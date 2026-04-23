@@ -27,6 +27,7 @@ prefix key first, then the action key. Pressing `Ctrl+a` twice sends a literal
 | `Prefix + ↓` | Move focus to the pane below |
 | `Prefix + ↑` | Move focus to the pane above |
 | `Prefix + →` | Move focus to the pane on the right |
+| `Prefix + hold Alt/Option`, then press `h` `j` `k` `l` repeatedly | Resize the active pane left, down, up, or right while `Alt/Option` remains held. The first `Alt/Option+h` / `j` / `k` / `l` applies immediately. If there is no resize input for 500 ms, the sequence ends automatically |
 
 ---
 

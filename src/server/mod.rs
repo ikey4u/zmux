@@ -1074,6 +1074,10 @@ fn dispatch_command_output(
             cmd_select_pane(state, cmd, sz);
             String::new()
         }
+        "resize-pane" | "resizep" => {
+            cmd_resize_pane(state, cmd, sz);
+            String::new()
+        }
         "select-window" | "selectw" => {
             cmd_select_window(state, cmd);
             String::new()
@@ -1513,6 +1517,52 @@ fn cmd_select_pane(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
     }
 }
 
+fn cmd_resize_pane(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
+    use crate::layout::NavDir;
+
+    let dir = if cmd.flag("L") {
+        Some(NavDir::Left)
+    } else if cmd.flag("R") {
+        Some(NavDir::Right)
+    } else if cmd.flag("U") {
+        Some(NavDir::Up)
+    } else if cmd.flag("D") {
+        Some(NavDir::Down)
+    } else {
+        None
+    };
+    let Some(dir) = dir else {
+        return;
+    };
+    let step = cmd
+        .args
+        .first()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(5)
+        .max(1);
+
+    let changed = {
+        let session = match active_session_mut(state) {
+            Some(s) => s,
+            None => return,
+        };
+        let win = match session.windows.get_mut(session.active_window_idx) {
+            Some(w) => w,
+            None => return,
+        };
+        if win.zoom_state.is_some() {
+            false
+        } else {
+            let path = win.active_pane_path.clone();
+            resize_layout_in_direction(&mut win.root, &path, dir, step)
+        }
+    };
+
+    if changed {
+        resize_all_panes(state, sz);
+    }
+}
+
 fn cmd_select_window(state: &mut Server, cmd: &ParsedCommand) {
     let session = match active_session_mut(state) {
         Some(s) => s,
@@ -1666,6 +1716,116 @@ fn subtree_contains_pane(node: &LayoutNode, id: PaneId) -> bool {
             children.iter().any(|c| subtree_contains_pane(c, id))
         }
     }
+}
+
+fn resize_layout_in_direction(
+    node: &mut LayoutNode,
+    path: &[usize],
+    dir: crate::layout::NavDir,
+    step: u16,
+) -> bool {
+    match node {
+        LayoutNode::Leaf(_) => false,
+        LayoutNode::Split {
+            direction,
+            sizes,
+            children,
+        } => {
+            let Some((&idx, rest)) = path.split_first() else {
+                return false;
+            };
+            if idx >= children.len() {
+                return false;
+            }
+            if resize_layout_in_direction(&mut children[idx], rest, dir, step) {
+                return true;
+            }
+            if !split_matches_resize_direction(*direction, dir) {
+                return false;
+            }
+            resize_split_sizes(sizes, idx, dir, step)
+        }
+    }
+}
+
+fn split_matches_resize_direction(
+    direction: SplitDirection,
+    dir: crate::layout::NavDir,
+) -> bool {
+    matches!(
+        (direction, dir),
+        (SplitDirection::Horizontal, crate::layout::NavDir::Left)
+            | (SplitDirection::Horizontal, crate::layout::NavDir::Right)
+            | (SplitDirection::Vertical, crate::layout::NavDir::Up)
+            | (SplitDirection::Vertical, crate::layout::NavDir::Down)
+    )
+}
+
+fn resize_split_sizes(
+    sizes: &mut [u16],
+    idx: usize,
+    dir: crate::layout::NavDir,
+    step: u16,
+) -> bool {
+    let Some((neighbor_idx, grow_active)) =
+        resize_target_for_index(idx, sizes.len(), dir)
+    else {
+        return false;
+    };
+    shift_split_sizes(sizes, idx, neighbor_idx, grow_active, step)
+}
+
+fn resize_target_for_index(
+    idx: usize,
+    len: usize,
+    dir: crate::layout::NavDir,
+) -> Option<(usize, bool)> {
+    match dir {
+        crate::layout::NavDir::Left | crate::layout::NavDir::Up => {
+            if idx > 0 {
+                Some((idx - 1, true))
+            } else if idx + 1 < len {
+                Some((idx + 1, false))
+            } else {
+                None
+            }
+        }
+        crate::layout::NavDir::Right | crate::layout::NavDir::Down => {
+            if idx + 1 < len {
+                Some((idx + 1, true))
+            } else if idx > 0 {
+                Some((idx - 1, false))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn shift_split_sizes(
+    sizes: &mut [u16],
+    idx: usize,
+    neighbor_idx: usize,
+    grow_active: bool,
+    step: u16,
+) -> bool {
+    if idx >= sizes.len() || neighbor_idx >= sizes.len() || idx == neighbor_idx
+    {
+        return false;
+    }
+    let donor_idx = if grow_active { neighbor_idx } else { idx };
+    let delta = step.min(sizes[donor_idx].saturating_sub(1));
+    if delta == 0 {
+        return false;
+    }
+    if grow_active {
+        sizes[idx] += delta;
+        sizes[neighbor_idx] -= delta;
+    } else {
+        sizes[idx] -= delta;
+        sizes[neighbor_idx] += delta;
+    }
+    true
 }
 
 fn cmd_clear_pane(state: &mut Server) {

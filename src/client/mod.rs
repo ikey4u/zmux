@@ -9,7 +9,8 @@ use crossterm::{
     cursor::{self, SetCursorStyle},
     event::{
         self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode,
-        KeyEvent, KeyModifiers,
+        KeyEvent, KeyModifiers, KeyboardEnhancementFlags, ModifierKeyCode,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
@@ -35,6 +36,7 @@ pub struct ClientApp {
 enum InputMode {
     Normal,
     Prefix,
+    Resize,
     CopyMode,
     CopySearch {
         buf: String,
@@ -60,6 +62,8 @@ enum InputMode {
         collapsed_windows: std::collections::HashSet<(String, usize)>,
     },
 }
+
+const RESIZE_IDLE_TIMEOUT: Duration = Duration::from_millis(500);
 
 impl ClientApp {
     pub fn new(socket_name: &str, session_name: Option<String>) -> Self {
@@ -87,13 +91,18 @@ impl ClientApp {
             stdout,
             EnterAlternateScreen,
             cursor::Hide,
-            EnableBracketedPaste
+            EnableBracketedPaste,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+            )
         )?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
         let prefix_key = (KeyCode::Char('a'), KeyModifiers::CONTROL);
         let mut mode = InputMode::Normal;
+        let mut resize_deadline: Option<Instant> = None;
         let mut status_notice: Option<(String, Instant)> = None;
         let mut hide_borders = false;
         let mut applied_cursor_style: Option<SetCursorStyle> = None;
@@ -115,6 +124,15 @@ impl ClientApp {
                     applied_cursor_style = Some(desired_cursor_style);
                 }
                 let now = Instant::now();
+                if mode == InputMode::Resize
+                    && matches!(resize_deadline, Some(expires_at) if now >= expires_at)
+                {
+                    mode = InputMode::Normal;
+                    resize_deadline = None;
+                }
+                if mode != InputMode::Resize {
+                    resize_deadline = None;
+                }
                 if matches!(status_notice.as_ref(), Some((_, expires_at)) if now >= *expires_at)
                 {
                     status_notice = None;
@@ -226,6 +244,25 @@ impl ClientApp {
                                         }
                                         continue;
                                     }
+                                    if is_resize_modifier_key(key) {
+                                        mode = InputMode::Resize;
+                                        resize_deadline = Some(
+                                            Instant::now()
+                                                + RESIZE_IDLE_TIMEOUT,
+                                        );
+                                        continue;
+                                    }
+                                    if let Some(cmd) =
+                                        resize_command_for_key(key)
+                                    {
+                                        server.run_command(cmd);
+                                        mode = InputMode::Resize;
+                                        resize_deadline = Some(
+                                            Instant::now()
+                                                + RESIZE_IDLE_TIMEOUT,
+                                        );
+                                        continue;
+                                    }
                                     match (key.code, key.modifiers) {
                                         (
                                             KeyCode::Char('d'),
@@ -331,6 +368,38 @@ impl ClientApp {
                                             }
                                         }
                                     }
+                                }
+
+                                InputMode::Resize => {
+                                    if is_resize_modifier_key(key) {
+                                        resize_deadline = Some(
+                                            Instant::now()
+                                                + RESIZE_IDLE_TIMEOUT,
+                                        );
+                                        continue;
+                                    }
+                                    if let Some(cmd) =
+                                        resize_command_for_key(key)
+                                    {
+                                        server.run_command(cmd);
+                                        resize_deadline = Some(
+                                            Instant::now()
+                                                + RESIZE_IDLE_TIMEOUT,
+                                        );
+                                        continue;
+                                    }
+                                    if key.code == KeyCode::Esc {
+                                        mode = InputMode::Normal;
+                                        resize_deadline = None;
+                                        continue;
+                                    }
+                                    if (key.code, key.modifiers) == prefix_key {
+                                        mode = InputMode::Prefix;
+                                        resize_deadline = None;
+                                        continue;
+                                    }
+                                    mode = InputMode::Normal;
+                                    resize_deadline = None;
                                 }
 
                                 InputMode::Command {
@@ -997,6 +1066,7 @@ impl ClientApp {
         let _ = execute!(
             terminal.backend_mut(),
             DisableBracketedPaste,
+            PopKeyboardEnhancementFlags,
             LeaveAlternateScreen,
             SetCursorStyle::DefaultUserShape,
             cursor::Show
@@ -1055,11 +1125,39 @@ fn run_command_notice(server: &SocketClient, cmd: &str) -> Option<String> {
     None
 }
 
+fn is_resize_modifier_key(key: KeyEvent) -> bool {
+    matches!(
+        key.code,
+        KeyCode::Modifier(ModifierKeyCode::LeftAlt)
+            | KeyCode::Modifier(ModifierKeyCode::RightAlt)
+    )
+}
+
+fn resize_command_for_key(key: KeyEvent) -> Option<&'static str> {
+    if !key.modifiers.contains(KeyModifiers::ALT) {
+        return None;
+    }
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+    {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('h') | KeyCode::Left => Some("resize-pane -L"),
+        KeyCode::Char('j') | KeyCode::Down => Some("resize-pane -D"),
+        KeyCode::Char('k') | KeyCode::Up => Some("resize-pane -U"),
+        KeyCode::Char('l') | KeyCode::Right => Some("resize-pane -R"),
+        _ => None,
+    }
+}
+
 fn status_banner_for_mode(
     mode: &InputMode,
     notice: Option<&str>,
 ) -> Option<String> {
     let mode_label = match mode {
+        InputMode::Resize => Some("RESIZE"),
         InputMode::CopyMode => Some("COPY"),
         InputMode::CopySearch { forward, .. } => {
             Some(if *forward { "COPY /" } else { "COPY ?" })
@@ -1158,7 +1256,7 @@ fn handle_paste_event(
         InputMode::Normal => {
             server.send_input(text.as_bytes());
         }
-        InputMode::Prefix => {
+        InputMode::Prefix | InputMode::Resize => {
             server.send_input(text.as_bytes());
             *mode = InputMode::Normal;
         }
@@ -1200,28 +1298,36 @@ fn handle_paste_event(
 }
 
 fn key_to_bytes(key: KeyEvent) -> Vec<u8> {
-    match key.code {
+    let mut bytes = match key.code {
         KeyCode::Char(c) => {
             if key.modifiers.contains(KeyModifiers::CONTROL) {
                 let lower = c.to_ascii_lowercase();
                 if lower >= 'a' && lower <= 'z' {
-                    return vec![lower as u8 - b'a' + 1];
+                    vec![lower as u8 - b'a' + 1]
+                } else {
+                    match c {
+                        '@' | '2' => vec![0x00],
+                        '[' | '3' => vec![0x1b],
+                        '\\' | '4' => vec![0x1c],
+                        ']' | '5' => vec![0x1d],
+                        '^' | '6' => vec![0x1e],
+                        '_' | '7' => vec![0x1f],
+                        _ => {
+                            if (c as u32) < 0x20 {
+                                vec![c as u8]
+                            } else {
+                                let mut buf = [0u8; 4];
+                                c.encode_utf8(&mut buf).as_bytes().to_vec()
+                            }
+                        }
+                    }
                 }
-                match c {
-                    '@' | '2' => return vec![0x00],
-                    '[' | '3' => return vec![0x1b],
-                    '\\' | '4' => return vec![0x1c],
-                    ']' | '5' => return vec![0x1d],
-                    '^' | '6' => return vec![0x1e],
-                    '_' | '7' => return vec![0x1f],
-                    _ => {}
-                }
+            } else if (c as u32) < 0x20 {
+                vec![c as u8]
+            } else {
+                let mut buf = [0u8; 4];
+                c.encode_utf8(&mut buf).as_bytes().to_vec()
             }
-            if (c as u32) < 0x20 {
-                return vec![c as u8];
-            }
-            let mut buf = [0u8; 4];
-            c.encode_utf8(&mut buf).as_bytes().to_vec()
         }
         KeyCode::Enter => b"\r".to_vec(),
         KeyCode::Backspace => b"\x7f".to_vec(),
@@ -1252,7 +1358,14 @@ fn key_to_bytes(key: KeyEvent) -> Vec<u8> {
             _ => vec![],
         },
         _ => vec![],
+    };
+    if !bytes.is_empty()
+        && key.modifiers.contains(KeyModifiers::ALT)
+        && !matches!(key.code, KeyCode::Esc | KeyCode::Modifier(_))
+    {
+        bytes.insert(0, 0x1b);
     }
+    bytes
 }
 
 fn char_byte_pos(s: &str, char_idx: usize) -> usize {
