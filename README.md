@@ -15,3 +15,5 @@ It currently supports pane, window, and session management, detach and attach wo
 ## Documentation
 
 - [Shortcut Reference](docs/SHORTCUT.md)
+
+![zmux shortcut quickstart](docs/diagrams/shortcut-quickstart-en.png)
