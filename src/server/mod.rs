@@ -403,13 +403,18 @@ impl InProcessServer {
             let latest_frame = Arc::clone(&self.latest_frame);
             let size_arc = Arc::clone(&self.size);
             let state_check = Arc::clone(&self.state);
+            let size_check = Arc::clone(&self.size);
             let socket_name_clone = socket_name.clone();
             thread::spawn(move || {
                 let _ = handle_client(stream, state, latest_frame, size_arc);
                 let is_empty = state_check
                     .lock()
                     .map(|mut s| {
-                        reap_dead_panes(&mut s);
+                        let sz = size_check
+                            .lock()
+                            .map(|s| *s)
+                            .unwrap_or(Size::new(24, 80));
+                        reap_dead_panes(&mut s, sz);
                         server_is_empty(&s)
                     })
                     .unwrap_or(false);
@@ -581,9 +586,9 @@ fn handle_client(
                     Ok(s) => s,
                     Err(_) => break,
                 };
-                reap_dead_panes(&mut s);
                 let sz =
                     size_arc.lock().map(|s| *s).unwrap_or(Size::new(24, 80));
+                reap_dead_panes(&mut s, sz);
                 if server_is_empty(&s) {
                     log_server("all sessions empty, sending exit frame");
                     "{\"type\":\"frame\",\"exit\":true,\"layout\":{\"type\":\"leaf\",\"id\":0,\"rows\":1,\"cols\":1,\"cursor_row\":0,\"cursor_col\":0,\"hide_cursor\":true,\"alternate_screen\":false,\"cursor_shape\":255,\"active\":false,\"rows_v2\":[]}}".to_string()
@@ -786,7 +791,8 @@ fn render_loop(
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            reap_dead_panes(&mut s);
+            let sz = size.lock().map(|s| *s).unwrap_or(Size::new(24, 80));
+            reap_dead_panes(&mut s, sz);
             server_is_empty(&s)
         };
         if should_exit {
@@ -858,7 +864,7 @@ fn render_loop(
     }
 }
 
-fn reap_dead_panes(state: &mut Server) -> bool {
+fn reap_dead_panes(state: &mut Server, size: Size) -> bool {
     let mut changed = false;
     for session in &mut state.sessions {
         let mut win_idx = 0;
@@ -909,6 +915,9 @@ fn reap_dead_panes(state: &mut Server) -> bool {
     }
     if prune_empty_sessions(state) {
         changed = true;
+    }
+    if changed && !server_is_empty(state) {
+        resize_all_panes(state, size);
     }
     changed
 }
@@ -1067,7 +1076,7 @@ fn dispatch_command_output(
             String::new()
         }
         "kill-window" | "killw" => {
-            cmd_kill_window(state);
+            cmd_kill_window(state, sz);
             String::new()
         }
         "select-pane" | "selectp" => {
@@ -1079,7 +1088,7 @@ fn dispatch_command_output(
             String::new()
         }
         "select-window" | "selectw" => {
-            cmd_select_window(state, cmd);
+            cmd_select_window(state, cmd, sz);
             String::new()
         }
         "rename-window" | "renamew" => {
@@ -1095,19 +1104,19 @@ fn dispatch_command_output(
             String::new()
         }
         "kill-session" | "kill-s" => {
-            cmd_kill_session(state, cmd);
+            cmd_kill_session(state, cmd, sz);
             String::new()
         }
         "switch-client" | "switchc" => {
-            cmd_switch_client(state, cmd);
+            cmd_switch_client(state, cmd, sz);
             String::new()
         }
         "next-session" => {
-            cmd_next_session(state);
+            cmd_next_session(state, sz);
             String::new()
         }
         "prev-session" => {
-            cmd_prev_session(state);
+            cmd_prev_session(state, sz);
             String::new()
         }
         "list-sessions" | "ls" => cmd_list_sessions(state),
@@ -1213,7 +1222,7 @@ fn cmd_new_session(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
     }
 }
 
-fn cmd_kill_session(state: &mut Server, cmd: &ParsedCommand) {
+fn cmd_kill_session(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
     let target = cmd.flag_value("t").map(|s| s.to_string());
     let idx = if let Some(name) = target {
         state.find_session_idx(&name)
@@ -1230,27 +1239,33 @@ fn cmd_kill_session(state: &mut Server, cmd: &ParsedCommand) {
             }
         }
     }
+    if !state.sessions.is_empty() {
+        resize_all_panes(state, sz);
+    }
 }
 
-fn cmd_switch_client(state: &mut Server, cmd: &ParsedCommand) {
+fn cmd_switch_client(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
     if let Some(name) = cmd.flag_value("t") {
         if let Some(idx) = state.find_session_idx(name) {
             state.active_session_idx = idx;
+            resize_all_panes(state, sz);
         }
     }
 }
 
-fn cmd_next_session(state: &mut Server) {
+fn cmd_next_session(state: &mut Server, sz: Size) {
     let n = state.sessions.len();
     if n > 1 {
         state.active_session_idx = (state.active_session_idx + 1) % n;
+        resize_all_panes(state, sz);
     }
 }
 
-fn cmd_prev_session(state: &mut Server) {
+fn cmd_prev_session(state: &mut Server, sz: Size) {
     let n = state.sessions.len();
     if n > 1 {
         state.active_session_idx = (state.active_session_idx + n - 1) % n;
+        resize_all_panes(state, sz);
     }
 }
 
@@ -1466,7 +1481,7 @@ fn cmd_kill_pane(state: &mut Server, _cmd: &ParsedCommand, sz: Size) {
     }
 }
 
-fn cmd_kill_window(state: &mut Server) {
+fn cmd_kill_window(state: &mut Server, sz: Size) {
     let session = match active_session_mut(state) {
         Some(s) => s,
         None => return,
@@ -1477,6 +1492,9 @@ fn cmd_kill_window(state: &mut Server) {
     session.windows.remove(session.active_window_idx);
     if session.active_window_idx > 0 {
         session.active_window_idx -= 1;
+    }
+    if !session.windows.is_empty() {
+        resize_all_panes(state, sz);
     }
 }
 
@@ -1563,7 +1581,7 @@ fn cmd_resize_pane(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
     }
 }
 
-fn cmd_select_window(state: &mut Server, cmd: &ParsedCommand) {
+fn cmd_select_window(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
     let session = match active_session_mut(state) {
         Some(s) => s,
         None => return,
@@ -1583,6 +1601,7 @@ fn cmd_select_window(state: &mut Server, cmd: &ParsedCommand) {
             }
         }
     }
+    resize_all_panes(state, sz);
 }
 
 fn cmd_rename_window(state: &mut Server, cmd: &ParsedCommand) {
@@ -1860,9 +1879,106 @@ fn json_escape_status(s: &str, out: &mut String) {
 mod tests {
     use super::*;
 
+    fn active_pane_size(state: &Server) -> (u16, u16) {
+        let session = &state.sessions[state.active_session_idx];
+        let win = &session.windows[session.active_window_idx];
+        let pane = crate::layout::active_pane(&win.root, &win.active_pane_path)
+            .unwrap();
+        (pane.last_rows, pane.last_cols)
+    }
+
     #[test]
     fn root_pane_size_matches_visible_content_area() {
         assert_eq!(root_pane_size(Size::new(24, 80)), (21, 78));
         assert_eq!(pane_viewport_size(Rect::new(0, 0, 2, 2)), (2, 2));
+    }
+
+    #[test]
+    fn select_window_resizes_new_active_window_pane() -> io::Result<()> {
+        let sz = Size::new(24, 80);
+        let expected = root_pane_size(sz);
+        let mut state = Server::new();
+        make_session(&mut state, "0", sz)?;
+
+        let mut new_window_cmd = ParsedCommand::parse("new-window");
+        cmd_new_window(&mut state, &new_window_cmd.remove(0), sz);
+
+        {
+            let session = &mut state.sessions[0];
+            let win = &mut session.windows[1];
+            let pane = crate::layout::active_pane_mut(
+                &mut win.root,
+                &win.active_pane_path,
+            )
+            .unwrap();
+            resize_pane(pane, expected.0, (expected.1 / 2).max(1))?;
+            session.active_window_idx = 0;
+        }
+
+        let mut select_window_cmd = ParsedCommand::parse("select-window -t 1");
+        cmd_select_window(&mut state, &select_window_cmd.remove(0), sz);
+
+        assert_eq!(state.sessions[0].active_window_idx, 1);
+        assert_eq!(active_pane_size(&state), expected);
+        Ok(())
+    }
+
+    #[test]
+    fn switch_client_resizes_target_session_pane() -> io::Result<()> {
+        let sz = Size::new(24, 80);
+        let expected = root_pane_size(sz);
+        let mut state = Server::new();
+        make_session(&mut state, "alpha", sz)?;
+        make_session(&mut state, "beta", sz)?;
+
+        {
+            let session = &mut state.sessions[1];
+            let win = &mut session.windows[0];
+            let pane = crate::layout::active_pane_mut(
+                &mut win.root,
+                &win.active_pane_path,
+            )
+            .unwrap();
+            resize_pane(pane, expected.0, (expected.1 / 2).max(1))?;
+        }
+
+        let mut switch_client_cmd =
+            ParsedCommand::parse("switch-client -t beta");
+        cmd_switch_client(&mut state, &switch_client_cmd.remove(0), sz);
+
+        assert_eq!(state.active_session_idx, 1);
+        assert_eq!(active_pane_size(&state), expected);
+        Ok(())
+    }
+
+    #[test]
+    fn reap_dead_panes_resizes_surviving_pane() -> io::Result<()> {
+        let sz = Size::new(24, 80);
+        let expected = root_pane_size(sz);
+        let mut state = Server::new();
+        make_session(&mut state, "0", sz)?;
+
+        let mut split_cmd = ParsedCommand::parse("split-window -h");
+        cmd_split_window(&mut state, &split_cmd.remove(0), sz);
+
+        {
+            let session = &mut state.sessions[0];
+            let win = &mut session.windows[0];
+            let pane = crate::layout::active_pane_mut(
+                &mut win.root,
+                &win.active_pane_path,
+            )
+            .unwrap();
+            pane.dead.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        reap_dead_panes(&mut state, sz);
+
+        assert_eq!(active_pane_size(&state), expected);
+        assert!(matches!(
+            state.sessions[0].windows[0].root,
+            LayoutNode::Leaf(_)
+        ));
+        Ok(())
     }
 }
