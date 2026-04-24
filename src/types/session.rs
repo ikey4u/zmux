@@ -175,6 +175,7 @@ pub struct Server {
     pub mode: Mode,
     pub next_session_id: SessionId,
     pub next_client_id: ClientId,
+    pub hide_borders: bool,
 }
 
 impl Server {
@@ -188,6 +189,7 @@ impl Server {
             mode: Mode::Passthrough,
             next_session_id: 0,
             next_client_id: 1,
+            hide_borders: false,
         }
     }
 

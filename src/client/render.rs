@@ -137,8 +137,13 @@ fn render_layout_node(
             if children.is_empty() || area.width == 0 || area.height == 0 {
                 return;
             }
-            let chunks =
-                split_layout_rects(area, direction, sizes, children.len());
+            let chunks = split_layout_rects(
+                area,
+                direction,
+                sizes,
+                children.len(),
+                hide_borders,
+            );
             for (child, chunk) in children.iter().zip(chunks.into_iter()) {
                 render_layout_node(f, child, chunk, hide_borders);
             }
@@ -170,13 +175,15 @@ fn split_layout_rects(
     direction: &str,
     sizes: &[u16],
     count: usize,
+    hide_borders: bool,
 ) -> Vec<Rect> {
     if count == 0 {
         return Vec::new();
     }
     let horizontal = direction == "horizontal";
     let total_dim = if horizontal { area.width } else { area.height };
-    let borders = count.saturating_sub(1) as u16;
+    let gap: u16 = if hide_borders { 0 } else { 1 };
+    let borders = count.saturating_sub(1) as u16 * gap;
     let available = total_dim.saturating_sub(borders);
     let total_pct = sizes.iter().copied().sum::<u16>().max(1);
     let mut rects = Vec::with_capacity(count);
@@ -202,7 +209,7 @@ fn split_layout_rects(
                 height: dim,
             }
         });
-        offset += dim + 1;
+        offset += dim + gap;
     }
     rects
 }
@@ -712,6 +719,7 @@ mod tests {
             "vertical",
             &[50, 50],
             2,
+            false,
         );
         assert_eq!(
             rects,

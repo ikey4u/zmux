@@ -353,6 +353,8 @@ impl ClientApp {
                                             KeyModifiers::NONE,
                                         ) => {
                                             hide_borders = !hide_borders;
+                                            server
+                                                .set_hide_borders(hide_borders);
                                         }
                                         _ => {
                                             if let Some(message) =

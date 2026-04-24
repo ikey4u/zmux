@@ -212,6 +212,13 @@ impl SocketClient {
         self.send_line(&format!("RESIZE {}x{}", size.rows, size.cols));
     }
 
+    pub fn set_hide_borders(&self, hide: bool) {
+        self.send_line(&format!(
+            "HIDE_BORDERS {}",
+            if hide { "1" } else { "0" }
+        ));
+    }
+
     pub fn is_empty(&self) -> bool {
         false
     }

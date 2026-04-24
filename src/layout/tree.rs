@@ -266,10 +266,11 @@ pub fn pane_path_in_direction(
     current: &[usize],
     dir: NavDir,
     total_area: crate::types::Rect,
+    border_size: u16,
 ) -> Vec<usize> {
     use crate::layout::rect::compute_rects;
 
-    let rects = compute_rects(node, total_area);
+    let rects = compute_rects(node, total_area, border_size);
     let cur_pane = match active_pane(node, current) {
         Some(p) => p,
         None => return current.to_vec(),

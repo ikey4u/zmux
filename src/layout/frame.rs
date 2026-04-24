@@ -6,13 +6,14 @@ use crate::{
     copy_mode::{
         build_wrapped_snapshot, CopyRenderRow, CopyRenderRun, CopyRenderView,
     },
+    layout::rect::BORDER_SIZE,
     types::{
         LayoutNode, Pane, PaneTextSnapshot, Rect, SplitDirection, Window,
         WrappedRow, WrappedSnapshot,
     },
 };
 
-pub fn serialize_frame(win: &Window, area: Rect) -> String {
+pub fn serialize_frame(win: &Window, area: Rect, hide_borders: bool) -> String {
     let mut out = String::with_capacity(65536);
     out.push_str("{\"type\":\"frame\",\"layout\":");
     if let Some(zoom) = &win.zoom_state {
@@ -21,10 +22,22 @@ pub fn serialize_frame(win: &Window, area: Rect) -> String {
         {
             write_leaf(pane, true, &mut out);
         } else {
-            write_node(&win.root, &win.active_pane_path, &mut out, area);
+            write_node(
+                &win.root,
+                &win.active_pane_path,
+                &mut out,
+                area,
+                hide_borders,
+            );
         }
     } else {
-        write_node(&win.root, &win.active_pane_path, &mut out, area);
+        write_node(
+            &win.root,
+            &win.active_pane_path,
+            &mut out,
+            area,
+            hide_borders,
+        );
     }
     out.push('}');
     out
@@ -35,6 +48,7 @@ fn write_node(
     active_path: &[usize],
     out: &mut String,
     area: Rect,
+    hide_borders: bool,
 ) {
     match node {
         LayoutNode::Split {
@@ -68,14 +82,21 @@ fn write_node(
                 } else {
                     &[]
                 };
-                let child_area =
-                    child_rect(area, direction, sizes, children.len(), i);
+                let child_area = child_rect(
+                    area,
+                    direction,
+                    sizes,
+                    children.len(),
+                    i,
+                    hide_borders,
+                );
                 write_child_node(
                     child,
                     child_inner_path,
                     child_active,
                     out,
                     child_area,
+                    hide_borders,
                 );
             }
             out.push_str("]}");
@@ -92,6 +113,7 @@ fn write_child_node(
     is_active_branch: bool,
     out: &mut String,
     area: Rect,
+    hide_borders: bool,
 ) {
     match node {
         LayoutNode::Split {
@@ -126,14 +148,21 @@ fn write_child_node(
                 } else {
                     &[]
                 };
-                let child_area =
-                    child_rect(area, direction, sizes, children.len(), i);
+                let child_area = child_rect(
+                    area,
+                    direction,
+                    sizes,
+                    children.len(),
+                    i,
+                    hide_borders,
+                );
                 write_child_node(
                     child,
                     child_rel,
                     child_is_active,
                     out,
                     child_area,
+                    hide_borders,
                 );
             }
             out.push_str("]}");
@@ -151,13 +180,14 @@ fn child_rect(
     sizes: &[u16],
     count: usize,
     index: usize,
+    hide_borders: bool,
 ) -> Rect {
-    use crate::layout::rect::BORDER_SIZE;
+    let border_size: u16 = if hide_borders { 0 } else { BORDER_SIZE };
     let total_dim = match direction {
         SplitDirection::Horizontal => area.width,
         SplitDirection::Vertical => area.height,
     };
-    let borders = (count.saturating_sub(1)) as u16 * BORDER_SIZE;
+    let borders = (count.saturating_sub(1)) as u16 * border_size;
     let available = total_dim.saturating_sub(borders);
     let total_pct: u16 = sizes.iter().copied().sum::<u16>().max(1);
     let mut offset = 0u16;
@@ -177,7 +207,7 @@ fn child_rect(
                 }
             };
         }
-        offset += dim + BORDER_SIZE;
+        offset += dim + border_size;
     }
     area
 }

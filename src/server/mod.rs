@@ -11,7 +11,7 @@ use crate::{
     commands::ParsedCommand,
     layout::{
         compute_rects, first_leaf_path, kill_pane_at_path, serialize_frame,
-        split_node,
+        split_node, BORDER_SIZE,
     },
     pty::{resize_pane, spawn_pane, SpawnOptions},
     types::{
@@ -131,6 +131,17 @@ impl InProcessServer {
         }
         if let Ok(mut s) = self.state.lock() {
             resize_all_panes(&mut s, new_size);
+        }
+        PTY_DATA_READY.store(true, Ordering::Relaxed);
+    }
+
+    pub fn set_hide_borders(&self, hide: bool) {
+        let sz = self.size.lock().map(|s| *s).unwrap_or(Size::new(24, 80));
+        if let Ok(mut s) = self.state.lock() {
+            if s.hide_borders != hide {
+                s.hide_borders = hide;
+                resize_all_panes(&mut s, sz);
+            }
         }
         PTY_DATA_READY.store(true, Ordering::Relaxed);
     }
@@ -599,6 +610,16 @@ fn handle_client(
                     resize_all_panes(&mut s, new_size);
                 }
             }
+        } else if line.starts_with("HIDE_BORDERS ") {
+            let hide = &line["HIDE_BORDERS ".len()..] == "1";
+            let sz = size_arc.lock().map(|s| *s).unwrap_or(Size::new(24, 80));
+            if let Ok(mut s) = state.lock() {
+                if s.hide_borders != hide {
+                    s.hide_borders = hide;
+                    resize_all_panes(&mut s, sz);
+                }
+            }
+            PTY_DATA_READY.store(true, Ordering::Relaxed);
         } else if line == "FRAME?" {
             let yank_ref = pending_yank.take();
             let json = {
@@ -623,7 +644,13 @@ fn handle_client(
                             None => continue,
                         };
                     let area = frame_layout_area(sz);
-                    build_frame_json(session, win, area, yank_ref.as_deref())
+                    build_frame_json(
+                        session,
+                        win,
+                        area,
+                        yank_ref.as_deref(),
+                        s.hide_borders,
+                    )
                 }
             };
             if send_frame(&mut write_stream, &json).is_err() {
@@ -721,9 +748,10 @@ fn build_frame_json(
     win: &crate::types::session::Window,
     area: Rect,
     yank_text: Option<&str>,
+    hide_borders: bool,
 ) -> String {
     use crate::layout::serialize_frame;
-    let layout_json = serialize_frame(win, area);
+    let layout_json = serialize_frame(win, area, hide_borders);
     let layout_part = layout_json
         .strip_prefix("{\"type\":\"frame\",\"layout\":")
         .and_then(|s| s.strip_suffix('}'))
@@ -841,8 +869,8 @@ fn frame_layout_area(size: Size) -> Rect {
     Rect::new(0, 0, size.cols.max(1), size.rows.saturating_sub(1).max(1))
 }
 
-fn pane_viewport_size(area: Rect) -> (u16, u16) {
-    if area.width > 2 && area.height > 2 {
+fn pane_viewport_size(area: Rect, hide_borders: bool) -> (u16, u16) {
+    if !hide_borders && area.width > 2 && area.height > 2 {
         (area.height - 2, area.width - 2)
     } else {
         (area.height.max(1), area.width.max(1))
@@ -850,7 +878,7 @@ fn pane_viewport_size(area: Rect) -> (u16, u16) {
 }
 
 fn root_pane_size(size: Size) -> (u16, u16) {
-    pane_viewport_size(frame_layout_area(size))
+    pane_viewport_size(frame_layout_area(size), false)
 }
 
 fn render_loop(
@@ -904,7 +932,7 @@ fn render_loop(
                 None => continue,
             };
             let area = frame_layout_area(sz);
-            let layout_json = serialize_frame(win, area);
+            let layout_json = serialize_frame(win, area, s.hide_borders);
             // 去掉外层 {type:frame, layout:...} 包装，只取 layout 部分
             let layout_part = layout_json
                 .strip_prefix("{\"type\":\"frame\",\"layout\":")
@@ -1064,6 +1092,8 @@ fn create_initial_session(
 }
 
 fn resize_all_panes(state: &mut Server, size: Size) {
+    let hide_borders = state.hide_borders;
+    let border_size: u16 = if hide_borders { 0 } else { BORDER_SIZE };
     for session in &mut state.sessions {
         for win in &mut session.windows {
             let area = frame_layout_area(size);
@@ -1072,13 +1102,13 @@ fn resize_all_panes(state: &mut Server, size: Size) {
                 if let Some(pane) =
                     crate::layout::find_pane_by_id_mut(&mut win.root, zoomed_id)
                 {
-                    let (rows, cols) = pane_viewport_size(area);
+                    let (rows, cols) = pane_viewport_size(area, hide_borders);
                     let _ = resize_pane(pane, rows, cols);
                     crate::copy_mode::refresh_layout(pane);
                 }
             } else {
-                let rects = compute_rects(&win.root, area);
-                resize_node_panes(&mut win.root, &rects, None);
+                let rects = compute_rects(&win.root, area, border_size);
+                resize_node_panes(&mut win.root, &rects, None, hide_borders);
             }
         }
     }
@@ -1088,6 +1118,7 @@ fn resize_node_panes(
     node: &mut LayoutNode,
     rects: &HashMap<PaneId, Rect>,
     zoom_pane_id: Option<PaneId>,
+    hide_borders: bool,
 ) {
     match node {
         LayoutNode::Leaf(p) => {
@@ -1097,14 +1128,14 @@ fn resize_node_panes(
                 }
             }
             if let Some(&rect) = rects.get(&p.id) {
-                let (rows, cols) = pane_viewport_size(rect);
+                let (rows, cols) = pane_viewport_size(rect, hide_borders);
                 let _ = resize_pane(p, rows, cols);
                 crate::copy_mode::refresh_layout(p);
             }
         }
         LayoutNode::Split { children, .. } => {
             for child in children.iter_mut() {
-                resize_node_panes(child, rects, zoom_pane_id);
+                resize_node_panes(child, rects, zoom_pane_id, hide_borders);
             }
         }
     }
@@ -1584,6 +1615,7 @@ fn cmd_kill_window(state: &mut Server, sz: Size) {
 fn cmd_select_pane(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
     use crate::layout::{find_pane_path, pane_path_in_direction, NavDir};
 
+    let hide_borders = state.hide_borders;
     let session = match active_session_mut(state) {
         Some(s) => s,
         None => return,
@@ -1619,8 +1651,10 @@ fn cmd_select_pane(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
     };
 
     if let Some(d) = dir {
+        let border_size: u16 = if hide_borders { 0 } else { BORDER_SIZE };
         let path = win.active_pane_path.clone();
-        let new_path = pane_path_in_direction(&win.root, &path, d, area);
+        let new_path =
+            pane_path_in_direction(&win.root, &path, d, area, border_size);
         if new_path != path {
             win.active_pane_path = new_path;
         }
@@ -1982,7 +2016,7 @@ mod tests {
     #[test]
     fn root_pane_size_matches_visible_content_area() {
         assert_eq!(root_pane_size(Size::new(24, 80)), (21, 78));
-        assert_eq!(pane_viewport_size(Rect::new(0, 0, 2, 2)), (2, 2));
+        assert_eq!(pane_viewport_size(Rect::new(0, 0, 2, 2), false), (2, 2));
     }
 
     #[test]

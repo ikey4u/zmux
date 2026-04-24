@@ -4,13 +4,22 @@ use crate::types::{LayoutNode, PaneId, Rect, SplitDirection};
 
 pub const BORDER_SIZE: u16 = 1;
 
-pub fn compute_rects(node: &LayoutNode, area: Rect) -> HashMap<PaneId, Rect> {
+pub fn compute_rects(
+    node: &LayoutNode,
+    area: Rect,
+    border_size: u16,
+) -> HashMap<PaneId, Rect> {
     let mut map = HashMap::new();
-    fill_rects(node, area, &mut map);
+    fill_rects(node, area, border_size, &mut map);
     map
 }
 
-fn fill_rects(node: &LayoutNode, area: Rect, map: &mut HashMap<PaneId, Rect>) {
+fn fill_rects(
+    node: &LayoutNode,
+    area: Rect,
+    border_size: u16,
+    map: &mut HashMap<PaneId, Rect>,
+) {
     match node {
         LayoutNode::Leaf(p) => {
             map.insert(p.id, area);
@@ -23,9 +32,15 @@ fn fill_rects(node: &LayoutNode, area: Rect, map: &mut HashMap<PaneId, Rect>) {
             if children.is_empty() {
                 return;
             }
-            let rects = split_rects(area, direction, sizes, children.len());
+            let rects = split_rects(
+                area,
+                direction,
+                sizes,
+                children.len(),
+                border_size,
+            );
             for (child, rect) in children.iter().zip(rects) {
-                fill_rects(child, rect, map);
+                fill_rects(child, rect, border_size, map);
             }
         }
     }
@@ -36,6 +51,7 @@ fn split_rects(
     direction: &SplitDirection,
     sizes: &[u16],
     count: usize,
+    border_size: u16,
 ) -> Vec<Rect> {
     if count == 0 {
         return vec![];
@@ -46,7 +62,7 @@ fn split_rects(
         SplitDirection::Vertical => area.height,
     };
 
-    let borders = (count.saturating_sub(1)) as u16 * BORDER_SIZE;
+    let borders = (count.saturating_sub(1)) as u16 * border_size;
     let available = total_dim.saturating_sub(borders);
 
     let total_pct: u16 = sizes.iter().copied().sum::<u16>().max(1);
@@ -70,7 +86,7 @@ fn split_rects(
         };
 
         rects.push(rect);
-        offset += dim + BORDER_SIZE;
+        offset += dim + border_size;
     }
 
     rects
@@ -107,7 +123,13 @@ fn collect_borders(
             if children.is_empty() {
                 return;
             }
-            let rects = split_rects(area, direction, sizes, children.len());
+            let rects = split_rects(
+                area,
+                direction,
+                sizes,
+                children.len(),
+                BORDER_SIZE,
+            );
             for (i, (child, rect)) in
                 children.iter().zip(rects.iter()).enumerate()
             {
