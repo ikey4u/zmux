@@ -44,6 +44,9 @@ fn exit_frame() -> FrameData {
             cursor_col: 0,
             hide_cursor: true,
             alternate_screen: false,
+            mouse_mode: 0,
+            in_copy_mode: false,
+            scroll_ratio: None,
             cursor_shape: 255,
             active: false,
             rows_v2: Vec::new(),
@@ -274,6 +277,14 @@ impl SocketClient {
             Err(_) => return Vec::new(),
         };
         parse_session_tree_json(&json)
+    }
+
+    pub fn scroll_up(&self, lines: usize) {
+        self.send_line(&format!("SCROLL up {}", lines));
+    }
+
+    pub fn scroll_down(&self, lines: usize) {
+        self.send_line(&format!("SCROLL down {}", lines));
     }
 
     pub fn enter_copy_mode(&self) -> bool {

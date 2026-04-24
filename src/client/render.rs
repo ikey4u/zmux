@@ -39,6 +39,12 @@ pub enum LayoutJson {
         #[serde(default)]
         alternate_screen: bool,
         #[serde(default)]
+        mouse_mode: u8,
+        #[serde(default)]
+        in_copy_mode: bool,
+        #[serde(default)]
+        scroll_ratio: Option<f32>,
+        #[serde(default)]
         cursor_shape: u8,
         #[serde(default)]
         active: bool,
@@ -83,6 +89,42 @@ pub fn render_frame(f: &mut Frame, fd: &FrameData, in_prefix: bool) {
 
 pub fn active_cursor_shape(fd: &FrameData) -> Option<u8> {
     active_cursor_shape_in_layout(&fd.layout)
+}
+
+pub fn active_mouse_mode(fd: &FrameData) -> u8 {
+    active_mouse_mode_in_layout(&fd.layout)
+}
+
+pub fn active_in_copy_mode(fd: &FrameData) -> bool {
+    active_in_copy_mode_in_layout(&fd.layout)
+}
+
+fn active_in_copy_mode_in_layout(layout: &LayoutJson) -> bool {
+    match layout {
+        LayoutJson::Split { children, .. } => {
+            children.iter().any(active_in_copy_mode_in_layout)
+        }
+        LayoutJson::Leaf {
+            active,
+            in_copy_mode,
+            ..
+        } if *active => *in_copy_mode,
+        LayoutJson::Leaf { .. } => false,
+    }
+}
+
+fn active_mouse_mode_in_layout(layout: &LayoutJson) -> u8 {
+    match layout {
+        LayoutJson::Split { children, .. } => children
+            .iter()
+            .map(active_mouse_mode_in_layout)
+            .find(|&m| m != 0)
+            .unwrap_or(0),
+        LayoutJson::Leaf {
+            active, mouse_mode, ..
+        } if *active => *mouse_mode,
+        LayoutJson::Leaf { .. } => 0,
+    }
 }
 
 fn active_cursor_shape_in_layout(layout: &LayoutJson) -> Option<u8> {
@@ -154,6 +196,8 @@ fn render_layout_node(
             cursor_row,
             cursor_col,
             hide_cursor,
+            in_copy_mode,
+            scroll_ratio,
             ..
         } => {
             render_pane_content(
@@ -163,6 +207,8 @@ fn render_layout_node(
                 *cursor_row,
                 *cursor_col,
                 *hide_cursor,
+                *in_copy_mode,
+                *scroll_ratio,
                 area,
                 hide_borders,
             );
@@ -221,6 +267,8 @@ fn render_pane_content(
     cursor_row: u16,
     cursor_col: u16,
     hide_cursor: bool,
+    in_copy_mode: bool,
+    scroll_ratio: Option<f32>,
     area: Rect,
     hide_borders: bool,
 ) {
@@ -312,7 +360,11 @@ fn render_pane_content(
         }
     }
 
-    if is_active && !hide_cursor {
+    if let Some(ratio) = scroll_ratio {
+        draw_scrollbar(f, content_area, ratio);
+    }
+
+    if is_active && !hide_cursor && (in_copy_mode || scroll_ratio.is_none()) {
         let cx = content_area
             .x
             .saturating_add(cursor_col)
@@ -322,6 +374,36 @@ fn render_pane_content(
             .saturating_add(cursor_row)
             .min(content_area.y + content_area.height.saturating_sub(1));
         f.set_cursor_position((cx, cy));
+    }
+}
+
+fn draw_scrollbar(f: &mut Frame, content_area: Rect, ratio: f32) {
+    let height = content_area.height as usize;
+    if height < 3 {
+        return;
+    }
+    let thumb_height = (height / 4).max(1);
+    let track_range = height.saturating_sub(thumb_height);
+    let thumb_top = (ratio.clamp(0.0, 1.0) * track_range as f32) as usize;
+    let col = content_area.x + content_area.width.saturating_sub(1);
+    for row in 0..height {
+        let y = content_area.y + row as u16;
+        let in_thumb = row >= thumb_top && row < thumb_top + thumb_height;
+        let (ch, style) = if in_thumb {
+            ("┃", Style::default().fg(Color::White).bg(Color::DarkGray))
+        } else {
+            ("│", Style::default().fg(Color::Rgb(60, 60, 60)))
+        };
+        let para = Paragraph::new(ch).style(style);
+        f.render_widget(
+            para,
+            Rect {
+                x: col,
+                y,
+                width: 1,
+                height: 1,
+            },
+        );
     }
 }
 
@@ -756,6 +838,9 @@ mod tests {
                         cursor_col: 0,
                         hide_cursor: false,
                         alternate_screen: false,
+                        mouse_mode: 0,
+                        in_copy_mode: false,
+                        scroll_ratio: None,
                         cursor_shape: 2,
                         active: false,
                         rows_v2: Vec::new(),
@@ -769,6 +854,9 @@ mod tests {
                         cursor_col: 0,
                         hide_cursor: false,
                         alternate_screen: false,
+                        mouse_mode: 0,
+                        in_copy_mode: false,
+                        scroll_ratio: None,
                         cursor_shape: 4,
                         active: true,
                         rows_v2: Vec::new(),
@@ -796,6 +884,9 @@ mod tests {
                 cursor_col: 0,
                 hide_cursor: true,
                 alternate_screen: false,
+                mouse_mode: 0,
+                in_copy_mode: false,
+                scroll_ratio: None,
                 cursor_shape: 6,
                 active: true,
                 rows_v2: Vec::new(),

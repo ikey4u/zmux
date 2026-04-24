@@ -599,6 +599,9 @@ fn handle_client(
                     PTY_DATA_READY.store(true, Ordering::Relaxed);
                 }
             }
+        } else if line.starts_with("SCROLL ") {
+            let rest = &line["SCROLL ".len()..];
+            handle_scroll_line(&state, rest);
         } else if line.starts_with("RESIZE ") {
             let rest = &line["RESIZE ".len()..];
             if let Some((rows, cols)) = parse_size_line(rest) {
@@ -632,7 +635,7 @@ fn handle_client(
                 reap_dead_panes(&mut s, sz);
                 if server_is_empty(&s) {
                     log_server("all sessions empty, sending exit frame");
-                    "{\"type\":\"frame\",\"exit\":true,\"layout\":{\"type\":\"leaf\",\"id\":0,\"rows\":1,\"cols\":1,\"cursor_row\":0,\"cursor_col\":0,\"hide_cursor\":true,\"alternate_screen\":false,\"cursor_shape\":255,\"active\":false,\"rows_v2\":[]}}".to_string()
+                    "{\"type\":\"frame\",\"exit\":true,\"layout\":{\"type\":\"leaf\",\"id\":0,\"rows\":1,\"cols\":1,\"cursor_row\":0,\"cursor_col\":0,\"hide_cursor\":true,\"alternate_screen\":false,\"mouse_mode\":0,\"in_copy_mode\":false,\"cursor_shape\":255,\"active\":false,\"rows_v2\":[]}}".to_string()
                 } else {
                     let session = match s.active_session() {
                         Some(s) => s,
@@ -711,6 +714,28 @@ fn handle_copy_key_line(state: &Arc<Mutex<Server>>, key: &str) {
             with_active_pane_mut(&mut s, crate::copy_mode::clear_selection);
             PTY_DATA_READY.store(true, Ordering::Relaxed);
         }
+    }
+}
+
+fn handle_scroll_line(state: &Arc<Mutex<Server>>, rest: &str) {
+    let (direction, lines) = if let Some(n) = rest.strip_prefix("up ") {
+        ("up", n.parse::<usize>().unwrap_or(3))
+    } else if let Some(n) = rest.strip_prefix("down ") {
+        ("down", n.parse::<usize>().unwrap_or(3))
+    } else {
+        return;
+    };
+    if let Ok(mut s) = state.lock() {
+        with_active_pane_mut(&mut s, |pane| match direction {
+            "up" => {
+                crate::copy_mode::scroll_up(pane, lines);
+            }
+            "down" => {
+                crate::copy_mode::scroll_down(pane, lines);
+            }
+            _ => {}
+        });
+        PTY_DATA_READY.store(true, Ordering::Relaxed);
     }
 }
 

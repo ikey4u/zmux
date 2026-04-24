@@ -215,20 +215,26 @@ fn child_rect(
 fn write_leaf(pane: &Pane, is_active: bool, out: &mut String) {
     let cs = pane.cursor_shape.load(Ordering::Relaxed);
     if let Some(copy_view) = crate::copy_mode::render_view(pane) {
+        let hide_cursor = false;
         let _ = write!(
             out,
             "{{\"type\":\"leaf\",\"id\":{},\"rows\":{},\"cols\":{},\
              \"cursor_row\":{},\"cursor_col\":{},\
-             \"hide_cursor\":false,\"alternate_screen\":false,\
+             \"hide_cursor\":{},\"alternate_screen\":false,\
+             \"mouse_mode\":0,\"in_copy_mode\":true,\
              \"cursor_shape\":{},\"active\":{},",
             pane.id,
             pane.last_rows,
             pane.last_cols,
             copy_view.cursor_row,
             copy_view.cursor_col,
+            hide_cursor,
             cs,
             is_active,
         );
+        if let Some(ratio) = copy_view.scroll_ratio {
+            let _ = write!(out, "\"scroll_ratio\":{:.4},", ratio);
+        }
         if !pane.title.is_empty() {
             out.push_str("\"title\":\"");
             json_escape(&pane.title, out);
@@ -253,6 +259,7 @@ fn write_leaf(pane: &Pane, is_active: bool, out: &mut String) {
     let (cr, cc) = screen.cursor_position();
     let hide_cursor = screen.hide_cursor();
     let alt = screen.alternate_screen();
+    let mouse_mode = mouse_protocol_to_u8(screen.mouse_protocol_mode());
 
     if !alt {
         if let Some(reflow_view) = logical_reflow_view(pane, screen) {
@@ -261,6 +268,7 @@ fn write_leaf(pane: &Pane, is_active: bool, out: &mut String) {
                 "{{\"type\":\"leaf\",\"id\":{},\"rows\":{},\"cols\":{},\
                  \"cursor_row\":{},\"cursor_col\":{},\
                  \"hide_cursor\":{},\"alternate_screen\":false,\
+                 \"mouse_mode\":{},\
                  \"cursor_shape\":{},\"active\":{},",
                 pane.id,
                 pane.last_rows,
@@ -268,6 +276,7 @@ fn write_leaf(pane: &Pane, is_active: bool, out: &mut String) {
                 reflow_view.cursor_row,
                 reflow_view.cursor_col,
                 hide_cursor,
+                mouse_mode,
                 cs,
                 is_active,
             );
@@ -288,6 +297,7 @@ fn write_leaf(pane: &Pane, is_active: bool, out: &mut String) {
         "{{\"type\":\"leaf\",\"id\":{},\"rows\":{},\"cols\":{},\
          \"cursor_row\":{},\"cursor_col\":{},\
          \"hide_cursor\":{},\"alternate_screen\":{},\
+         \"mouse_mode\":{},\
          \"cursor_shape\":{},\"active\":{},",
         pane.id,
         pane.last_rows,
@@ -296,6 +306,7 @@ fn write_leaf(pane: &Pane, is_active: bool, out: &mut String) {
         cc,
         hide_cursor,
         alt,
+        mouse_mode,
         cs,
         is_active,
     );
@@ -309,6 +320,16 @@ fn write_leaf(pane: &Pane, is_active: bool, out: &mut String) {
     out.push_str("\"rows_v2\":");
     write_rows_v2(screen, pane.last_rows, pane.last_cols, out);
     out.push('}');
+}
+
+fn mouse_protocol_to_u8(mode: vt100::MouseProtocolMode) -> u8 {
+    match mode {
+        vt100::MouseProtocolMode::None => 0,
+        vt100::MouseProtocolMode::Press => 1,
+        vt100::MouseProtocolMode::PressRelease => 2,
+        vt100::MouseProtocolMode::ButtonMotion => 3,
+        vt100::MouseProtocolMode::AnyMotion => 4,
+    }
 }
 
 fn logical_reflow_view(
@@ -364,6 +385,7 @@ fn build_logical_reflow_view(
         rows,
         cursor_row: cursor_row_idx.saturating_sub(scroll_top) as u16,
         cursor_col: cursor_col as u16,
+        scroll_ratio: None,
     }
 }
 

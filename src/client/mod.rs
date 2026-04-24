@@ -8,9 +8,10 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use crossterm::{
     cursor::{self, SetCursorStyle},
     event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode,
-        KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-        ModifierKeyCode, PopKeyboardEnhancementFlags,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
+        EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, KeyboardEnhancementFlags, ModifierKeyCode, MouseButton,
+        MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
         PushKeyboardEnhancementFlags,
     },
     execute,
@@ -65,6 +66,7 @@ enum InputMode {
 }
 
 const RESIZE_IDLE_TIMEOUT: Duration = Duration::from_millis(500);
+const SCROLL_LINES: usize = 3;
 
 impl ClientApp {
     pub fn new(socket_name: &str, session_name: Option<String>) -> Self {
@@ -93,6 +95,7 @@ impl ClientApp {
             EnterAlternateScreen,
             cursor::Hide,
             EnableBracketedPaste,
+            EnableMouseCapture,
             PushKeyboardEnhancementFlags(
                 KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                     | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
@@ -100,9 +103,11 @@ impl ClientApp {
         )?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
+        let mut mouse_select: Option<MouseSelection> = None;
 
         let prefix_key = (KeyCode::Char('a'), KeyModifiers::CONTROL);
         let mut mode = InputMode::Normal;
+        let mut copy_mode_confirmed = false;
         let mut resize_deadline: Option<Instant> = None;
         let mut status_notice: Option<(String, Instant)> = None;
         let mut hide_borders = false;
@@ -115,6 +120,14 @@ impl ClientApp {
                     if fd.exit {
                         log_client("received exit frame, breaking main loop");
                         break;
+                    }
+                    if mode == InputMode::CopyMode {
+                        if active_in_copy_mode(fd) {
+                            copy_mode_confirmed = true;
+                        } else if copy_mode_confirmed {
+                            mode = InputMode::Normal;
+                            copy_mode_confirmed = false;
+                        }
                     }
                 }
                 let desired_cursor_style = cursor_style_for_shape(
@@ -219,6 +232,11 @@ impl ClientApp {
                         ),
                         _ => {}
                     }
+                    if let Some(ref sel) = mouse_select {
+                        if let Some(ref fd) = frame {
+                            render_mouse_selection(f, sel, fd, hide_borders);
+                        }
+                    }
                 })?;
 
                 if event::poll(Duration::from_millis(8))? {
@@ -232,6 +250,12 @@ impl ClientApp {
                                     if (key.code, key.modifiers) == prefix_key {
                                         mode = InputMode::Prefix;
                                     } else {
+                                        if frame
+                                            .as_ref()
+                                            .map_or(false, active_in_copy_mode)
+                                        {
+                                            server.exit_copy_mode();
+                                        }
                                         let bytes = key_to_bytes(key);
                                         if !bytes.is_empty() {
                                             server.send_input(&bytes);
@@ -301,6 +325,7 @@ impl ClientApp {
                                         (KeyCode::Char('['), _) => {
                                             if server.enter_copy_mode() {
                                                 mode = InputMode::CopyMode;
+                                                copy_mode_confirmed = false;
                                             } else {
                                                 status_notice = Some((
                                                     "copy mode unavailable"
@@ -488,6 +513,7 @@ impl ClientApp {
                                         ) => {
                                             server.exit_copy_mode();
                                             mode = InputMode::Normal;
+                                            copy_mode_confirmed = false;
                                         }
                                         (KeyCode::Char('/'), _) => {
                                             mode = InputMode::CopySearch {
@@ -637,6 +663,7 @@ impl ClientApp {
                                             } else {
                                                 server.exit_copy_mode();
                                                 mode = InputMode::Normal;
+                                                copy_mode_confirmed = false;
                                                 let copy_result =
                                                     copy_to_clipboard(&text);
                                                 status_notice = Some((
@@ -1055,6 +1082,148 @@ impl ClientApp {
                                 },
                             }
                         }
+                        Event::Mouse(mouse) => {
+                            match mode {
+                                InputMode::Normal
+                                | InputMode::Prefix
+                                | InputMode::Resize => {
+                                    if mode != InputMode::Normal {
+                                        mode = InputMode::Normal;
+                                    }
+                                    let mouse_mode = frame
+                                        .as_ref()
+                                        .map(active_mouse_mode)
+                                        .unwrap_or(0);
+                                    if mouse_mode != 0 {
+                                        mouse_select = None;
+                                        let bytes = mouse_to_bytes(mouse);
+                                        if !bytes.is_empty() {
+                                            server.send_input(&bytes);
+                                        }
+                                    } else {
+                                        match mouse.kind {
+                                            MouseEventKind::ScrollUp => {
+                                                server.scroll_up(SCROLL_LINES);
+                                            }
+                                            MouseEventKind::ScrollDown => {
+                                                server
+                                                    .scroll_down(SCROLL_LINES);
+                                            }
+                                            MouseEventKind::Down(
+                                                MouseButton::Left,
+                                            ) => {
+                                                if let Some(ref fd) = frame {
+                                                    let (cols, rows) =
+                                                        terminal::size()
+                                                            .unwrap_or((
+                                                                80, 24,
+                                                            ));
+                                                    let fa =
+                                                        ratatui::layout::Rect {
+                                                            x: 0,
+                                                            y: 0,
+                                                            width: cols,
+                                                            height: rows,
+                                                        };
+                                                    let pa = active_pane_content_rect(fd, fa, hide_borders);
+                                                    if mouse.column >= pa.x
+                                                        && mouse.column
+                                                            < pa.x + pa.width
+                                                        && mouse.row >= pa.y
+                                                        && mouse.row
+                                                            < pa.y + pa.height
+                                                    {
+                                                        mouse_select = Some(
+                                                            MouseSelection {
+                                                                start_col:
+                                                                    mouse.column,
+                                                                start_row:
+                                                                    mouse.row,
+                                                                end_col: mouse
+                                                                    .column,
+                                                                end_row: mouse
+                                                                    .row,
+                                                            },
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            MouseEventKind::Drag(
+                                                MouseButton::Left,
+                                            ) => {
+                                                if let Some(ref mut sel) =
+                                                    mouse_select
+                                                {
+                                                    if let Some(ref fd) = frame
+                                                    {
+                                                        let (cols, rows) =
+                                                            terminal::size()
+                                                                .unwrap_or((
+                                                                    80, 24,
+                                                                ));
+                                                        let fa = ratatui::layout::Rect { x: 0, y: 0, width: cols, height: rows };
+                                                        let pa = active_pane_content_rect(fd, fa, hide_borders);
+                                                        sel.end_col = mouse.column
+                                                            .max(pa.x)
+                                                            .min(pa.x + pa.width.saturating_sub(1));
+                                                        sel.end_row = mouse.row
+                                                            .max(pa.y)
+                                                            .min(pa.y + pa.height.saturating_sub(1));
+                                                    } else {
+                                                        sel.end_col =
+                                                            mouse.column;
+                                                        sel.end_row = mouse.row;
+                                                    }
+                                                }
+                                            }
+                                            MouseEventKind::Up(
+                                                MouseButton::Left,
+                                            ) => {
+                                                if let Some(sel) =
+                                                    mouse_select.take()
+                                                {
+                                                    if let Some(ref fd) = frame
+                                                    {
+                                                        let text = extract_text_from_frame(fd, &sel, hide_borders);
+                                                        if !text.is_empty() {
+                                                            let result = copy_to_clipboard(&text);
+                                                            status_notice = Some((
+                                                                match result {
+                                                                    ClipboardCopyResult::System => format!(
+                                                                        "copied {} chars",
+                                                                        text.chars().count()
+                                                                    ),
+                                                                    ClipboardCopyResult::Osc52 => format!(
+                                                                        "copied {} chars via OSC 52",
+                                                                        text.chars().count()
+                                                                    ),
+                                                                    ClipboardCopyResult::Unavailable => format!(
+                                                                        "yanked {} chars (clipboard unavailable)",
+                                                                        text.chars().count()
+                                                                    ),
+                                                                },
+                                                                Instant::now() + Duration::from_secs(3),
+                                                            ));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                InputMode::CopyMode => match mouse.kind {
+                                    MouseEventKind::ScrollUp => {
+                                        server.scroll_up(SCROLL_LINES);
+                                    }
+                                    MouseEventKind::ScrollDown => {
+                                        server.scroll_down(SCROLL_LINES);
+                                    }
+                                    _ => {}
+                                },
+                                _ => {}
+                            }
+                        }
                         Event::Paste(text) => {
                             handle_paste_event(&server, &mut mode, text);
                         }
@@ -1072,6 +1241,7 @@ impl ClientApp {
         let _ = execute!(
             terminal.backend_mut(),
             DisableBracketedPaste,
+            DisableMouseCapture,
             PopKeyboardEnhancementFlags,
             LeaveAlternateScreen,
             SetCursorStyle::DefaultUserShape,
@@ -1079,6 +1249,265 @@ impl ClientApp {
         );
         run_result
     }
+}
+
+struct MouseSelection {
+    start_col: u16,
+    start_row: u16,
+    end_col: u16,
+    end_row: u16,
+}
+
+fn render_mouse_selection(
+    f: &mut ratatui::Frame,
+    sel: &MouseSelection,
+    fd: &FrameData,
+    hide_borders: bool,
+) {
+    use ratatui::style::{Color, Modifier, Style};
+
+    let (start_row, start_col, end_row, end_col) =
+        if (sel.start_row, sel.start_col) <= (sel.end_row, sel.end_col) {
+            (sel.start_row, sel.start_col, sel.end_row, sel.end_col)
+        } else {
+            (sel.end_row, sel.end_col, sel.start_row, sel.start_col)
+        };
+    if start_row == end_row && start_col == end_col {
+        return;
+    }
+
+    let frame_area = f.area();
+    let pa = active_pane_content_rect(fd, frame_area, hide_borders);
+
+    let clamp_row =
+        |r: u16| r.max(pa.y).min(pa.y + pa.height.saturating_sub(1));
+    let clamp_col = |c: u16| c.max(pa.x).min(pa.x + pa.width);
+
+    let sr = clamp_row(start_row);
+    let sc = clamp_col(start_col);
+    let er = clamp_row(end_row);
+    let ec = clamp_col(end_col);
+
+    if sr == er && sc == ec {
+        return;
+    }
+
+    let buf = f.buffer_mut();
+    for row in sr..=er {
+        let col_begin = if row == sr { sc } else { pa.x };
+        let col_end = if row == er { ec } else { pa.x + pa.width };
+        for col in col_begin..col_end {
+            if col >= frame_area.width {
+                break;
+            }
+            let cell = &mut buf[(col, row)];
+            cell.set_style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::LightCyan)
+                    .remove_modifier(Modifier::REVERSED),
+            );
+        }
+    }
+}
+
+fn extract_text_from_frame(
+    fd: &FrameData,
+    sel: &MouseSelection,
+    hide_borders: bool,
+) -> String {
+    let (start_row, start_col, end_row, end_col) =
+        if (sel.start_row, sel.start_col) <= (sel.end_row, sel.end_col) {
+            (sel.start_row, sel.start_col, sel.end_row, sel.end_col)
+        } else {
+            (sel.end_row, sel.end_col, sel.start_row, sel.start_col)
+        };
+    if start_row == end_row && start_col == end_col {
+        return String::new();
+    }
+    let term_area = ratatui::layout::Rect {
+        x: 0,
+        y: 0,
+        width: terminal::size().map(|(c, _)| c).unwrap_or(80),
+        height: terminal::size().map(|(_, r)| r).unwrap_or(24),
+    };
+    let content_height = term_area.height.saturating_sub(1);
+    let layout_area = ratatui::layout::Rect {
+        x: 0,
+        y: 0,
+        width: term_area.width,
+        height: content_height,
+    };
+    let (rows, content_area) =
+        find_active_pane_content(&fd.layout, layout_area, hide_borders);
+    if rows.is_empty() {
+        return String::new();
+    }
+    let clamp_row = |r: u16| {
+        r.max(content_area.y)
+            .min(content_area.y + content_area.height.saturating_sub(1))
+    };
+    let clamp_col = |c: u16| {
+        c.max(content_area.x)
+            .min(content_area.x + content_area.width)
+    };
+    let start_row = clamp_row(start_row);
+    let start_col = clamp_col(start_col);
+    let end_row = clamp_row(end_row);
+    let end_col = clamp_col(end_col);
+    if start_row == end_row && start_col == end_col {
+        return String::new();
+    }
+    let pane_start_row = (start_row - content_area.y) as usize;
+    let pane_start_col = (start_col - content_area.x) as usize;
+    let pane_end_row = (end_row - content_area.y) as usize;
+    let pane_end_col = (end_col - content_area.x) as usize;
+    let max_row = rows.len().saturating_sub(1);
+    let pane_start_row = pane_start_row.min(max_row);
+    let pane_end_row = pane_end_row.min(max_row);
+    let mut lines: Vec<String> = Vec::new();
+    for row in pane_start_row..=pane_end_row {
+        let row_text = rows.get(row).map(|s| s.as_str()).unwrap_or("");
+        let chars: Vec<char> = row_text.chars().collect();
+        let line_start = if row == pane_start_row {
+            pane_start_col
+        } else {
+            0
+        };
+        let line_end = if row == pane_end_row {
+            pane_end_col.min(chars.len())
+        } else {
+            chars.len()
+        };
+        let s: String = chars
+            .iter()
+            .skip(line_start)
+            .take(line_end.saturating_sub(line_start))
+            .collect();
+        lines.push(s);
+    }
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    for line in &mut lines {
+        let trimmed = line.trim_end().to_string();
+        *line = trimmed;
+    }
+    lines.join("\n")
+}
+
+fn active_pane_content_rect(
+    fd: &FrameData,
+    frame_area: ratatui::layout::Rect,
+    hide_borders: bool,
+) -> ratatui::layout::Rect {
+    let content_height = frame_area.height.saturating_sub(1);
+    let layout_area = ratatui::layout::Rect {
+        x: 0,
+        y: 0,
+        width: frame_area.width,
+        height: content_height,
+    };
+    let (_, pane_area) =
+        find_active_pane_content(&fd.layout, layout_area, hide_borders);
+    pane_area
+}
+
+fn find_active_pane_content(
+    layout: &LayoutJson,
+    area: ratatui::layout::Rect,
+    hide_borders: bool,
+) -> (Vec<String>, ratatui::layout::Rect) {
+    match layout {
+        LayoutJson::Leaf {
+            active: true,
+            rows_v2,
+            ..
+        } => {
+            let content_area =
+                if !hide_borders && area.width > 2 && area.height > 2 {
+                    ratatui::layout::Rect {
+                        x: area.x + 1,
+                        y: area.y + 1,
+                        width: area.width - 2,
+                        height: area.height - 2,
+                    }
+                } else {
+                    area
+                };
+            let rows = rows_v2
+                .iter()
+                .map(|row| row.runs.iter().map(|r| r.text.as_str()).collect())
+                .collect();
+            (rows, content_area)
+        }
+        LayoutJson::Split {
+            direction,
+            sizes,
+            children,
+        } => {
+            let chunks = split_layout_rects_for_extract(
+                area,
+                direction,
+                sizes,
+                children.len(),
+                hide_borders,
+            );
+            for (child, chunk) in children.iter().zip(chunks.into_iter()) {
+                let (rows, content_area) =
+                    find_active_pane_content(child, chunk, hide_borders);
+                if !rows.is_empty() {
+                    return (rows, content_area);
+                }
+            }
+            (Vec::new(), area)
+        }
+        LayoutJson::Leaf { .. } => (Vec::new(), area),
+    }
+}
+
+fn split_layout_rects_for_extract(
+    area: ratatui::layout::Rect,
+    direction: &str,
+    sizes: &[u16],
+    count: usize,
+    hide_borders: bool,
+) -> Vec<ratatui::layout::Rect> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let horizontal = direction == "horizontal";
+    let total_dim = if horizontal { area.width } else { area.height };
+    let gap: u16 = if hide_borders { 0 } else { 1 };
+    let borders = count.saturating_sub(1) as u16 * gap;
+    let available = total_dim.saturating_sub(borders);
+    let total_pct = sizes.iter().copied().sum::<u16>().max(1);
+    let mut rects = Vec::with_capacity(count);
+    let mut offset = 0u16;
+    for (index, &pct) in sizes.iter().enumerate().take(count) {
+        let dim = if index + 1 == count {
+            available.saturating_sub(offset)
+        } else {
+            (available as u32 * pct as u32 / total_pct as u32) as u16
+        };
+        rects.push(if horizontal {
+            ratatui::layout::Rect {
+                x: area.x + offset,
+                y: area.y,
+                width: dim,
+                height: area.height,
+            }
+        } else {
+            ratatui::layout::Rect {
+                x: area.x,
+                y: area.y + offset,
+                width: area.width,
+                height: dim,
+            }
+        });
+        offset += dim + gap;
+    }
+    rects
 }
 
 fn cursor_style_for_shape(shape: Option<u8>) -> SetCursorStyle {
@@ -1487,6 +1916,41 @@ fn key_to_bytes(key: KeyEvent) -> Vec<u8> {
         bytes.insert(0, 0x1b);
     }
     bytes
+}
+
+fn mouse_to_bytes(event: MouseEvent) -> Vec<u8> {
+    let col = event.column;
+    let row = event.row;
+    let mut cb = match event.kind {
+        MouseEventKind::Down(MouseButton::Left) => 0,
+        MouseEventKind::Down(MouseButton::Middle) => 1,
+        MouseEventKind::Down(MouseButton::Right) => 2,
+        MouseEventKind::Up(MouseButton::Left) => 0,
+        MouseEventKind::Up(MouseButton::Middle) => 1,
+        MouseEventKind::Up(MouseButton::Right) => 2,
+        MouseEventKind::Drag(MouseButton::Left) => 32,
+        MouseEventKind::Drag(MouseButton::Middle) => 33,
+        MouseEventKind::Drag(MouseButton::Right) => 34,
+        MouseEventKind::Moved => 35,
+        MouseEventKind::ScrollUp => 64,
+        MouseEventKind::ScrollDown => 65,
+        MouseEventKind::ScrollLeft => 66,
+        MouseEventKind::ScrollRight => 67,
+    };
+    if event.modifiers.contains(KeyModifiers::SHIFT) {
+        cb |= 4;
+    }
+    if event.modifiers.contains(KeyModifiers::ALT) {
+        cb |= 8;
+    }
+    if event.modifiers.contains(KeyModifiers::CONTROL) {
+        cb |= 16;
+    }
+    let suffix = match event.kind {
+        MouseEventKind::Up(_) => 'm',
+        _ => 'M',
+    };
+    format!("\x1b[<{};{};{}{}", cb, col + 1, row + 1, suffix).into_bytes()
 }
 
 fn char_byte_pos(s: &str, char_idx: usize) -> usize {

@@ -24,6 +24,7 @@ pub struct CopyRenderView {
     pub rows: Vec<CopyRenderRow>,
     pub cursor_row: u16,
     pub cursor_col: u16,
+    pub scroll_ratio: Option<f32>,
 }
 
 pub fn enter(pane: &mut Pane) -> bool {
@@ -358,6 +359,52 @@ pub fn page_down(pane: &mut Pane) {
     });
 }
 
+pub fn scroll_up(pane: &mut Pane, lines: usize) -> bool {
+    if pane.copy_state.is_none() {
+        if !enter(pane) {
+            return false;
+        }
+    }
+    let width = pane.last_cols.max(1) as usize;
+    let height = pane.last_rows.max(1) as usize;
+    let Some(state) = pane.copy_state.as_mut() else {
+        return false;
+    };
+    rebuild_wrapped(state, width, height);
+    state.scroll_top = state.scroll_top.saturating_sub(lines);
+    true
+}
+
+pub fn scroll_down(pane: &mut Pane, lines: usize) -> bool {
+    if pane.copy_state.is_none() {
+        return false;
+    }
+    let width = pane.last_cols.max(1) as usize;
+    let height = pane.last_rows.max(1) as usize;
+    let Some(state) = pane.copy_state.as_mut() else {
+        return false;
+    };
+    rebuild_wrapped(state, width, height);
+    let max_scroll = state.wrapped.rows.len().saturating_sub(height);
+    state.scroll_top = (state.scroll_top + lines).min(max_scroll);
+    if state.scroll_top >= max_scroll {
+        exit(pane);
+        return false;
+    }
+    true
+}
+
+pub fn scroll_ratio(pane: &Pane) -> Option<f32> {
+    let state = pane.copy_state.as_ref()?;
+    let height = pane.last_rows.max(1) as usize;
+    let total = state.wrapped.rows.len();
+    if total <= height {
+        return None;
+    }
+    let max_scroll = total - height;
+    Some(state.scroll_top as f32 / max_scroll as f32)
+}
+
 pub fn move_to_top(pane: &mut Pane) {
     with_state(pane, |state, width, height| {
         state.cursor = CopyPoint { line: 0, col: 0 };
@@ -494,10 +541,18 @@ pub fn render_view(pane: &Pane) -> Option<CopyRenderView> {
         let row = state.wrapped.rows.get(absolute_row);
         rows.push(render_row(state, row, active_match));
     }
+    let total_rows = state.wrapped.rows.len();
+    let scroll_ratio = if total_rows > height {
+        let max_scroll = total_rows - height;
+        Some(state.scroll_top as f32 / max_scroll as f32)
+    } else {
+        None
+    };
     Some(CopyRenderView {
         rows,
         cursor_row: cursor_row_idx.saturating_sub(state.scroll_top) as u16,
         cursor_col: cursor_col as u16,
+        scroll_ratio,
     })
 }
 
