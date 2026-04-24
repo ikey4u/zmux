@@ -411,8 +411,8 @@ pub fn resize_pane(pane: &mut Pane, rows: u16, cols: u16) -> io::Result<()> {
         .resize(size)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     if let Ok(mut p) = pane.parser.lock() {
-        let old_rows = p.screen().size().0;
-        if rows < old_rows {
+        let (old_rows, old_cols) = p.screen().size();
+        if rows < old_rows || cols != old_cols {
             let ring_data: Vec<u8> = pane
                 .output_ring
                 .lock()

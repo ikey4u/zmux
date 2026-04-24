@@ -28,6 +28,7 @@ fn log_socket(msg: &str) {
 }
 
 pub struct SocketClient {
+    socket_name: String,
     latest_frame: Arc<Mutex<Option<FrameData>>>,
     write_stream: Arc<Mutex<Box<dyn Write + Send>>>,
 }
@@ -50,6 +51,7 @@ fn exit_frame() -> FrameData {
         },
         status: None,
         exit: true,
+        yank_text: None,
     }
 }
 
@@ -174,6 +176,7 @@ impl SocketClient {
         });
 
         Ok(Self {
+            socket_name: socket_name.to_string(),
             latest_frame,
             write_stream: write_arc,
         })
@@ -218,15 +221,52 @@ impl SocketClient {
     }
 
     pub fn active_window_name(&self) -> String {
-        String::new()
+        self.latest_frame
+            .lock()
+            .ok()
+            .and_then(|f| {
+                f.as_ref().and_then(|fd| fd.status.as_ref()).and_then(|st| {
+                    st.windows.iter().find(|w| w.active).map(|w| w.name.clone())
+                })
+            })
+            .unwrap_or_default()
     }
 
     pub fn session_name(&self) -> String {
-        String::new()
+        self.latest_frame
+            .lock()
+            .ok()
+            .and_then(|f| {
+                f.as_ref().and_then(|fd| fd.status.as_ref()).map(|st| {
+                    st.left
+                        .trim_start_matches('[')
+                        .trim_end_matches(']')
+                        .to_string()
+                })
+            })
+            .unwrap_or_default()
     }
 
     pub fn session_tree(&self) -> Vec<SessionTreeEntry> {
-        Vec::new()
+        let stream = match connect_client(&self.socket_name) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut ws = match stream.try_clone() {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let reader = BufReader::new(stream);
+        if ws.write_all(b"SESSION_TREE\n").is_err() || ws.flush().is_err() {
+            return Vec::new();
+        }
+        let mut buf_reader = reader;
+        let json = match crate::ipc::recv_resp(&mut buf_reader) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        parse_session_tree_json(&json)
     }
 
     pub fn enter_copy_mode(&self) -> bool {
@@ -321,6 +361,56 @@ impl SocketClient {
 
     pub fn copy_yank_selection(&self) -> String {
         self.send_line("COPY_YANK");
+        for _ in 0..50 {
+            thread::sleep(Duration::from_millis(20));
+            if let Some(frame) =
+                self.latest_frame.lock().ok().and_then(|f| f.clone())
+            {
+                if let Some(text) = frame.yank_text {
+                    if let Ok(mut f) = self.latest_frame.lock() {
+                        if let Some(ref mut fd) = *f {
+                            fd.yank_text = None;
+                        }
+                    }
+                    return text;
+                }
+            }
+        }
         String::new()
     }
+}
+
+fn parse_session_tree_json(json: &str) -> Vec<SessionTreeEntry> {
+    let items: Vec<serde_json::Value> = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    items
+        .iter()
+        .filter_map(|v| {
+            let typ = v.get("type")?.as_str()?;
+            match typ {
+                "session" => Some(SessionTreeEntry::Session {
+                    name: v.get("name")?.as_str()?.to_string(),
+                    window_count: v.get("window_count")?.as_u64()? as usize,
+                    is_active: v.get("is_active")?.as_bool()?,
+                }),
+                "window" => Some(SessionTreeEntry::Window {
+                    session_name: v.get("session_name")?.as_str()?.to_string(),
+                    index: v.get("index")?.as_u64()? as usize,
+                    name: v.get("name")?.as_str()?.to_string(),
+                    pane_count: v.get("pane_count")?.as_u64()? as usize,
+                    is_active: v.get("is_active")?.as_bool()?,
+                }),
+                "pane" => Some(SessionTreeEntry::Pane {
+                    session_name: v.get("session_name")?.as_str()?.to_string(),
+                    window_index: v.get("window_index")?.as_u64()? as usize,
+                    pane_id: v.get("pane_id")?.as_u64()? as usize,
+                    index: v.get("index")?.as_u64()? as usize,
+                    is_active: v.get("is_active")?.as_bool()?,
+                }),
+                _ => None,
+            }
+        })
+        .collect()
 }

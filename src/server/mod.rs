@@ -493,6 +493,12 @@ fn handle_client(
             log_server("LIST served, closing");
             return Ok(());
         }
+        "SESSION_TREE" => {
+            let json = build_session_tree_json(&state);
+            send_resp(&mut write_stream, &json)?;
+            log_server("SESSION_TREE served, closing");
+            return Ok(());
+        }
         line if line.starts_with("ATTACH") => {}
         _ => {
             log_server(&format!("unknown hello {:?}, closing", hello));
@@ -514,6 +520,7 @@ fn handle_client(
     }
 
     log_server("entering main loop");
+    let mut pending_yank: Option<String> = None;
     loop {
         let line = match recv_line(&mut reader) {
             Ok(l) if l.is_empty() => {
@@ -569,6 +576,18 @@ fn handle_client(
             handle_copy_nav(&state, "next");
         } else if line == "COPY_SEARCH_PREV" {
             handle_copy_nav(&state, "prev");
+        } else if line == "COPY_YANK" {
+            if let Ok(mut s) = state.lock() {
+                let text = with_active_pane_mut(
+                    &mut s,
+                    crate::copy_mode::yank_selection,
+                )
+                .unwrap_or_default();
+                if !text.is_empty() {
+                    pending_yank = Some(text);
+                    PTY_DATA_READY.store(true, Ordering::Relaxed);
+                }
+            }
         } else if line.starts_with("RESIZE ") {
             let rest = &line["RESIZE ".len()..];
             if let Some((rows, cols)) = parse_size_line(rest) {
@@ -581,6 +600,7 @@ fn handle_client(
                 }
             }
         } else if line == "FRAME?" {
+            let yank_ref = pending_yank.take();
             let json = {
                 let mut s = match state.lock() {
                     Ok(s) => s,
@@ -603,7 +623,7 @@ fn handle_client(
                             None => continue,
                         };
                     let area = frame_layout_area(sz);
-                    build_frame_json(session, win, area)
+                    build_frame_json(session, win, area, yank_ref.as_deref())
                 }
             };
             if send_frame(&mut write_stream, &json).is_err() {
@@ -700,6 +720,7 @@ fn build_frame_json(
     session: &crate::types::session::Session,
     win: &crate::types::session::Window,
     area: Rect,
+    yank_text: Option<&str>,
 ) -> String {
     use crate::layout::serialize_frame;
     let layout_json = serialize_frame(win, area);
@@ -727,10 +748,72 @@ fn build_frame_json(
         status.push('}');
     }
     status.push_str("]}");
-    format!(
-        "{{\"type\":\"frame\",\"layout\":{},\"status\":{}}}",
-        layout_part, status
-    )
+    if let Some(text) = yank_text {
+        let escaped = serde_json::to_string(text).unwrap_or_default();
+        format!(
+            "{{\"type\":\"frame\",\"layout\":{},\"status\":{},\"yank_text\":{}}}",
+            layout_part, status, escaped
+        )
+    } else {
+        format!(
+            "{{\"type\":\"frame\",\"layout\":{},\"status\":{}}}",
+            layout_part, status
+        )
+    }
+}
+
+fn build_session_tree_json(state: &Arc<Mutex<Server>>) -> String {
+    let s = match state.lock() {
+        Ok(s) => s,
+        Err(_) => return "[]".to_string(),
+    };
+    let active_sess_idx = s.active_session_idx;
+    let mut out = String::from("[");
+    let mut first_entry = true;
+    for (si, sess) in s.sessions.iter().enumerate() {
+        let active_win_idx = sess.active_window_idx;
+        let is_active_sess = si == active_sess_idx;
+
+        if !first_entry {
+            out.push(',');
+        }
+        first_entry = false;
+        out.push_str(&format!(
+            "{{\"type\":\"session\",\"name\":{},\"window_count\":{},\"is_active\":{}}}",
+            serde_json::to_string(&sess.name).unwrap_or_default(),
+            sess.windows.len(),
+            is_active_sess
+        ));
+
+        for (wi, win) in sess.windows.iter().enumerate() {
+            let pane_ids = crate::layout::collect_pane_ids(&win.root);
+            let active_pane_id =
+                crate::layout::active_pane(&win.root, &win.active_pane_path)
+                    .map(|p| p.id);
+            let is_active_win = is_active_sess && wi == active_win_idx;
+            out.push_str(&format!(
+                ",{{\"type\":\"window\",\"session_name\":{},\"index\":{},\"name\":{},\"pane_count\":{},\"is_active\":{}}}",
+                serde_json::to_string(&sess.name).unwrap_or_default(),
+                wi,
+                serde_json::to_string(&win.name).unwrap_or_default(),
+                pane_ids.len(),
+                is_active_win
+            ));
+
+            for (pi, &pane_id) in pane_ids.iter().enumerate() {
+                out.push_str(&format!(
+                    ",{{\"type\":\"pane\",\"session_name\":{},\"window_index\":{},\"pane_id\":{},\"index\":{},\"is_active\":{}}}",
+                    serde_json::to_string(&sess.name).unwrap_or_default(),
+                    wi,
+                    pane_id,
+                    pi,
+                    is_active_win && Some(pane_id) == active_pane_id
+                ));
+            }
+        }
+    }
+    out.push(']');
+    out
 }
 
 fn parse_size_line(s: &str) -> Option<(u16, u16)> {
@@ -1499,7 +1582,7 @@ fn cmd_kill_window(state: &mut Server, sz: Size) {
 }
 
 fn cmd_select_pane(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
-    use crate::layout::{pane_path_in_direction, NavDir};
+    use crate::layout::{find_pane_path, pane_path_in_direction, NavDir};
 
     let session = match active_session_mut(state) {
         Some(s) => s,
@@ -1509,6 +1592,17 @@ fn cmd_select_pane(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
         Some(w) => w,
         None => return,
     };
+
+    if let Some(target) = cmd.flag_value("t") {
+        if let Some(id_str) = target.strip_prefix('%') {
+            if let Ok(pane_id) = id_str.parse::<usize>() {
+                if let Some(path) = find_pane_path(&win.root, pane_id) {
+                    win.active_pane_path = path;
+                }
+            }
+        }
+        return;
+    }
 
     let area = frame_layout_area(sz);
 
@@ -1529,8 +1623,6 @@ fn cmd_select_pane(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
         let new_path = pane_path_in_direction(&win.root, &path, d, area);
         if new_path != path {
             win.active_pane_path = new_path;
-        } else {
-            // 方向上无相邻 pane，保持不变（不循环跳转）
         }
     }
 }

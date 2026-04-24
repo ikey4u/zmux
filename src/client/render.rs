@@ -16,6 +16,8 @@ pub struct FrameData {
     pub status: Option<StatusJson>,
     #[serde(default)]
     pub exit: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yank_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -768,6 +770,7 @@ mod tests {
             },
             status: None,
             exit: false,
+            yank_text: None,
         };
 
         assert_eq!(active_cursor_shape(&fd), Some(4));
@@ -792,6 +795,7 @@ mod tests {
             },
             status: None,
             exit: false,
+            yank_text: None,
         };
 
         assert_eq!(active_cursor_shape(&fd), None);
