@@ -9,8 +9,9 @@ use crossterm::{
     cursor::{self, SetCursorStyle},
     event::{
         self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode,
-        KeyEvent, KeyModifiers, KeyboardEnhancementFlags, ModifierKeyCode,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+        ModifierKeyCode, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
@@ -222,7 +223,10 @@ impl ClientApp {
 
                 if event::poll(Duration::from_millis(8))? {
                     match event::read()? {
-                        Event::Key(key) => {
+                        Event::Key(key)
+                            if key.kind == KeyEventKind::Press
+                                || key.kind == KeyEventKind::Repeat =>
+                        {
                             match mode.clone() {
                                 InputMode::Normal => {
                                     if (key.code, key.modifiers) == prefix_key {
@@ -1299,21 +1303,97 @@ fn handle_paste_event(
     }
 }
 
+fn xterm_modifier_param(modifiers: KeyModifiers) -> u8 {
+    let mut param = 1u8;
+    if modifiers.contains(KeyModifiers::SHIFT) {
+        param += 1;
+    }
+    if modifiers.contains(KeyModifiers::ALT) {
+        param += 2;
+    }
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        param += 4;
+    }
+    param
+}
+
+fn csi_letter_with_modifiers(letter: char, modifiers: KeyModifiers) -> Vec<u8> {
+    let param = xterm_modifier_param(modifiers);
+    if param > 1 {
+        format!("\x1b[1;{}{}", param, letter).into_bytes()
+    } else {
+        format!("\x1b[{}", letter).into_bytes()
+    }
+}
+
+fn csi_tilde_with_modifiers(code: u8, modifiers: KeyModifiers) -> Vec<u8> {
+    let param = xterm_modifier_param(modifiers);
+    if param > 1 {
+        format!("\x1b[{};{}~", code, param).into_bytes()
+    } else {
+        format!("\x1b[{}~", code).into_bytes()
+    }
+}
+
+fn fkey_with_modifiers(n: u8, base: &[u8], modifiers: KeyModifiers) -> Vec<u8> {
+    let param = xterm_modifier_param(modifiers);
+    if param > 1 {
+        match n {
+            1..=4 => {
+                let letter = base[base.len() - 1];
+                format!("\x1b[1;{}{}", param, letter as char).into_bytes()
+            }
+            _ => {
+                let code = match n {
+                    5 => 15,
+                    6 => 17,
+                    7 => 18,
+                    8 => 19,
+                    9 => 20,
+                    10 => 21,
+                    11 => 23,
+                    12 => 24,
+                    13 => 25,
+                    14 => 26,
+                    15 => 28,
+                    16 => 29,
+                    17 => 31,
+                    18 => 32,
+                    19 => 33,
+                    20 => 34,
+                    21 => 42,
+                    22 => 43,
+                    23 => 44,
+                    24 => 45,
+                    _ => return vec![],
+                };
+                format!("\x1b[{};{}~", code, param).into_bytes()
+            }
+        }
+    } else {
+        base.to_vec()
+    }
+}
+
 fn key_to_bytes(key: KeyEvent) -> Vec<u8> {
+    let mods = key.modifiers;
+    let mods_no_shift = mods & !KeyModifiers::SHIFT;
+
     let mut bytes = match key.code {
         KeyCode::Char(c) => {
-            if key.modifiers.contains(KeyModifiers::CONTROL) {
+            if mods.contains(KeyModifiers::CONTROL) {
                 let lower = c.to_ascii_lowercase();
                 if lower >= 'a' && lower <= 'z' {
                     vec![lower as u8 - b'a' + 1]
                 } else {
                     match c {
-                        '@' | '2' => vec![0x00],
+                        ' ' | '@' | '2' => vec![0x00],
                         '[' | '3' => vec![0x1b],
                         '\\' | '4' => vec![0x1c],
                         ']' | '5' => vec![0x1d],
                         '^' | '6' => vec![0x1e],
-                        '_' | '7' => vec![0x1f],
+                        '/' | '_' | '7' => vec![0x1f],
+                        '?' => vec![0x7f],
                         _ => {
                             if (c as u32) < 0x20 {
                                 vec![c as u8]
@@ -1334,36 +1414,75 @@ fn key_to_bytes(key: KeyEvent) -> Vec<u8> {
         KeyCode::Enter => b"\r".to_vec(),
         KeyCode::Backspace => b"\x7f".to_vec(),
         KeyCode::Esc => b"\x1b".to_vec(),
-        KeyCode::Tab => b"\t".to_vec(),
-        KeyCode::Up => b"\x1b[A".to_vec(),
-        KeyCode::Down => b"\x1b[B".to_vec(),
-        KeyCode::Right => b"\x1b[C".to_vec(),
-        KeyCode::Left => b"\x1b[D".to_vec(),
-        KeyCode::Home => b"\x1b[H".to_vec(),
-        KeyCode::End => b"\x1b[F".to_vec(),
-        KeyCode::Delete => b"\x1b[3~".to_vec(),
-        KeyCode::PageUp => b"\x1b[5~".to_vec(),
-        KeyCode::PageDown => b"\x1b[6~".to_vec(),
-        KeyCode::F(n) => match n {
-            1 => b"\x1bOP".to_vec(),
-            2 => b"\x1bOQ".to_vec(),
-            3 => b"\x1bOR".to_vec(),
-            4 => b"\x1bOS".to_vec(),
-            5 => b"\x1b[15~".to_vec(),
-            6 => b"\x1b[17~".to_vec(),
-            7 => b"\x1b[18~".to_vec(),
-            8 => b"\x1b[19~".to_vec(),
-            9 => b"\x1b[20~".to_vec(),
-            10 => b"\x1b[21~".to_vec(),
-            11 => b"\x1b[23~".to_vec(),
-            12 => b"\x1b[24~".to_vec(),
-            _ => vec![],
-        },
+        KeyCode::Null => vec![0x00],
+        KeyCode::Tab => {
+            if mods.contains(KeyModifiers::SHIFT) {
+                b"\x1b[Z".to_vec()
+            } else {
+                b"\t".to_vec()
+            }
+        }
+        KeyCode::BackTab => b"\x1b[Z".to_vec(),
+        KeyCode::Up => csi_letter_with_modifiers('A', mods_no_shift),
+        KeyCode::Down => csi_letter_with_modifiers('B', mods_no_shift),
+        KeyCode::Right => csi_letter_with_modifiers('C', mods_no_shift),
+        KeyCode::Left => csi_letter_with_modifiers('D', mods_no_shift),
+        KeyCode::Home => csi_letter_with_modifiers('H', mods_no_shift),
+        KeyCode::End => csi_letter_with_modifiers('F', mods_no_shift),
+        KeyCode::Insert => csi_tilde_with_modifiers(2, mods_no_shift),
+        KeyCode::Delete => csi_tilde_with_modifiers(3, mods_no_shift),
+        KeyCode::PageUp => csi_tilde_with_modifiers(5, mods_no_shift),
+        KeyCode::PageDown => csi_tilde_with_modifiers(6, mods_no_shift),
+        KeyCode::F(n) => {
+            let base: Vec<u8> = match n {
+                1 => b"\x1bOP".to_vec(),
+                2 => b"\x1bOQ".to_vec(),
+                3 => b"\x1bOR".to_vec(),
+                4 => b"\x1bOS".to_vec(),
+                5 => b"\x1b[15~".to_vec(),
+                6 => b"\x1b[17~".to_vec(),
+                7 => b"\x1b[18~".to_vec(),
+                8 => b"\x1b[19~".to_vec(),
+                9 => b"\x1b[20~".to_vec(),
+                10 => b"\x1b[21~".to_vec(),
+                11 => b"\x1b[23~".to_vec(),
+                12 => b"\x1b[24~".to_vec(),
+                13 => b"\x1b[25~".to_vec(),
+                14 => b"\x1b[26~".to_vec(),
+                15 => b"\x1b[28~".to_vec(),
+                16 => b"\x1b[29~".to_vec(),
+                17 => b"\x1b[31~".to_vec(),
+                18 => b"\x1b[32~".to_vec(),
+                19 => b"\x1b[33~".to_vec(),
+                20 => b"\x1b[34~".to_vec(),
+                21 => b"\x1b[42~".to_vec(),
+                22 => b"\x1b[43~".to_vec(),
+                23 => b"\x1b[44~".to_vec(),
+                24 => b"\x1b[45~".to_vec(),
+                _ => vec![],
+            };
+            fkey_with_modifiers(n, &base, mods_no_shift)
+        }
         _ => vec![],
     };
     if !bytes.is_empty()
-        && key.modifiers.contains(KeyModifiers::ALT)
-        && !matches!(key.code, KeyCode::Esc | KeyCode::Modifier(_))
+        && mods.contains(KeyModifiers::ALT)
+        && !matches!(
+            key.code,
+            KeyCode::Esc
+                | KeyCode::Modifier(_)
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Right
+                | KeyCode::Left
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::Insert
+                | KeyCode::Delete
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::F(_)
+        )
     {
         bytes.insert(0, 0x1b);
     }
