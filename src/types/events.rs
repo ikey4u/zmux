@@ -1,4 +1,7 @@
-use std::sync::mpsc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Condvar, Mutex,
+};
 
 use super::session::{ClientId, PaneId, SessionId, Size};
 
@@ -46,5 +49,31 @@ pub struct FramePush {
     pub json: String,
 }
 
-pub static PTY_DATA_READY: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub static PTY_DATA_READY: AtomicBool = AtomicBool::new(false);
+
+static RENDER_CONDVAR: (Mutex<bool>, Condvar) =
+    (Mutex::new(false), Condvar::new());
+
+pub fn mark_data_ready() {
+    PTY_DATA_READY.store(true, Ordering::Relaxed);
+    notify_render();
+}
+
+pub fn notify_render() {
+    if let Ok(mut flag) = RENDER_CONDVAR.0.lock() {
+        *flag = true;
+    }
+    RENDER_CONDVAR.1.notify_one();
+}
+
+pub fn wait_render(timeout: std::time::Duration) {
+    if let Ok(flag) = RENDER_CONDVAR.0.lock() {
+        let result =
+            RENDER_CONDVAR
+                .1
+                .wait_timeout_while(flag, timeout, |ready| !*ready);
+        if let Ok((mut guard, _)) = result {
+            *guard = false;
+        }
+    }
+}

@@ -15,7 +15,7 @@ use std::{os::fd::AsRawFd, path::Path};
 
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 
-use crate::types::{events::PTY_DATA_READY, Pane, PaneId, PaneTextBuffer};
+use crate::types::{Pane, PaneId, PaneTextBuffer};
 
 pub const CURSOR_SHAPE_UNSET: u8 = 255;
 
@@ -261,7 +261,7 @@ fn start_reader_thread(
                 Ok(0) | Err(_) => {
                     dead_flag.store(true, Ordering::Relaxed);
                     data_version.fetch_add(1, Ordering::Relaxed);
-                    PTY_DATA_READY.store(true, Ordering::Relaxed);
+                    crate::types::events::mark_data_ready();
                     break;
                 }
                 Ok(n) => {
@@ -287,7 +287,7 @@ fn start_reader_thread(
                     }
                     cursor_tracker.process(data, &cursor_shape);
                     data_version.fetch_add(1, Ordering::Relaxed);
-                    PTY_DATA_READY.store(true, Ordering::Relaxed);
+                    crate::types::events::mark_data_ready();
                 }
             }
         }

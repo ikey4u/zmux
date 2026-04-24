@@ -15,7 +15,7 @@ use crate::{
     },
     pty::{resize_pane, spawn_pane, SpawnOptions},
     types::{
-        events::PTY_DATA_READY,
+        events::{mark_data_ready, PTY_DATA_READY},
         layout::{LayoutNode, Rect, SplitDirection},
         options::{SessionOptions, WindowOptions},
         session::{PaneId, Server, Session, Size, Window},
@@ -132,7 +132,7 @@ impl InProcessServer {
         if let Ok(mut s) = self.state.lock() {
             resize_all_panes(&mut s, new_size);
         }
-        PTY_DATA_READY.store(true, Ordering::Relaxed);
+        mark_data_ready();
     }
 
     pub fn set_hide_borders(&self, hide: bool) {
@@ -143,7 +143,7 @@ impl InProcessServer {
                 resize_all_panes(&mut s, sz);
             }
         }
-        PTY_DATA_READY.store(true, Ordering::Relaxed);
+        mark_data_ready();
     }
 
     pub fn is_empty(&self) -> bool {
@@ -253,7 +253,7 @@ impl InProcessServer {
         })
         .unwrap_or(false);
         if changed {
-            PTY_DATA_READY.store(true, Ordering::Relaxed);
+            mark_data_ready();
         }
         changed
     }
@@ -267,7 +267,7 @@ impl InProcessServer {
             })
             .unwrap_or(false);
             if changed {
-                PTY_DATA_READY.store(true, Ordering::Relaxed);
+                mark_data_ready();
             }
         }
     }
@@ -344,7 +344,7 @@ impl InProcessServer {
         })
         .unwrap_or(false);
         if changed {
-            PTY_DATA_READY.store(true, Ordering::Relaxed);
+            mark_data_ready();
         }
         changed
     }
@@ -358,7 +358,7 @@ impl InProcessServer {
             with_active_pane_mut(&mut state, crate::copy_mode::search_next)
                 .unwrap_or(false);
         if changed {
-            PTY_DATA_READY.store(true, Ordering::Relaxed);
+            mark_data_ready();
         }
         changed
     }
@@ -372,7 +372,7 @@ impl InProcessServer {
             with_active_pane_mut(&mut state, crate::copy_mode::search_prev)
                 .unwrap_or(false);
         if changed {
-            PTY_DATA_READY.store(true, Ordering::Relaxed);
+            mark_data_ready();
         }
         changed
     }
@@ -386,7 +386,7 @@ impl InProcessServer {
             with_active_pane_mut(&mut state, crate::copy_mode::yank_selection)
                 .unwrap_or_default();
         if !text.is_empty() {
-            PTY_DATA_READY.store(true, Ordering::Relaxed);
+            mark_data_ready();
         }
         text
     }
@@ -395,7 +395,7 @@ impl InProcessServer {
         if let Ok(mut state) = self.state.lock() {
             let changed = with_active_pane_mut(&mut state, f).is_some();
             if changed {
-                PTY_DATA_READY.store(true, Ordering::Relaxed);
+                mark_data_ready();
             }
         }
     }
@@ -596,7 +596,7 @@ fn handle_client(
                 .unwrap_or_default();
                 if !text.is_empty() {
                     pending_yank = Some(text);
-                    PTY_DATA_READY.store(true, Ordering::Relaxed);
+                    mark_data_ready();
                 }
             }
         } else if line.starts_with("SCROLL ") {
@@ -622,7 +622,7 @@ fn handle_client(
                     resize_all_panes(&mut s, sz);
                 }
             }
-            PTY_DATA_READY.store(true, Ordering::Relaxed);
+            mark_data_ready();
         } else if line == "FRAME?" {
             let yank_ref = pending_yank.take();
             let json = {
@@ -690,7 +690,7 @@ fn handle_copy_key_line(state: &Arc<Mutex<Server>>, key: &str) {
     if let Some(f) = pane_fn {
         if let Ok(mut s) = state.lock() {
             with_active_pane_mut(&mut s, f);
-            PTY_DATA_READY.store(true, Ordering::Relaxed);
+            mark_data_ready();
         }
     }
     if key.starts_with("sel_") {
@@ -705,14 +705,14 @@ fn handle_copy_key_line(state: &Arc<Mutex<Server>>, key: &str) {
                 with_active_pane_mut(&mut s, |pane| {
                     crate::copy_mode::start_selection(pane, m)
                 });
-                PTY_DATA_READY.store(true, Ordering::Relaxed);
+                mark_data_ready();
             }
         }
     }
     if key == "clear_sel" {
         if let Ok(mut s) = state.lock() {
             with_active_pane_mut(&mut s, crate::copy_mode::clear_selection);
-            PTY_DATA_READY.store(true, Ordering::Relaxed);
+            mark_data_ready();
         }
     }
 }
@@ -735,7 +735,7 @@ fn handle_scroll_line(state: &Arc<Mutex<Server>>, rest: &str) {
             }
             _ => {}
         });
-        PTY_DATA_READY.store(true, Ordering::Relaxed);
+        mark_data_ready();
     }
 }
 
@@ -751,7 +751,7 @@ fn handle_copy_search_line(state: &Arc<Mutex<Server>>, rest: &str) {
         with_active_pane_mut(&mut s, |pane| {
             crate::copy_mode::search(pane, query.clone(), forward)
         });
-        PTY_DATA_READY.store(true, Ordering::Relaxed);
+        mark_data_ready();
     }
 }
 
@@ -764,7 +764,7 @@ fn handle_copy_nav(state: &Arc<Mutex<Server>>, dir: &str) {
         with_active_pane_mut(&mut s, |pane| {
             f(pane);
         });
-        PTY_DATA_READY.store(true, Ordering::Relaxed);
+        mark_data_ready();
     }
 }
 
@@ -914,7 +914,7 @@ fn render_loop(
 ) {
     let mut first = true;
     loop {
-        thread::sleep(Duration::from_millis(16));
+        crate::types::events::wait_render(Duration::from_millis(16));
 
         let dirty = PTY_DATA_READY.swap(false, Ordering::Relaxed);
         if !dirty && !first {
@@ -958,13 +958,11 @@ fn render_loop(
             };
             let area = frame_layout_area(sz);
             let layout_json = serialize_frame(win, area, s.hide_borders);
-            // 去掉外层 {type:frame, layout:...} 包装，只取 layout 部分
             let layout_part = layout_json
                 .strip_prefix("{\"type\":\"frame\",\"layout\":")
                 .and_then(|s| s.strip_suffix('}'))
                 .unwrap_or("{}");
 
-            // 构建 status JSON
             let session_name = &session.name;
             let active_idx = session.active_window_idx;
             let mut status = String::new();
@@ -1171,7 +1169,7 @@ fn execute_command_string(state: &mut Server, raw: &str, sz: Size) {
     for cmd in cmds {
         dispatch_command(state, &cmd, sz);
     }
-    PTY_DATA_READY.store(true, Ordering::Relaxed);
+    mark_data_ready();
 }
 
 fn execute_command_with_output(
@@ -1188,7 +1186,7 @@ fn execute_command_with_output(
             out.push('\n');
         }
     }
-    PTY_DATA_READY.store(true, Ordering::Relaxed);
+    mark_data_ready();
     out
 }
 
@@ -1272,7 +1270,7 @@ fn dispatch_command_output(
             with_active_pane_mut(state, |pane| {
                 crate::copy_mode::enter(pane);
             });
-            PTY_DATA_READY.store(true, Ordering::Relaxed);
+            mark_data_ready();
             String::new()
         }
         _ => String::new(),
