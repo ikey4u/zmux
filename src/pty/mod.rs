@@ -271,7 +271,7 @@ fn start_reader_thread(
                     }
                     if let Ok(mut ring) = output_ring.lock() {
                         for &b in data {
-                            if ring.len() >= 65536 {
+                            if ring.len() >= 2 * 1024 * 1024 {
                                 ring.pop_front();
                             }
                             ring.push_back(b);
