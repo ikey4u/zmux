@@ -21,6 +21,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 
 mod render;
 mod socket;
+use regex::Regex;
 pub use render::*;
 pub use socket::SocketClient;
 
@@ -1094,7 +1095,21 @@ impl ClientApp {
                                         .as_ref()
                                         .map(active_mouse_mode)
                                         .unwrap_or(0);
-                                    if mouse_mode != 0 {
+                                    let shift_held = mouse
+                                        .modifiers
+                                        .contains(KeyModifiers::SHIFT);
+                                    let shift_overrides = shift_held
+                                        && matches!(
+                                            mouse.kind,
+                                            MouseEventKind::Down(
+                                                MouseButton::Left
+                                            ) | MouseEventKind::Drag(
+                                                MouseButton::Left
+                                            ) | MouseEventKind::Up(
+                                                MouseButton::Left
+                                            )
+                                        );
+                                    if mouse_mode != 0 && !shift_overrides {
                                         mouse_select = None;
                                         let bytes = mouse_to_bytes(mouse);
                                         if !bytes.is_empty() {
@@ -1184,26 +1199,42 @@ impl ClientApp {
                                                 {
                                                     if let Some(ref fd) = frame
                                                     {
-                                                        let text = extract_text_from_frame(fd, &sel, hide_borders);
-                                                        if !text.is_empty() {
-                                                            let result = copy_to_clipboard(&text);
-                                                            status_notice = Some((
-                                                                match result {
-                                                                    ClipboardCopyResult::System => format!(
-                                                                        "copied {} chars",
-                                                                        text.chars().count()
-                                                                    ),
-                                                                    ClipboardCopyResult::Osc52 => format!(
-                                                                        "copied {} chars via OSC 52",
-                                                                        text.chars().count()
-                                                                    ),
-                                                                    ClipboardCopyResult::Unavailable => format!(
-                                                                        "yanked {} chars (clipboard unavailable)",
-                                                                        text.chars().count()
-                                                                    ),
-                                                                },
-                                                                Instant::now() + Duration::from_secs(3),
-                                                            ));
+                                                        let is_click = sel
+                                                            .start_row
+                                                            == sel.end_row
+                                                            && sel.start_col
+                                                                == sel.end_col;
+                                                        if is_click {
+                                                            if let Some(url) = detect_url_at_click(fd, sel.start_row, sel.start_col, hide_borders) {
+                                                                open_url(&url);
+                                                                status_notice = Some((
+                                                                    format!("opening {}", truncate_status_url(&url)),
+                                                                    Instant::now() + Duration::from_secs(3),
+                                                                ));
+                                                            }
+                                                        } else {
+                                                            let text = extract_text_from_frame(fd, &sel, hide_borders);
+                                                            if !text.is_empty()
+                                                            {
+                                                                let result = copy_to_clipboard(&text);
+                                                                status_notice = Some((
+                                                                    match result {
+                                                                        ClipboardCopyResult::System => format!(
+                                                                            "copied {} chars",
+                                                                            text.chars().count()
+                                                                        ),
+                                                                        ClipboardCopyResult::Osc52 => format!(
+                                                                            "copied {} chars via OSC 52",
+                                                                            text.chars().count()
+                                                                        ),
+                                                                        ClipboardCopyResult::Unavailable => format!(
+                                                                            "yanked {} chars (clipboard unavailable)",
+                                                                            text.chars().count()
+                                                                        ),
+                                                                    },
+                                                                    Instant::now() + Duration::from_secs(3),
+                                                                ));
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -1368,22 +1399,17 @@ fn extract_text_from_frame(
     let mut lines: Vec<String> = Vec::new();
     for row in pane_start_row..=pane_end_row {
         let row_text = rows.get(row).map(|s| s.as_str()).unwrap_or("");
-        let chars: Vec<char> = row_text.chars().collect();
-        let line_start = if row == pane_start_row {
+        let col_start = if row == pane_start_row {
             pane_start_col
         } else {
             0
         };
-        let line_end = if row == pane_end_row {
-            pane_end_col.min(chars.len())
+        let col_end = if row == pane_end_row {
+            pane_end_col
         } else {
-            chars.len()
+            usize::MAX
         };
-        let s: String = chars
-            .iter()
-            .skip(line_start)
-            .take(line_end.saturating_sub(line_start))
-            .collect();
+        let s = slice_by_display_col(row_text, col_start, col_end);
         lines.push(s);
     }
     while lines.last().is_some_and(|l| l.trim().is_empty()) {
@@ -1394,6 +1420,23 @@ fn extract_text_from_frame(
         *line = trimmed;
     }
     lines.join("\n")
+}
+
+fn slice_by_display_col(s: &str, col_start: usize, col_end: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut result = String::new();
+    let mut col = 0usize;
+    for ch in s.chars() {
+        let w = ch.width().unwrap_or(1);
+        if col + w > col_end {
+            break;
+        }
+        if col >= col_start {
+            result.push(ch);
+        }
+        col += w;
+    }
+    result
 }
 
 fn active_pane_content_rect(
@@ -2094,6 +2137,93 @@ fn ensure_server_and_connect(
     );
     log_client(&msg);
     Err(io::Error::new(io::ErrorKind::TimedOut, msg))
+}
+
+fn detect_url_at_click(
+    fd: &FrameData,
+    screen_row: u16,
+    screen_col: u16,
+    hide_borders: bool,
+) -> Option<String> {
+    let (cols, rows) = terminal::size().unwrap_or((80, 24));
+    let term_area = ratatui::layout::Rect {
+        x: 0,
+        y: 0,
+        width: cols,
+        height: rows,
+    };
+    let content_height = term_area.height.saturating_sub(1);
+    let layout_area = ratatui::layout::Rect {
+        x: 0,
+        y: 0,
+        width: term_area.width,
+        height: content_height,
+    };
+    let (row_texts, content_area) =
+        find_active_pane_content(&fd.layout, layout_area, hide_borders);
+    if screen_row < content_area.y
+        || screen_row >= content_area.y + content_area.height
+        || screen_col < content_area.x
+        || screen_col >= content_area.x + content_area.width
+    {
+        return None;
+    }
+    let pane_row = (screen_row - content_area.y) as usize;
+    let pane_col = (screen_col - content_area.x) as usize;
+    let line = row_texts.get(pane_row)?;
+    let re = Regex::new(r#"https?://[^\s<>"'()\[\]{}|\\^`\x{FF08}\x{FF09}\x{3001}\x{3002}\x{FF0C}\x{FF1B}]+"#).ok()?;
+    for m in re.find_iter(line) {
+        use unicode_width::UnicodeWidthChar;
+        let start_col: usize = line[..m.start()]
+            .chars()
+            .map(|c| c.width().unwrap_or(1))
+            .sum();
+        let end_col: usize = start_col
+            + line[m.start()..m.end()]
+                .chars()
+                .map(|c| c.width().unwrap_or(1))
+                .sum::<usize>();
+        if pane_col >= start_col && pane_col < end_col {
+            let url = m.as_str();
+            let url = url.trim_end_matches(|c: char| {
+                matches!(c, '.' | ',' | ';' | ':' | '!' | '?')
+            });
+            return Some(url.to_string());
+        }
+    }
+    None
+}
+
+fn open_url(url: &str) {
+    let _ = if cfg!(target_os = "macos") {
+        std::process::Command::new("open")
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    } else {
+        std::process::Command::new("xdg-open")
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    };
+}
+
+fn truncate_status_url(url: &str) -> String {
+    const MAX_CHARS: usize = 50;
+    if url.chars().count() <= MAX_CHARS {
+        url.to_string()
+    } else {
+        let end = url
+            .char_indices()
+            .nth(MAX_CHARS)
+            .map(|(i, _)| i)
+            .unwrap_or(url.len());
+        format!("{}...", &url[..end])
+    }
 }
 
 #[cfg(test)]
