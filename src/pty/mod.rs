@@ -254,7 +254,7 @@ fn start_reader_thread(
     dead_flag: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
-        let mut buf = [0u8; 4096];
+        let mut buf = [0u8; 65536];
         let mut cursor_tracker = CursorShapeTracker::default();
         loop {
             match reader.read(&mut buf) {

@@ -1,6 +1,9 @@
 use std::{
     io::{self, BufReader, Write},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     thread,
     time::Duration,
 };
@@ -31,6 +34,7 @@ pub struct SocketClient {
     socket_name: String,
     latest_frame: Arc<Mutex<Option<FrameData>>>,
     write_stream: Arc<Mutex<Box<dyn Write + Send>>>,
+    frame_counter: Arc<AtomicU64>,
 }
 
 fn exit_frame() -> FrameData {
@@ -124,9 +128,11 @@ impl SocketClient {
             Arc::new(Mutex::new(Some(first_frame)));
         let write_arc: Arc<Mutex<Box<dyn Write + Send>>> =
             Arc::new(Mutex::new(Box::new(writer)));
+        let frame_counter: Arc<AtomicU64> = Arc::new(AtomicU64::new(1));
 
         let frame_arc = Arc::clone(&latest_frame);
         let ws_poll = Arc::clone(&write_arc);
+        let counter_arc = Arc::clone(&frame_counter);
 
         thread::spawn(move || {
             let mut reader = probe_reader;
@@ -169,6 +175,7 @@ impl SocketClient {
                                     }
                                 }
                                 *f = Some(fd);
+                                counter_arc.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                     }
@@ -191,6 +198,7 @@ impl SocketClient {
             socket_name: socket_name.to_string(),
             latest_frame,
             write_stream: write_arc,
+            frame_counter,
         })
     }
 
@@ -207,6 +215,9 @@ impl SocketClient {
         self.latest_frame.lock().ok()?.clone()
     }
 
+    pub fn frame_counter(&self) -> u64 {
+        self.frame_counter.load(Ordering::Relaxed)
+    }
     pub fn send_input(&self, bytes: &[u8]) {
         self.send_line(&format!("INPUT {}", encode_hex(bytes)));
     }

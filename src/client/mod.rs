@@ -113,6 +113,8 @@ impl ClientApp {
         let mut status_notice: Option<(String, Instant)> = None;
         let mut hide_borders = false;
         let mut applied_cursor_style: Option<SetCursorStyle> = None;
+        let mut last_draw_time = Instant::now() - Duration::from_millis(16);
+        let mut last_drawn_counter: u64 = 0;
 
         let run_result: io::Result<()> = (|| {
             loop {
@@ -182,63 +184,77 @@ impl ClientApp {
                     None
                 };
 
-                terminal.draw(|f| {
-                    let in_prefix = mode == InputMode::Prefix;
-                    if let Some(ref fd) = frame {
-                        let mut display_frame = fd.clone();
-                        if let Some(ref message) = status_banner {
-                            if let Some(status) = display_frame.status.as_mut()
-                            {
-                                status.right = message.clone();
+                let current_counter = server.frame_counter();
+                let frame_new = current_counter != last_drawn_counter;
+                if frame_new
+                    || last_draw_time.elapsed() >= Duration::from_millis(16)
+                {
+                    terminal.draw(|f| {
+                        let in_prefix = mode == InputMode::Prefix;
+                        if let Some(ref fd) = frame {
+                            let mut display_frame = fd.clone();
+                            if let Some(ref message) = status_banner {
+                                if let Some(status) =
+                                    display_frame.status.as_mut()
+                                {
+                                    status.right = message.clone();
+                                }
+                            }
+                            render_frame_ex(
+                                f,
+                                &display_frame,
+                                in_prefix,
+                                has_prompt || chooser_entries.is_some(),
+                                hide_borders,
+                            );
+                        } else {
+                            render_loading(f);
+                        }
+                        match &mode {
+                            InputMode::CopySearch { buf, forward, .. } => {
+                                render_prompt(
+                                    f,
+                                    if *forward { "/" } else { "?" },
+                                    buf,
+                                )
+                            }
+                            InputMode::RenameWindow { buf, .. } => {
+                                render_prompt(f, "Rename window: ", buf)
+                            }
+                            InputMode::RenameSession { buf, .. } => {
+                                render_prompt(f, "Rename session: ", buf)
+                            }
+                            InputMode::Command { buf, .. } => {
+                                render_prompt(f, ":", buf)
+                            }
+                            InputMode::SessionChooser {
+                                entries,
+                                selected,
+                                collapsed,
+                                collapsed_windows,
+                            } => render_session_chooser(
+                                f,
+                                entries,
+                                *selected,
+                                collapsed,
+                                collapsed_windows,
+                            ),
+                            _ => {}
+                        }
+                        if let Some(ref sel) = mouse_select {
+                            if let Some(ref fd) = frame {
+                                render_mouse_selection(
+                                    f,
+                                    sel,
+                                    fd,
+                                    hide_borders,
+                                );
                             }
                         }
-                        render_frame_ex(
-                            f,
-                            &display_frame,
-                            in_prefix,
-                            has_prompt || chooser_entries.is_some(),
-                            hide_borders,
-                        );
-                    } else {
-                        render_loading(f);
-                    }
-                    match &mode {
-                        InputMode::CopySearch { buf, forward, .. } => {
-                            render_prompt(
-                                f,
-                                if *forward { "/" } else { "?" },
-                                buf,
-                            )
-                        }
-                        InputMode::RenameWindow { buf, .. } => {
-                            render_prompt(f, "Rename window: ", buf)
-                        }
-                        InputMode::RenameSession { buf, .. } => {
-                            render_prompt(f, "Rename session: ", buf)
-                        }
-                        InputMode::Command { buf, .. } => {
-                            render_prompt(f, ":", buf)
-                        }
-                        InputMode::SessionChooser {
-                            entries,
-                            selected,
-                            collapsed,
-                            collapsed_windows,
-                        } => render_session_chooser(
-                            f,
-                            entries,
-                            *selected,
-                            collapsed,
-                            collapsed_windows,
-                        ),
-                        _ => {}
-                    }
-                    if let Some(ref sel) = mouse_select {
-                        if let Some(ref fd) = frame {
-                            render_mouse_selection(f, sel, fd, hide_borders);
-                        }
-                    }
-                })?;
+                    })?;
+                    last_draw_time = Instant::now();
+                    last_drawn_counter = current_counter;
+                }
 
                 if event::poll(Duration::from_millis(8))? {
                     match event::read()? {
