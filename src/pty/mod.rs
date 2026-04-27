@@ -420,8 +420,9 @@ pub fn resize_pane(pane: &mut Pane, rows: u16, cols: u16) -> io::Result<()> {
                 .map(|ring| ring.iter().copied().collect())
                 .unwrap_or_default();
             if !ring_data.is_empty() {
+                let tail = tail_bytes_for_replay(&ring_data, rows, cols);
                 let mut new_parser = vt100::Parser::new(rows, cols, 2000);
-                new_parser.process(&ring_data);
+                new_parser.process(tail);
                 *p = new_parser;
             } else {
                 p.screen_mut().set_size(rows, cols);
@@ -433,6 +434,19 @@ pub fn resize_pane(pane: &mut Pane, rows: u16, cols: u16) -> io::Result<()> {
     pane.last_rows = rows;
     pane.last_cols = cols;
     Ok(())
+}
+
+const SCROLLBACK_LINES: usize = 2000;
+const BYTES_PER_LINE_FACTOR: usize = 4;
+
+fn tail_bytes_for_replay(data: &[u8], rows: u16, cols: u16) -> &[u8] {
+    let lines_needed = rows as usize + SCROLLBACK_LINES;
+    let bytes_needed = lines_needed * cols as usize * BYTES_PER_LINE_FACTOR;
+    if bytes_needed >= data.len() {
+        return data;
+    }
+    let start = data.len() - bytes_needed;
+    &data[start..]
 }
 
 #[cfg(windows)]

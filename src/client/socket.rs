@@ -153,12 +153,21 @@ impl SocketClient {
                 }
                 match recv_frame(&mut reader) {
                     Ok(json) => {
-                        if let Ok(fd) = serde_json::from_str::<FrameData>(&json)
+                        if let Ok(mut fd) =
+                            serde_json::from_str::<FrameData>(&json)
                         {
                             if fd.exit {
                                 log_socket("poll thread received exit frame");
                             }
                             if let Ok(mut f) = frame_arc.lock() {
+                                if fd.yank_text.is_none() {
+                                    if let Some(prev) = f.as_ref() {
+                                        if prev.yank_text.is_some() {
+                                            fd.yank_text =
+                                                prev.yank_text.clone();
+                                        }
+                                    }
+                                }
                                 *f = Some(fd);
                             }
                         }
