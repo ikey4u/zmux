@@ -439,61 +439,36 @@ pub fn resize_pane(pane: &mut Pane, rows: u16, cols: u16) -> io::Result<()> {
     if rows == pane.last_rows && cols == pane.last_cols {
         return Ok(());
     }
-    let size = PtySize {
-        rows,
-        cols,
-        pixel_width: 0,
-        pixel_height: 0,
-    };
-    pane.master
-        .resize(size)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    if let Ok(mut p) = pane.parser.lock() {
-        let (old_rows, old_cols) = p.size();
-        if rows < old_rows || cols != old_cols {
-            let ring_data: Vec<u8> = pane
-                .output_ring
-                .lock()
-                .ok()
-                .map(|ring| ring.iter().copied().collect())
-                .unwrap_or_default();
-            if !ring_data.is_empty() {
-                let tail = tail_bytes_for_replay(&ring_data, rows, cols);
-                *p = replay_tail_into_parser(tail, rows, cols);
-            } else {
-                p.resize(rows, cols);
-            }
-        } else {
+    let preserve_tui_screen = pane
+        .parser
+        .lock()
+        .map(|p| {
+            let (old_rows, old_cols) = p.size();
+            (rows < old_rows || cols < old_cols)
+                && (p.hide_cursor()
+                    || p.alternate_screen()
+                    || p.mouse_mode() != 0)
+        })
+        .unwrap_or(false);
+
+    if !preserve_tui_screen {
+        let size = PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        pane.master
+            .resize(size)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        if let Ok(mut p) = pane.parser.lock() {
             p.resize(rows, cols);
+            p.scrollback_bottom();
         }
     }
     pane.last_rows = rows;
     pane.last_cols = cols;
     Ok(())
-}
-
-const SCROLLBACK_LINES: usize = 0;
-const BYTES_PER_LINE_FACTOR: usize = 4;
-
-fn tail_bytes_for_replay(data: &[u8], rows: u16, cols: u16) -> &[u8] {
-    let lines_needed = rows as usize + SCROLLBACK_LINES;
-    let bytes_needed = lines_needed * cols as usize * BYTES_PER_LINE_FACTOR;
-    if bytes_needed >= data.len() {
-        return data;
-    }
-    let start = data.len() - bytes_needed;
-    &data[start..]
-}
-
-fn replay_tail_into_parser(
-    tail: &[u8],
-    rows: u16,
-    cols: u16,
-) -> AlacrittyTermState {
-    let mut parser = AlacrittyTermState::new(rows, cols, 2000);
-    parser.process(tail);
-    parser.scrollback_bottom();
-    parser
 }
 
 #[cfg(windows)]
@@ -572,24 +547,5 @@ mod tests {
         tracker.process(b"\x1b[?1049", &cursor_shape);
         tracker.process(b"l", &cursor_shape);
         assert_eq!(cursor_shape.load(Ordering::Relaxed), 5);
-    }
-
-    #[test]
-    fn replay_tail_uses_viewport_sized_window() {
-        let data: Vec<u8> = (0..200).map(|i| i as u8).collect();
-        let tail = tail_bytes_for_replay(&data, 2, 10);
-
-        assert_eq!(tail, &data[120..]);
-    }
-
-    #[test]
-    fn replay_tail_parser_stays_at_scrollback_bottom() {
-        let tail = b"one\r\ntwo\r\nthree\r\nfour\r\nfive";
-        let mut parser = replay_tail_into_parser(tail, 3, 20);
-
-        parser.scrollback_bottom();
-        assert_eq!(parser.size(), (3, 20));
-        parser = replay_tail_into_parser(tail, 3, 20);
-        assert_eq!(parser.size(), (3, 20));
     }
 }
