@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Clear, Paragraph},
     Frame,
 };
 use serde::{Deserialize, Serialize};
@@ -298,6 +298,7 @@ fn render_pane_content(
     if has_border {
         draw_border(f, area, border_color);
     }
+    f.render_widget(Clear, content_area);
 
     let max_rows = content_area.height as usize;
     let max_cols = content_area.width as usize;

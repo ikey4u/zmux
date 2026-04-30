@@ -33,6 +33,8 @@ use crate::{
 pub struct ClientApp {
     pub socket_name: String,
     pub session_name: Option<String>,
+    pub clean: bool,
+    pub start_dir: Option<String>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -70,10 +72,17 @@ const RESIZE_IDLE_TIMEOUT: Duration = Duration::from_millis(500);
 const SCROLL_LINES: usize = 3;
 
 impl ClientApp {
-    pub fn new(socket_name: &str, session_name: Option<String>) -> Self {
+    pub fn new(
+        socket_name: &str,
+        session_name: Option<String>,
+        clean: bool,
+        start_dir: Option<String>,
+    ) -> Self {
         Self {
             socket_name: socket_name.to_string(),
             session_name,
+            clean,
+            start_dir,
         }
     }
 
@@ -86,8 +95,13 @@ impl ClientApp {
         #[cfg(unix)]
         crate::pty::remember_host_termios();
 
-        let server =
-            ensure_server_and_connect(&self.socket_name, &session_name, size)?;
+        let server = ensure_server_and_connect(
+            &self.socket_name,
+            &session_name,
+            size,
+            self.clean,
+            self.start_dir.as_deref(),
+        )?;
 
         terminal::enable_raw_mode()?;
         let mut stdout = io::stdout();
@@ -2084,20 +2098,26 @@ fn ensure_server_and_connect(
     socket_name: &str,
     session_name: &str,
     size: Size,
+    clean: bool,
+    start_dir: Option<&str>,
 ) -> io::Result<SocketClient> {
     log_client(&format!(
-        "ensure_server_and_connect socket='{}' session='{}' size={}x{}",
-        socket_name, session_name, size.rows, size.cols
+        "ensure_server_and_connect socket='{}' session='{}' size={}x{} clean={} start_dir={:?}",
+        socket_name, session_name, size.rows, size.cols, clean, start_dir
     ));
 
-    match SocketClient::connect(socket_name, size) {
-        Ok(client) => {
-            log_client("connected to existing server");
-            return Ok(client);
+    if !clean {
+        match SocketClient::connect(socket_name, size) {
+            Ok(client) => {
+                log_client("connected to existing server");
+                return Ok(client);
+            }
+            Err(e) => {
+                log_client(&format!("connect failed: {}", e));
+            }
         }
-        Err(e) => {
-            log_client(&format!("connect failed: {}", e));
-        }
+    } else {
+        log_client("clean requested; skipping existing server connection");
     }
 
     #[cfg(unix)]
@@ -2120,6 +2140,7 @@ fn ensure_server_and_connect(
         &exe,
         socket_name,
         session_name,
+        start_dir,
     );
     if let Err(e) = child {
         log_client(&format!("spawn failed: {}", e));

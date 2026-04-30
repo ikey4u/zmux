@@ -8,4 +8,5 @@ pub mod platform;
 pub mod pty;
 pub mod server;
 pub mod style;
+pub mod terminal;
 pub mod types;

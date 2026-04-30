@@ -1,5 +1,6 @@
 use std::{fmt::Write as FmtWrite, sync::atomic::Ordering};
 
+use alacritty_terminal::{term::cell::Flags, vte::ansi::Color};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
@@ -7,6 +8,7 @@ use crate::{
         build_wrapped_snapshot, CopyRenderRow, CopyRenderRun, CopyRenderView,
     },
     layout::rect::BORDER_SIZE,
+    terminal::{color_is_default, color_name, AlacrittyTermState},
     types::{
         LayoutNode, Pane, PaneTextSnapshot, Rect, SplitDirection, Window,
         WrappedRow, WrappedSnapshot,
@@ -255,42 +257,10 @@ fn write_leaf(pane: &Pane, is_active: bool, out: &mut String) {
         );
         return;
     };
-    let screen = parser.screen();
-    let (cr, cc) = screen.cursor_position();
-    let hide_cursor = screen.hide_cursor();
-    let alt = screen.alternate_screen();
-    let mouse_mode = mouse_protocol_to_u8(screen.mouse_protocol_mode());
-
-    if !alt {
-        if let Some(reflow_view) = logical_reflow_view(pane, screen) {
-            let _ = write!(
-                out,
-                "{{\"type\":\"leaf\",\"id\":{},\"rows\":{},\"cols\":{},\
-                 \"cursor_row\":{},\"cursor_col\":{},\
-                 \"hide_cursor\":{},\"alternate_screen\":false,\
-                 \"mouse_mode\":{},\
-                 \"cursor_shape\":{},\"active\":{},",
-                pane.id,
-                pane.last_rows,
-                pane.last_cols,
-                reflow_view.cursor_row,
-                reflow_view.cursor_col,
-                hide_cursor,
-                mouse_mode,
-                cs,
-                is_active,
-            );
-            if !pane.title.is_empty() {
-                out.push_str("\"title\":\"");
-                json_escape(&pane.title, out);
-                out.push_str("\",");
-            }
-            out.push_str("\"rows_v2\":");
-            write_copy_rows(&reflow_view.rows, out);
-            out.push('}');
-            return;
-        }
-    }
+    let (cr, cc) = parser.cursor_position();
+    let hide_cursor = parser.hide_cursor();
+    let alt = parser.alternate_screen();
+    let mouse_mode = parser.mouse_mode();
 
     let _ = write!(
         out,
@@ -318,27 +288,17 @@ fn write_leaf(pane: &Pane, is_active: bool, out: &mut String) {
     }
 
     out.push_str("\"rows_v2\":");
-    write_rows_v2(screen, pane.last_rows, pane.last_cols, out);
+    write_rows_v2(&parser, pane.last_rows, pane.last_cols, out);
     out.push('}');
-}
-
-fn mouse_protocol_to_u8(mode: vt100::MouseProtocolMode) -> u8 {
-    match mode {
-        vt100::MouseProtocolMode::None => 0,
-        vt100::MouseProtocolMode::Press => 1,
-        vt100::MouseProtocolMode::PressRelease => 2,
-        vt100::MouseProtocolMode::ButtonMotion => 3,
-        vt100::MouseProtocolMode::AnyMotion => 4,
-    }
 }
 
 fn logical_reflow_view(
     pane: &Pane,
-    screen: &vt100::Screen,
+    term: &AlacrittyTermState,
 ) -> Option<CopyRenderView> {
     let buffer = pane.text_buffer.lock().ok()?;
     if !can_use_logical_reflow(
-        screen,
+        term,
         pane.last_rows,
         pane.last_cols,
         buffer.reflow_enabled(),
@@ -354,15 +314,15 @@ fn logical_reflow_view(
 }
 
 fn can_use_logical_reflow(
-    screen: &vt100::Screen,
+    term: &AlacrittyTermState,
     rows: u16,
     cols: u16,
     reflow_enabled: bool,
 ) -> bool {
-    let (cursor_row, _) = screen.cursor_position();
+    let (cursor_row, _) = term.cursor_position();
     reflow_enabled
-        && !screen.alternate_screen()
-        && !screen_has_non_default_formatting(screen, rows, cols, cursor_row)
+        && !term.alternate_screen()
+        && !screen_has_non_default_formatting(term, rows, cols, cursor_row)
 }
 
 fn build_logical_reflow_view(
@@ -434,26 +394,31 @@ fn render_logical_row(row: Option<&WrappedRow>) -> CopyRenderRow {
 }
 
 fn screen_has_non_default_formatting(
-    screen: &vt100::Screen,
+    term: &AlacrittyTermState,
     rows: u16,
     cols: u16,
     cursor_row: u16,
 ) -> bool {
+    let visible_rows = term.visible_rows();
     for row in 0..rows {
         if row == cursor_row {
             continue;
         }
         for col in 0..cols {
-            let Some(cell) = screen.cell(row, col) else {
+            let Some(cell) = visible_rows
+                .get(row as usize)
+                .and_then(|cells| cells.get(col as usize))
+                .and_then(|cell| cell.as_ref())
+            else {
                 continue;
             };
-            if cell.fgcolor() != vt100::Color::Default
-                || cell.bgcolor() != vt100::Color::Default
-                || cell.dim()
-                || cell.bold()
-                || cell.italic()
-                || cell.underline()
-                || cell.inverse()
+            if !color_is_default(cell.fg)
+                || !color_is_default(cell.bg)
+                || cell.flags.contains(Flags::DIM)
+                || cell.flags.contains(Flags::BOLD)
+                || cell.flags.contains(Flags::ITALIC)
+                || cell.flags.intersects(Flags::ALL_UNDERLINES)
+                || cell.flags.contains(Flags::INVERSE)
             {
                 return true;
             }
@@ -464,14 +429,14 @@ fn screen_has_non_default_formatting(
 
 struct Run {
     text: String,
-    fg: vt100::Color,
-    bg: vt100::Color,
+    fg: Color,
+    bg: Color,
     flags: u8,
     width: u16,
 }
 
 fn write_rows_v2(
-    screen: &vt100::Screen,
+    term: &AlacrittyTermState,
     rows: u16,
     cols: u16,
     out: &mut String,
@@ -482,6 +447,7 @@ fn write_rows_v2(
     const FLAG_UNDERLINE: u8 = 8;
     const FLAG_INVERSE: u8 = 16;
 
+    let visible_rows = term.visible_rows();
     out.push('[');
     for r in 0..rows {
         if r > 0 {
@@ -493,35 +459,37 @@ fn write_rows_v2(
         let mut c = 0u16;
 
         while c < cols {
-            let (text, fg, bg, flags, w) = if let Some(cell) = screen.cell(r, c)
+            let (text, fg, bg, flags, w) = if let Some(cell) = visible_rows
+                .get(r as usize)
+                .and_then(|cells| cells.get(c as usize))
+                .and_then(|cell| cell.as_ref())
             {
-                let t = cell.contents();
-                let t = if t.is_empty() { " " } else { t };
-                let fg = cell.fgcolor();
-                let bg = cell.bgcolor();
                 let mut fl = 0u8;
-                if cell.dim() {
+                if cell.flags.contains(Flags::DIM) {
                     fl |= FLAG_DIM;
                 }
-                if cell.bold() {
+                if cell.flags.contains(Flags::BOLD) {
                     fl |= FLAG_BOLD;
                 }
-                if cell.italic() {
+                if cell.flags.contains(Flags::ITALIC) {
                     fl |= FLAG_ITALIC;
                 }
-                if cell.underline() {
+                if cell.flags.intersects(Flags::ALL_UNDERLINES) {
                     fl |= FLAG_UNDERLINE;
                 }
-                if cell.inverse() {
+                if cell.flags.contains(Flags::INVERSE) {
                     fl |= FLAG_INVERSE;
                 }
-                let w = UnicodeWidthStr::width(t).max(1) as u16;
-                (t.to_string(), fg, bg, fl, w)
+                (cell.text.clone(), cell.fg, cell.bg, fl, cell.width)
             } else {
                 (
                     " ".to_string(),
-                    vt100::Color::Default,
-                    vt100::Color::Default,
+                    Color::Named(
+                        alacritty_terminal::vte::ansi::NamedColor::Foreground,
+                    ),
+                    Color::Named(
+                        alacritty_terminal::vte::ansi::NamedColor::Background,
+                    ),
                     0u8,
                     1u16,
                 )
@@ -607,16 +575,8 @@ fn char_width(ch: char) -> usize {
     UnicodeWidthChar::width(ch).unwrap_or(1).max(1)
 }
 
-fn push_color(c: vt100::Color, out: &mut String) {
-    match c {
-        vt100::Color::Default => out.push_str("default"),
-        vt100::Color::Idx(i) => {
-            let _ = write!(out, "idx:{}", i);
-        }
-        vt100::Color::Rgb(r, g, b) => {
-            let _ = write!(out, "rgb:{},{},{}", r, g, b);
-        }
-    }
+fn push_color(c: Color, out: &mut String) {
+    out.push_str(&color_name(c));
 }
 
 fn json_escape(s: &str, out: &mut String) {
@@ -642,7 +602,16 @@ mod tests {
         build_logical_reflow_view, can_use_logical_reflow,
         screen_has_non_default_formatting,
     };
-    use crate::types::{PaneTextSnapshot, SnapshotLine};
+    use crate::{
+        terminal::AlacrittyTermState,
+        types::{PaneTextSnapshot, SnapshotLine},
+    };
+
+    fn parser_with(data: &[u8], rows: u16, cols: u16) -> AlacrittyTermState {
+        let mut parser = AlacrittyTermState::new(rows, cols, 2000);
+        parser.process(data);
+        parser
+    }
 
     fn plain_row_text(
         snapshot: &PaneTextSnapshot,
@@ -692,36 +661,27 @@ mod tests {
 
     #[test]
     fn prompt_line_styling_does_not_disable_logical_reflow() {
-        let mut parser = vt100::Parser::new(3, 10, 0);
-        parser.process(b"\x1b[31mred");
-        assert!(!screen_has_non_default_formatting(
-            parser.screen(),
-            3,
-            10,
-            0
-        ));
-        assert!(can_use_logical_reflow(parser.screen(), 3, 10, true));
+        let parser = parser_with(b"\x1b[31mred", 3, 10);
+        assert!(!screen_has_non_default_formatting(&parser, 3, 10, 0));
+        assert!(can_use_logical_reflow(&parser, 3, 10, true));
     }
 
     #[test]
     fn styling_above_cursor_still_disables_logical_reflow() {
-        let mut parser = vt100::Parser::new(3, 10, 0);
-        parser.process(b"\x1b[31mred\n\x1b[0mplain");
-        assert!(screen_has_non_default_formatting(parser.screen(), 3, 10, 1));
-        assert!(!can_use_logical_reflow(parser.screen(), 3, 10, true));
+        let parser = parser_with(b"\x1b[31mred\n\x1b[0mplain", 3, 10);
+        assert!(screen_has_non_default_formatting(&parser, 3, 10, 1));
+        assert!(!can_use_logical_reflow(&parser, 3, 10, true));
     }
 
     #[test]
     fn filled_last_row_does_not_disable_logical_reflow() {
-        let mut parser = vt100::Parser::new(2, 5, 0);
-        parser.process(b"12345\n67890");
-        assert!(can_use_logical_reflow(parser.screen(), 2, 5, true));
+        let parser = parser_with(b"12345\n67890", 2, 5);
+        assert!(can_use_logical_reflow(&parser, 2, 5, true));
     }
 
     #[test]
     fn actual_alternate_screen_still_disables_logical_reflow() {
-        let mut parser = vt100::Parser::new(3, 10, 0);
-        parser.process(b"\x1b[?1049h");
-        assert!(!can_use_logical_reflow(parser.screen(), 3, 10, true));
+        let parser = parser_with(b"\x1b[?1049h", 3, 10);
+        assert!(!can_use_logical_reflow(&parser, 3, 10, true));
     }
 }

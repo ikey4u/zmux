@@ -56,6 +56,7 @@ impl InProcessServer {
         session_name: String,
         size: Size,
         socket_name: Option<String>,
+        start_dir: Option<String>,
     ) -> io::Result<Self> {
         let state = Arc::new(Mutex::new(Server::new()));
         let latest_frame: Arc<Mutex<Option<FrameData>>> =
@@ -64,7 +65,12 @@ impl InProcessServer {
 
         {
             let mut s = state.lock().unwrap();
-            create_initial_session(&mut s, &session_name, size)?;
+            create_initial_session(
+                &mut s,
+                &session_name,
+                size,
+                start_dir.as_deref(),
+            )?;
         }
 
         let state2 = Arc::clone(&state);
@@ -483,7 +489,7 @@ fn log_server(msg: &str) {
 fn handle_client(
     stream: std::os::unix::net::UnixStream,
     state: Arc<Mutex<Server>>,
-    _latest_frame: Arc<Mutex<Option<FrameData>>>,
+    latest_frame: Arc<Mutex<Option<FrameData>>>,
     size_arc: Arc<Mutex<Size>>,
 ) -> io::Result<()> {
     use std::io::BufReader;
@@ -636,6 +642,26 @@ fn handle_client(
                 if server_is_empty(&s) {
                     log_server("all sessions empty, sending exit frame");
                     "{\"type\":\"frame\",\"exit\":true,\"layout\":{\"type\":\"leaf\",\"id\":0,\"rows\":1,\"cols\":1,\"cursor_row\":0,\"cursor_col\":0,\"hide_cursor\":true,\"alternate_screen\":false,\"mouse_mode\":0,\"in_copy_mode\":false,\"cursor_shape\":255,\"active\":false,\"rows_v2\":[]}}".to_string()
+                } else if let Some(mut frame) =
+                    latest_frame.lock().ok().and_then(|frame| frame.clone())
+                {
+                    if let Some(yank_text) = yank_ref {
+                        frame.yank_text = Some(yank_text.to_string());
+                    }
+                    serde_json::to_string(&frame).unwrap_or_else(|_| {
+                        let session = s.active_session().unwrap();
+                        let win = session
+                            .windows
+                            .get(session.active_window_idx)
+                            .unwrap();
+                        build_frame_json(
+                            session,
+                            win,
+                            frame_layout_area(sz),
+                            None,
+                            s.hide_borders,
+                        )
+                    })
                 } else {
                     let session = match s.active_session() {
                         Some(s) => s,
@@ -1076,6 +1102,7 @@ fn create_initial_session(
     state: &mut Server,
     name: &str,
     size: Size,
+    start_dir: Option<&str>,
 ) -> io::Result<()> {
     let session_id = state.alloc_session_id();
     let mut session = Session::new(session_id, name.to_string());
@@ -1084,7 +1111,9 @@ fn create_initial_session(
     let pane_id = session.alloc_pane_id();
     let window_id = session.alloc_window_id();
 
-    let start_dir = crate::pty::default_start_dir();
+    let start_dir = start_dir
+        .map(|dir| dir.to_string())
+        .or_else(crate::pty::default_start_dir);
     let (rows, cols) = root_pane_size(size);
     let pane = spawn_pane(SpawnOptions {
         pane_id,
@@ -1107,7 +1136,7 @@ fn create_initial_session(
         layout_index: 0,
         last_output_time: Instant::now(),
         last_seen_version: 0,
-        default_start_dir: None,
+        default_start_dir: start_dir.clone(),
     };
     session.windows.push(window);
     state.sessions.push(session);
@@ -2006,7 +2035,11 @@ fn cmd_clear_pane(state: &mut Server) {
             *buf = crate::types::PaneTextBuffer::new(5 * 1024 * 1024);
         }
         if let Ok(mut parser) = pane.parser.lock() {
-            *parser = vt100::Parser::new(pane.last_rows, pane.last_cols, 2000);
+            *parser = crate::terminal::AlacrittyTermState::new(
+                pane.last_rows,
+                pane.last_cols,
+                2000,
+            );
         }
         let _ = pane.writer.write_all(b"\r");
         let _ = pane.writer.flush();

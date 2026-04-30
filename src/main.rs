@@ -18,6 +18,12 @@ struct Cli {
 
     #[arg(short = 's', long)]
     session: Option<String>,
+
+    #[arg(long)]
+    clean: bool,
+
+    #[arg(short = 'c', long = "directory", value_name = "DIR")]
+    directory: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -48,13 +54,19 @@ fn main() -> io::Result<()> {
 
     match cli.command {
         Some(Cmd::Server) => {
-            run_server_daemon(&socket, cli.session.as_deref())?;
+            run_server_daemon(
+                &socket,
+                cli.session.as_deref(),
+                cli.directory.as_deref(),
+            )?;
         }
         Some(Cmd::New { session }) => {
-            ClientApp::new(&socket, session).run()?;
+            ClientApp::new(&socket, session, cli.clean, cli.directory.clone())
+                .run()?;
         }
         Some(Cmd::Attach { target }) => {
-            ClientApp::new(&socket, target).run()?;
+            ClientApp::new(&socket, target, cli.clean, cli.directory.clone())
+                .run()?;
         }
         Some(Cmd::Ls) => {
             run_ls(&socket)?;
@@ -64,7 +76,8 @@ fn main() -> io::Result<()> {
             std::process::exit(1);
         }
         None => {
-            ClientApp::new(&socket, cli.session).run()?;
+            ClientApp::new(&socket, cli.session, cli.clean, cli.directory)
+                .run()?;
         }
     }
 
@@ -74,6 +87,7 @@ fn main() -> io::Result<()> {
 fn run_server_daemon(
     socket_name: &str,
     session_name: Option<&str>,
+    start_dir: Option<&str>,
 ) -> io::Result<()> {
     use zmux::{server::InProcessServer, types::session::Size};
 
@@ -82,8 +96,12 @@ fn run_server_daemon(
 
     let session = session_name.unwrap_or("0").to_string();
     let size = Size::new(24, 80);
-    let server =
-        InProcessServer::start(session, size, Some(socket_name.to_string()))?;
+    let server = InProcessServer::start(
+        session,
+        size,
+        Some(socket_name.to_string()),
+        start_dir.map(|dir| dir.to_string()),
+    )?;
     server.run_socket_server(socket_name)
 }
 

@@ -4,6 +4,7 @@ pub fn spawn_server_background(
     exe: &PathBuf,
     socket_name: &str,
     session_name: &str,
+    start_dir: Option<&str>,
 ) -> io::Result<()> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -13,6 +14,10 @@ pub fn spawn_server_background(
     cmd.arg(socket_name);
     cmd.arg("--session");
     cmd.arg(session_name);
+    if let Some(start_dir) = start_dir {
+        cmd.arg("--directory");
+        cmd.arg(start_dir);
+    }
     cmd.creation_flags(CREATE_NO_WINDOW);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());

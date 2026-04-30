@@ -1,3 +1,4 @@
+use alacritty_terminal::vte::ansi::{Color as TermColor, NamedColor};
 use ratatui::style::{Color, Modifier, Style};
 
 pub fn parse_color(s: &str) -> Color {
@@ -80,26 +81,29 @@ pub fn parse_style(spec: &str) -> Style {
     style
 }
 
-pub fn vt_color_to_ratatui(c: vt100::Color) -> Color {
+pub fn term_color_to_ratatui(c: TermColor) -> Color {
     match c {
-        vt100::Color::Default => Color::Reset,
-        vt100::Color::Idx(0) => Color::Black,
-        vt100::Color::Idx(1) => Color::Red,
-        vt100::Color::Idx(2) => Color::Green,
-        vt100::Color::Idx(3) => Color::Yellow,
-        vt100::Color::Idx(4) => Color::Blue,
-        vt100::Color::Idx(5) => Color::Magenta,
-        vt100::Color::Idx(6) => Color::Cyan,
-        vt100::Color::Idx(7) => Color::Gray,
-        vt100::Color::Idx(8) => Color::DarkGray,
-        vt100::Color::Idx(9) => Color::LightRed,
-        vt100::Color::Idx(10) => Color::LightGreen,
-        vt100::Color::Idx(11) => Color::LightYellow,
-        vt100::Color::Idx(12) => Color::LightBlue,
-        vt100::Color::Idx(13) => Color::LightMagenta,
-        vt100::Color::Idx(14) => Color::LightCyan,
-        vt100::Color::Idx(15) => Color::White,
-        vt100::Color::Idx(i) => Color::Indexed(i),
-        vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+        TermColor::Named(NamedColor::Foreground | NamedColor::Background) => {
+            Color::Reset
+        }
+        TermColor::Named(NamedColor::Black) => Color::Black,
+        TermColor::Named(NamedColor::Red) => Color::Red,
+        TermColor::Named(NamedColor::Green) => Color::Green,
+        TermColor::Named(NamedColor::Yellow) => Color::Yellow,
+        TermColor::Named(NamedColor::Blue) => Color::Blue,
+        TermColor::Named(NamedColor::Magenta) => Color::Magenta,
+        TermColor::Named(NamedColor::Cyan) => Color::Cyan,
+        TermColor::Named(NamedColor::White) => Color::Gray,
+        TermColor::Named(NamedColor::BrightBlack) => Color::DarkGray,
+        TermColor::Named(NamedColor::BrightRed) => Color::LightRed,
+        TermColor::Named(NamedColor::BrightGreen) => Color::LightGreen,
+        TermColor::Named(NamedColor::BrightYellow) => Color::LightYellow,
+        TermColor::Named(NamedColor::BrightBlue) => Color::LightBlue,
+        TermColor::Named(NamedColor::BrightMagenta) => Color::LightMagenta,
+        TermColor::Named(NamedColor::BrightCyan) => Color::LightCyan,
+        TermColor::Named(NamedColor::BrightWhite) => Color::White,
+        TermColor::Named(_) => Color::Reset,
+        TermColor::Indexed(i) => Color::Indexed(i),
+        TermColor::Spec(rgb) => Color::Rgb(rgb.r, rgb.g, rgb.b),
     }
 }

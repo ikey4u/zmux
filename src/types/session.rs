@@ -16,6 +16,7 @@ use super::{
     mode::{CopyModeState, Mode},
     options::{GlobalOptions, SessionOptions, WindowOptions},
 };
+use crate::terminal::AlacrittyTermState;
 
 pub type SessionId = usize;
 pub type WindowId = usize;
@@ -39,7 +40,7 @@ pub struct Pane {
     pub master: Box<dyn MasterPty>,
     pub writer: Box<dyn std::io::Write + Send>,
     pub child: Box<dyn portable_pty::Child>,
-    pub parser: Arc<Mutex<vt100::Parser>>,
+    pub parser: Arc<Mutex<AlacrittyTermState>>,
     pub last_rows: u16,
     pub last_cols: u16,
     pub title: String,

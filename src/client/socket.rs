@@ -93,33 +93,40 @@ impl SocketClient {
         log_socket("sent ATTACH + FRAME?");
 
         let mut probe_reader = BufReader::new(reader_stream);
-        let first_frame = match recv_frame(&mut probe_reader) {
-            Ok(json) => {
-                log_socket(&format!("got first frame ({} bytes)", json.len()));
-                let frame =
-                    serde_json::from_str::<FrameData>(&json).map_err(|e| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("failed to decode first frame: {}", e),
-                        )
-                    })?;
-                if frame.exit {
-                    log_socket("first frame was exit frame");
+        let (first_frame, first_frame_json) =
+            match recv_frame(&mut probe_reader) {
+                Ok(json) => {
+                    log_socket(&format!(
+                        "got first frame ({} bytes)",
+                        json.len()
+                    ));
+                    let frame = serde_json::from_str::<FrameData>(&json)
+                        .map_err(|e| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("failed to decode first frame: {}", e),
+                            )
+                        })?;
+                    if frame.exit {
+                        log_socket("first frame was exit frame");
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            "server has no attachable sessions",
+                        ));
+                    }
+                    (frame, json)
+                }
+                Err(e) => {
+                    log_socket(&format!("first frame timeout/error: {}", e));
                     return Err(io::Error::new(
-                        io::ErrorKind::ConnectionAborted,
-                        "server has no attachable sessions",
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "server did not respond to first FRAME?: {}",
+                            e
+                        ),
                     ));
                 }
-                frame
-            }
-            Err(e) => {
-                log_socket(&format!("first frame timeout/error: {}", e));
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("server did not respond to first FRAME?: {}", e),
-                ));
-            }
-        };
+            };
 
         probe_reader.get_ref().set_read_timeout(None)?;
         log_socket("connection established, starting poll thread");
@@ -136,6 +143,7 @@ impl SocketClient {
 
         thread::spawn(move || {
             let mut reader = probe_reader;
+            let mut last_frame_json = first_frame_json;
             loop {
                 {
                     let mut ws = match ws_poll.lock() {
@@ -159,6 +167,11 @@ impl SocketClient {
                 }
                 match recv_frame(&mut reader) {
                     Ok(json) => {
+                        if json == last_frame_json {
+                            thread::sleep(Duration::from_millis(16));
+                            continue;
+                        }
+                        last_frame_json = json.clone();
                         if let Ok(mut fd) =
                             serde_json::from_str::<FrameData>(&json)
                         {
@@ -190,7 +203,7 @@ impl SocketClient {
                         break;
                     }
                 }
-                thread::sleep(Duration::from_millis(2));
+                thread::sleep(Duration::from_millis(16));
             }
         });
 

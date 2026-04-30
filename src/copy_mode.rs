@@ -1,8 +1,11 @@
 use unicode_width::UnicodeWidthChar;
 
-use crate::types::{
-    CopyModeState, CopyPoint, CopySnapshotSource, Pane, PaneTextSnapshot,
-    SearchMatch, SelectionMode, SnapshotLine, WrappedRow, WrappedSnapshot,
+use crate::{
+    terminal::AlacrittyTermState,
+    types::{
+        CopyModeState, CopyPoint, CopySnapshotSource, Pane, PaneTextSnapshot,
+        SearchMatch, SelectionMode, SnapshotLine, WrappedRow, WrappedSnapshot,
+    },
 };
 
 #[derive(Clone)]
@@ -50,16 +53,16 @@ fn snapshot_for_copy_mode(
         .lock()
         .ok()
         .map(|buffer| (buffer.reflow_enabled(), buffer.snapshot()));
-    let mut parser = pane.parser.lock().ok();
+    let parser = pane.parser.lock().ok();
     let alternate_screen = parser
         .as_ref()
-        .map(|p| p.screen().alternate_screen())
+        .map(|p| p.alternate_screen())
         .unwrap_or(false);
     let parser_snapshot = if alternate_screen {
-        parser.as_mut().map(|p| snapshot_from_parser(p))
+        parser.as_ref().map(|p| snapshot_from_parser(p))
     } else {
         snapshot_from_output_ring(pane)
-            .or_else(|| parser.as_mut().map(|p| snapshot_from_parser(p)))
+            .or_else(|| parser.as_ref().map(|p| snapshot_from_parser(p)))
     };
     select_snapshot_for_copy_mode(
         buffer_snapshot,
@@ -80,9 +83,9 @@ fn snapshot_from_output_ring(pane: &Pane) -> Option<PaneTextSnapshot> {
     }
     let wide_cols = 500u16;
     let rows = pane.last_rows.max(24);
-    let mut tmp_parser = vt100::Parser::new(rows, wide_cols, 2000);
+    let mut tmp_parser = AlacrittyTermState::new(rows, wide_cols, 2000);
     tmp_parser.process(&ring_data);
-    Some(snapshot_from_parser(&mut tmp_parser))
+    Some(snapshot_from_parser(&tmp_parser))
 }
 
 fn select_snapshot_for_copy_mode(
@@ -105,47 +108,23 @@ fn select_snapshot_for_copy_mode(
     buffer_snapshot.map(|(_, snapshot)| (CopySnapshotSource::Buffer, snapshot))
 }
 
-fn snapshot_from_parser(parser: &mut vt100::Parser) -> PaneTextSnapshot {
-    let screen = parser.screen_mut();
-    let original_scrollback = screen.scrollback();
-    screen.set_scrollback(usize::MAX);
-    let max_scrollback = screen.scrollback();
-    screen.set_scrollback(0);
-    let (rows, cols) = screen.size();
-    let rows = rows.max(1);
-    let cols = cols.max(1);
-    let (cursor_row, cursor_col) = screen.cursor_position();
-    let cursor_physical_row = max_scrollback + cursor_row as usize;
-    let mut physical_rows = Vec::with_capacity(max_scrollback + rows as usize);
+fn snapshot_from_parser(parser: &AlacrittyTermState) -> PaneTextSnapshot {
+    let (rows, cursor_physical_row, cursor_col) = parser.snapshot_rows();
+    let mut physical_rows = Vec::with_capacity(rows.len());
 
-    for offset in (1..=max_scrollback).rev() {
-        screen.set_scrollback(offset);
-        if let Some(row) = snapshot_visible_row(screen, 0, cols, 0) {
-            physical_rows.push(row);
-        }
-    }
-
-    screen.set_scrollback(0);
-    for row_idx in 0..rows {
-        let min_width = if row_idx == cursor_row {
+    for (row_idx, cells) in rows.iter().enumerate() {
+        let min_width = if row_idx == cursor_physical_row {
             cursor_col as usize
         } else {
             0
         };
-        if let Some(row) =
-            snapshot_visible_row(screen, row_idx, cols, min_width)
-        {
+        if let Some(row) = snapshot_visible_row(cells, min_width) {
             physical_rows.push(row);
         }
     }
     trim_viewport_blank_tail(&mut physical_rows, cursor_physical_row);
 
-    screen.set_scrollback(original_scrollback);
-    snapshot_from_physical_rows(
-        &physical_rows,
-        cursor_physical_row,
-        cursor_col as usize,
-    )
+    snapshot_from_physical_rows(&physical_rows, cursor_physical_row, cursor_col)
 }
 
 fn trim_viewport_blank_tail(
@@ -170,15 +149,24 @@ struct ScreenSnapshotRow {
 }
 
 fn snapshot_visible_row(
-    screen: &vt100::Screen,
-    row_idx: u16,
-    cols: u16,
+    cells: &[Option<crate::terminal::TerminalCell>],
     min_width: usize,
 ) -> Option<ScreenSnapshotRow> {
-    let row_text = screen.rows(0, cols).nth(row_idx as usize)?;
+    let mut row_text = String::new();
+    let mut wrapped = false;
+    for cell in cells {
+        if let Some(cell) = cell {
+            row_text.push_str(&cell.text);
+            wrapped |= cell
+                .flags
+                .contains(alacritty_terminal::term::cell::Flags::WRAPLINE);
+        } else {
+            row_text.push(' ');
+        }
+    }
     Some(ScreenSnapshotRow {
         text: trim_screen_row(&row_text, min_width),
-        wrapped: screen.row_wrapped(row_idx),
+        wrapped,
     })
 }
 
@@ -1419,9 +1407,9 @@ mod tests {
 
     #[test]
     fn parser_snapshot_tracks_wrapped_prompt_cursor() {
-        let mut parser = vt100::Parser::new(3, 5, 0);
+        let mut parser = AlacrittyTermState::new(3, 5, 0);
         parser.process(b"hello world");
-        let snapshot = snapshot_from_parser(&mut parser);
+        let snapshot = snapshot_from_parser(&parser);
         assert_eq!(snapshot.lines.len(), 1);
         assert_eq!(snapshot.lines[0].text, "hello world");
         assert_eq!(snapshot.cursor_line, 0);
@@ -1430,9 +1418,9 @@ mod tests {
 
     #[test]
     fn parser_snapshot_preserves_scrollback_history() {
-        let mut parser = vt100::Parser::new(2, 8, 10);
+        let mut parser = AlacrittyTermState::new(2, 8, 10);
         parser.process(b"older\r\nprompt\r\n$");
-        let snapshot = snapshot_from_parser(&mut parser);
+        let snapshot = snapshot_from_parser(&parser);
         assert_eq!(snapshot.lines.len(), 3);
         assert_eq!(snapshot.lines[0].text, "older");
         assert_eq!(snapshot.lines[1].text, "prompt");
@@ -1443,9 +1431,9 @@ mod tests {
 
     #[test]
     fn parser_snapshot_trims_blank_tail_below_cursor() {
-        let mut parser = vt100::Parser::new(5, 20, 10);
+        let mut parser = AlacrittyTermState::new(5, 20, 10);
         parser.process(b"prompt\r\n$");
-        let snapshot = snapshot_from_parser(&mut parser);
+        let snapshot = snapshot_from_parser(&parser);
         assert_eq!(snapshot.lines.len(), 2);
         assert_eq!(snapshot.lines[0].text, "prompt");
         assert_eq!(snapshot.lines[1].text, "$");
@@ -1454,19 +1442,19 @@ mod tests {
     }
 
     #[test]
-    fn parser_height_shrink_can_leave_only_first_visible_rows() {
-        let mut parser = vt100::Parser::new(60, 80, 2000);
+    fn parser_height_shrink_preserves_scrollback_history() {
+        let mut parser = AlacrittyTermState::new(60, 80, 2000);
         let mut output = String::new();
         for i in 0..=50 {
             output.push_str(&i.to_string());
             output.push_str("\r\n");
         }
         parser.process(output.as_bytes());
-        parser.screen_mut().set_size(26, 80);
-        let snapshot = snapshot_from_parser(&mut parser);
-        assert_eq!(snapshot.lines.len(), 26);
+        parser.resize(26, 80);
+        let snapshot = snapshot_from_parser(&parser);
+        assert!(snapshot.lines.len() >= 51);
         assert_eq!(snapshot.lines[0].text, "0");
-        assert_eq!(snapshot.lines[25].text, "25");
+        assert!(snapshot.lines.iter().any(|line| line.text == "50"));
     }
 
     #[test]

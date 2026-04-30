@@ -8,14 +8,17 @@ use std::{
         Arc, Mutex,
     },
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 #[cfg(unix)]
 use std::{os::fd::AsRawFd, path::Path};
 
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 
-use crate::types::{Pane, PaneId, PaneTextBuffer};
+use crate::{
+    terminal::AlacrittyTermState,
+    types::{Pane, PaneId, PaneTextBuffer},
+};
 
 pub const CURSOR_SHAPE_UNSET: u8 = 255;
 
@@ -90,8 +93,9 @@ pub fn spawn_pane(opts: SpawnOptions<'_>) -> io::Result<Pane> {
         .take_writer()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-    let parser =
-        Arc::new(Mutex::new(vt100::Parser::new(opts.rows, opts.cols, 2000)));
+    let parser = Arc::new(Mutex::new(AlacrittyTermState::new(
+        opts.rows, opts.cols, 2000,
+    )));
     let data_version: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let cursor_shape: Arc<AtomicU8> =
         Arc::new(AtomicU8::new(CURSOR_SHAPE_UNSET));
@@ -245,7 +249,7 @@ fn is_zsh_shell(shell: &str) -> bool {
 fn start_reader_thread(
     mut reader: Box<dyn io::Read + Send>,
     _pane_id: PaneId,
-    parser: Arc<Mutex<vt100::Parser>>,
+    parser: Arc<Mutex<AlacrittyTermState>>,
     data_version: Arc<AtomicU64>,
     cursor_shape: Arc<AtomicU8>,
     bell_pending: Arc<AtomicBool>,
@@ -256,6 +260,10 @@ fn start_reader_thread(
     thread::spawn(move || {
         let mut buf = [0u8; 65536];
         let mut cursor_tracker = CursorShapeTracker::default();
+        let render_debounce_seq = Arc::new(AtomicU64::new(0));
+        let mut burst_window_start = Instant::now();
+        let mut burst_bytes = 0usize;
+        let mut suppress_until: Option<Instant> = None;
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => {
@@ -266,9 +274,10 @@ fn start_reader_thread(
                 }
                 Ok(n) => {
                     let data = &buf[..n];
-                    if let Ok(mut p) = parser.lock() {
-                        p.process(data);
-                    }
+                    let should_render = parser
+                        .lock()
+                        .map(|mut p| p.process(data))
+                        .unwrap_or(true);
                     if let Ok(mut ring) = output_ring.lock() {
                         for &b in data {
                             if ring.len() >= 2 * 1024 * 1024 {
@@ -287,9 +296,38 @@ fn start_reader_thread(
                     }
                     cursor_tracker.process(data, &cursor_shape);
                     data_version.fetch_add(1, Ordering::Relaxed);
-                    crate::types::events::mark_data_ready();
+                    let now = Instant::now();
+                    if now.duration_since(burst_window_start)
+                        > Duration::from_millis(50)
+                    {
+                        burst_window_start = now;
+                        burst_bytes = 0;
+                    }
+                    burst_bytes = burst_bytes.saturating_add(n);
+                    let high_volume = n >= 2048 || burst_bytes >= 8192;
+                    if high_volume {
+                        suppress_until = Some(now + Duration::from_millis(120));
+                    }
+                    let suppress_render =
+                        suppress_until.is_some_and(|until| now < until);
+                    if should_render && !suppress_render {
+                        crate::types::events::mark_data_ready();
+                    } else {
+                        schedule_debounced_render(&render_debounce_seq);
+                    }
                 }
             }
+        }
+    });
+}
+
+fn schedule_debounced_render(seq: &Arc<AtomicU64>) {
+    let generation = seq.fetch_add(1, Ordering::Relaxed) + 1;
+    let seq = Arc::clone(seq);
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(120));
+        if seq.load(Ordering::Relaxed) == generation {
+            crate::types::events::mark_data_ready();
         }
     });
 }
@@ -411,7 +449,7 @@ pub fn resize_pane(pane: &mut Pane, rows: u16, cols: u16) -> io::Result<()> {
         .resize(size)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     if let Ok(mut p) = pane.parser.lock() {
-        let (old_rows, old_cols) = p.screen().size();
+        let (old_rows, old_cols) = p.size();
         if rows < old_rows || cols != old_cols {
             let ring_data: Vec<u8> = pane
                 .output_ring
@@ -421,14 +459,12 @@ pub fn resize_pane(pane: &mut Pane, rows: u16, cols: u16) -> io::Result<()> {
                 .unwrap_or_default();
             if !ring_data.is_empty() {
                 let tail = tail_bytes_for_replay(&ring_data, rows, cols);
-                let mut new_parser = vt100::Parser::new(rows, cols, 2000);
-                new_parser.process(tail);
-                *p = new_parser;
+                *p = replay_tail_into_parser(tail, rows, cols);
             } else {
-                p.screen_mut().set_size(rows, cols);
+                p.resize(rows, cols);
             }
         } else {
-            p.screen_mut().set_size(rows, cols);
+            p.resize(rows, cols);
         }
     }
     pane.last_rows = rows;
@@ -436,7 +472,7 @@ pub fn resize_pane(pane: &mut Pane, rows: u16, cols: u16) -> io::Result<()> {
     Ok(())
 }
 
-const SCROLLBACK_LINES: usize = 2000;
+const SCROLLBACK_LINES: usize = 0;
 const BYTES_PER_LINE_FACTOR: usize = 4;
 
 fn tail_bytes_for_replay(data: &[u8], rows: u16, cols: u16) -> &[u8] {
@@ -447,6 +483,17 @@ fn tail_bytes_for_replay(data: &[u8], rows: u16, cols: u16) -> &[u8] {
     }
     let start = data.len() - bytes_needed;
     &data[start..]
+}
+
+fn replay_tail_into_parser(
+    tail: &[u8],
+    rows: u16,
+    cols: u16,
+) -> AlacrittyTermState {
+    let mut parser = AlacrittyTermState::new(rows, cols, 2000);
+    parser.process(tail);
+    parser.scrollback_bottom();
+    parser
 }
 
 #[cfg(windows)]
@@ -525,5 +572,24 @@ mod tests {
         tracker.process(b"\x1b[?1049", &cursor_shape);
         tracker.process(b"l", &cursor_shape);
         assert_eq!(cursor_shape.load(Ordering::Relaxed), 5);
+    }
+
+    #[test]
+    fn replay_tail_uses_viewport_sized_window() {
+        let data: Vec<u8> = (0..200).map(|i| i as u8).collect();
+        let tail = tail_bytes_for_replay(&data, 2, 10);
+
+        assert_eq!(tail, &data[120..]);
+    }
+
+    #[test]
+    fn replay_tail_parser_stays_at_scrollback_bottom() {
+        let tail = b"one\r\ntwo\r\nthree\r\nfour\r\nfive";
+        let mut parser = replay_tail_into_parser(tail, 3, 20);
+
+        parser.scrollback_bottom();
+        assert_eq!(parser.size(), (3, 20));
+        parser = replay_tail_into_parser(tail, 3, 20);
+        assert_eq!(parser.size(), (3, 20));
     }
 }
