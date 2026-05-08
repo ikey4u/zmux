@@ -17,7 +17,7 @@ use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 
 use crate::{
     terminal::AlacrittyTermState,
-    types::{Pane, PaneId, PaneTextBuffer},
+    types::{Pane, PaneId},
 };
 
 pub const CURSOR_SHAPE_UNSET: u8 = 255;
@@ -102,8 +102,6 @@ pub fn spawn_pane(opts: SpawnOptions<'_>) -> io::Result<Pane> {
     let bell_pending: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let output_ring: Arc<Mutex<VecDeque<u8>>> =
         Arc::new(Mutex::new(VecDeque::new()));
-    let text_buffer: Arc<Mutex<PaneTextBuffer>> =
-        Arc::new(Mutex::new(PaneTextBuffer::new(5 * 1024 * 1024)));
     let dead: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
     start_reader_thread(
@@ -116,7 +114,6 @@ pub fn spawn_pane(opts: SpawnOptions<'_>) -> io::Result<Pane> {
         Arc::clone(&cursor_shape),
         Arc::clone(&bell_pending),
         Arc::clone(&output_ring),
-        Arc::clone(&text_buffer),
         Arc::clone(&dead),
     );
 
@@ -138,7 +135,6 @@ pub fn spawn_pane(opts: SpawnOptions<'_>) -> io::Result<Pane> {
         bell_pending,
         copy_state: None,
         output_ring,
-        text_buffer,
         start_dir: opts.start_dir.map(|s| s.to_string()),
     })
 }
@@ -254,7 +250,6 @@ fn start_reader_thread(
     cursor_shape: Arc<AtomicU8>,
     bell_pending: Arc<AtomicBool>,
     output_ring: Arc<Mutex<VecDeque<u8>>>,
-    text_buffer: Arc<Mutex<PaneTextBuffer>>,
     dead_flag: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
@@ -285,9 +280,6 @@ fn start_reader_thread(
                             }
                             ring.push_back(b);
                         }
-                    }
-                    if let Ok(mut history) = text_buffer.lock() {
-                        history.push_bytes(data);
                     }
                     for &b in data {
                         if b == 0x07 {
@@ -451,16 +443,24 @@ pub fn resize_pane(pane: &mut Pane, rows: u16, cols: u16) -> io::Result<()> {
         })
         .unwrap_or(false);
 
+    // Always send the PTY resize to the OS so that the shell/app inside
+    // receives SIGWINCH and updates $COLUMNS/$LINES correctly.  Skipping
+    // the PTY resize (as the old preserve_tui_screen path did) left the
+    // shell believing it still had the pre-shrink width after zoom-out,
+    // causing long-line input to stop wrapping at the visible column.
+    let size = PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    pane.master
+        .resize(size)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
     if !preserve_tui_screen {
-        let size = PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        };
-        pane.master
-            .resize(size)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        // For non-TUI panes (regular shell etc.) also reflow the parser
+        // so scrollback and cursor position are recalculated.
         if let Ok(mut p) = pane.parser.lock() {
             p.resize(rows, cols);
             p.scrollback_bottom();

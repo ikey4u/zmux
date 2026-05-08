@@ -46,30 +46,20 @@ pub fn enter(pane: &mut Pane) -> bool {
 
 fn snapshot_for_copy_mode(
     pane: &Pane,
-    preferred_source: Option<CopySnapshotSource>,
+    _preferred_source: Option<CopySnapshotSource>,
 ) -> Option<(CopySnapshotSource, PaneTextSnapshot)> {
-    let buffer_snapshot = pane
-        .text_buffer
-        .lock()
-        .ok()
-        .map(|buffer| (buffer.reflow_enabled(), buffer.snapshot()));
     let parser = pane.parser.lock().ok();
     let alternate_screen = parser
         .as_ref()
         .map(|p| p.alternate_screen())
         .unwrap_or(false);
-    let parser_snapshot = if alternate_screen {
+    let snapshot = if alternate_screen {
         parser.as_ref().map(|p| snapshot_from_parser(p))
     } else {
         snapshot_from_output_ring(pane)
             .or_else(|| parser.as_ref().map(|p| snapshot_from_parser(p)))
     };
-    select_snapshot_for_copy_mode(
-        buffer_snapshot,
-        parser_snapshot,
-        alternate_screen,
-        preferred_source,
-    )
+    snapshot.map(|s| (CopySnapshotSource::Parser, s))
 }
 
 fn snapshot_from_output_ring(pane: &Pane) -> Option<PaneTextSnapshot> {
@@ -86,26 +76,6 @@ fn snapshot_from_output_ring(pane: &Pane) -> Option<PaneTextSnapshot> {
     let mut tmp_parser = AlacrittyTermState::new(rows, wide_cols, 2000);
     tmp_parser.process(&ring_data);
     Some(snapshot_from_parser(&tmp_parser))
-}
-
-fn select_snapshot_for_copy_mode(
-    buffer_snapshot: Option<(bool, PaneTextSnapshot)>,
-    parser_snapshot: Option<PaneTextSnapshot>,
-    alternate_screen: bool,
-    _preferred_source: Option<CopySnapshotSource>,
-) -> Option<(CopySnapshotSource, PaneTextSnapshot)> {
-    if alternate_screen {
-        return parser_snapshot
-            .map(|snapshot| (CopySnapshotSource::Parser, snapshot))
-            .or_else(|| {
-                buffer_snapshot
-                    .map(|(_, snapshot)| (CopySnapshotSource::Buffer, snapshot))
-            });
-    }
-    if let Some(snapshot) = parser_snapshot {
-        return Some((CopySnapshotSource::Parser, snapshot));
-    }
-    buffer_snapshot.map(|(_, snapshot)| (CopySnapshotSource::Buffer, snapshot))
 }
 
 fn snapshot_from_parser(parser: &AlacrittyTermState) -> PaneTextSnapshot {
@@ -1455,89 +1425,6 @@ mod tests {
         assert!(snapshot.lines.len() >= 51);
         assert_eq!(snapshot.lines[0].text, "0");
         assert!(snapshot.lines.iter().any(|line| line.text == "50"));
-    }
-
-    #[test]
-    fn copy_mode_prefers_parser_snapshot_on_normal_screen() {
-        let parser_snapshot = PaneTextSnapshot {
-            lines: vec![
-                SnapshotLine {
-                    text: "older".to_string(),
-                    terminated: true,
-                },
-                SnapshotLine {
-                    text: "prompt".to_string(),
-                    terminated: true,
-                },
-                SnapshotLine {
-                    text: "$".to_string(),
-                    terminated: false,
-                },
-            ],
-            cursor_line: 2,
-            cursor_col: 1,
-        };
-        let buffer_snapshot = PaneTextSnapshot {
-            lines: vec![
-                SnapshotLine {
-                    text: "older".to_string(),
-                    terminated: true,
-                },
-                SnapshotLine {
-                    text: "prompt".to_string(),
-                    terminated: true,
-                },
-                SnapshotLine {
-                    text: "$".to_string(),
-                    terminated: true,
-                },
-                SnapshotLine {
-                    text: "prompt".to_string(),
-                    terminated: true,
-                },
-                SnapshotLine {
-                    text: "$".to_string(),
-                    terminated: false,
-                },
-            ],
-            cursor_line: 4,
-            cursor_col: 1,
-        };
-        let (source, snapshot) = select_snapshot_for_copy_mode(
-            Some((true, buffer_snapshot)),
-            Some(parser_snapshot),
-            false,
-            None,
-        )
-        .unwrap();
-        assert_eq!(source, CopySnapshotSource::Parser);
-        assert_eq!(snapshot.lines.len(), 3);
-        assert_eq!(snapshot.lines[0].text, "older");
-        assert_eq!(snapshot.lines[1].text, "prompt");
-        assert_eq!(snapshot.lines[2].text, "$");
-    }
-
-    #[test]
-    fn copy_mode_falls_back_to_buffer_when_parser_unavailable() {
-        let buffer_snapshot = PaneTextSnapshot {
-            lines: (0..=50)
-                .map(|i| SnapshotLine {
-                    text: i.to_string(),
-                    terminated: i != 50,
-                })
-                .collect(),
-            cursor_line: 50,
-            cursor_col: 2,
-        };
-        let (source, snapshot) = select_snapshot_for_copy_mode(
-            Some((false, buffer_snapshot)),
-            None,
-            false,
-            None,
-        )
-        .unwrap();
-        assert_eq!(source, CopySnapshotSource::Buffer);
-        assert_eq!(snapshot.lines.len(), 51);
     }
 
     #[test]

@@ -2031,9 +2031,6 @@ fn cmd_clear_pane(state: &mut Server) {
         if let Ok(mut ring) = pane.output_ring.lock() {
             ring.clear();
         }
-        if let Ok(mut buf) = pane.text_buffer.lock() {
-            *buf = crate::types::PaneTextBuffer::new(5 * 1024 * 1024);
-        }
         if let Ok(mut parser) = pane.parser.lock() {
             *parser = crate::terminal::AlacrittyTermState::new(
                 pane.last_rows,

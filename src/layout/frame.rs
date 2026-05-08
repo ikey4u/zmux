@@ -1,18 +1,12 @@
 use std::{fmt::Write as FmtWrite, sync::atomic::Ordering};
 
 use alacritty_terminal::{term::cell::Flags, vte::ansi::Color};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    copy_mode::{
-        build_wrapped_snapshot, CopyRenderRow, CopyRenderRun, CopyRenderView,
-    },
+    copy_mode::CopyRenderRow,
     layout::rect::BORDER_SIZE,
-    terminal::{color_is_default, color_name, AlacrittyTermState},
-    types::{
-        LayoutNode, Pane, PaneTextSnapshot, Rect, SplitDirection, Window,
-        WrappedRow, WrappedSnapshot,
-    },
+    terminal::{color_name, AlacrittyTermState},
+    types::{LayoutNode, Pane, Rect, SplitDirection, Window},
 };
 
 pub fn serialize_frame(win: &Window, area: Rect, hide_borders: bool) -> String {
@@ -292,141 +286,6 @@ fn write_leaf(pane: &Pane, is_active: bool, out: &mut String) {
     out.push('}');
 }
 
-fn logical_reflow_view(
-    pane: &Pane,
-    term: &AlacrittyTermState,
-) -> Option<CopyRenderView> {
-    let buffer = pane.text_buffer.lock().ok()?;
-    if !can_use_logical_reflow(
-        term,
-        pane.last_rows,
-        pane.last_cols,
-        buffer.reflow_enabled(),
-    ) {
-        return None;
-    }
-    let snapshot = buffer.snapshot();
-    Some(build_logical_reflow_view(
-        &snapshot,
-        pane.last_rows as usize,
-        pane.last_cols as usize,
-    ))
-}
-
-fn can_use_logical_reflow(
-    term: &AlacrittyTermState,
-    rows: u16,
-    cols: u16,
-    reflow_enabled: bool,
-) -> bool {
-    let (cursor_row, _) = term.cursor_position();
-    reflow_enabled
-        && !term.alternate_screen()
-        && !screen_has_non_default_formatting(term, rows, cols, cursor_row)
-}
-
-fn build_logical_reflow_view(
-    snapshot: &PaneTextSnapshot,
-    height: usize,
-    width: usize,
-) -> CopyRenderView {
-    let width = width.max(1);
-    let height = height.max(1);
-    let wrapped = build_wrapped_snapshot(snapshot, width);
-    let (cursor_row_idx, cursor_col) =
-        logical_cursor_display_position(snapshot, &wrapped);
-    let scroll_top = wrapped.rows.len().saturating_sub(height);
-    let mut rows = Vec::with_capacity(height);
-    for visible_row in 0..height {
-        let absolute_row = scroll_top + visible_row;
-        rows.push(render_logical_row(wrapped.rows.get(absolute_row)));
-    }
-    CopyRenderView {
-        rows,
-        cursor_row: cursor_row_idx.saturating_sub(scroll_top) as u16,
-        cursor_col: cursor_col as u16,
-        scroll_ratio: None,
-    }
-}
-
-fn logical_cursor_display_position(
-    snapshot: &PaneTextSnapshot,
-    wrapped: &WrappedSnapshot,
-) -> (usize, usize) {
-    if snapshot.cursor_line >= wrapped.line_ranges.len() {
-        return (wrapped.rows.len().saturating_sub(1), 0);
-    }
-    let (start, end) = wrapped.line_ranges[snapshot.cursor_line];
-    let mut row_idx = start;
-    for idx in start..end {
-        let row = &wrapped.rows[idx];
-        if snapshot.cursor_col <= row.end_col || idx + 1 == end {
-            row_idx = idx;
-            break;
-        }
-    }
-    let row = &wrapped.rows[row_idx];
-    let col = display_width_between(
-        &snapshot.lines[row.line].text,
-        row.start_col,
-        snapshot.cursor_col.min(row.end_col),
-    );
-    (row_idx, col)
-}
-
-fn render_logical_row(row: Option<&WrappedRow>) -> CopyRenderRow {
-    let Some(row) = row else {
-        return CopyRenderRow { runs: Vec::new() };
-    };
-    if row.text.is_empty() {
-        return CopyRenderRow { runs: Vec::new() };
-    }
-    CopyRenderRow {
-        runs: vec![CopyRenderRun {
-            text: row.text.clone(),
-            fg: "default".to_string(),
-            bg: "default".to_string(),
-            flags: 0,
-            width: UnicodeWidthStr::width(row.text.as_str())
-                .min(u16::MAX as usize) as u16,
-        }],
-    }
-}
-
-fn screen_has_non_default_formatting(
-    term: &AlacrittyTermState,
-    rows: u16,
-    cols: u16,
-    cursor_row: u16,
-) -> bool {
-    let visible_rows = term.visible_rows();
-    for row in 0..rows {
-        if row == cursor_row {
-            continue;
-        }
-        for col in 0..cols {
-            let Some(cell) = visible_rows
-                .get(row as usize)
-                .and_then(|cells| cells.get(col as usize))
-                .and_then(|cell| cell.as_ref())
-            else {
-                continue;
-            };
-            if !color_is_default(cell.fg)
-                || !color_is_default(cell.bg)
-                || cell.flags.contains(Flags::DIM)
-                || cell.flags.contains(Flags::BOLD)
-                || cell.flags.contains(Flags::ITALIC)
-                || cell.flags.intersects(Flags::ALL_UNDERLINES)
-                || cell.flags.contains(Flags::INVERSE)
-            {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 struct Run {
     text: String,
     fg: Color,
@@ -563,18 +422,6 @@ fn write_copy_rows(rows: &[CopyRenderRow], out: &mut String) {
     out.push(']');
 }
 
-fn display_width_between(text: &str, start: usize, end: usize) -> usize {
-    text.chars()
-        .skip(start)
-        .take(end.saturating_sub(start))
-        .map(char_width)
-        .sum()
-}
-
-fn char_width(ch: char) -> usize {
-    UnicodeWidthChar::width(ch).unwrap_or(1).max(1)
-}
-
 fn push_color(c: Color, out: &mut String) {
     out.push_str(&color_name(c));
 }
@@ -593,95 +440,5 @@ fn json_escape(s: &str, out: &mut String) {
             }
             c => out.push(c),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        build_logical_reflow_view, can_use_logical_reflow,
-        screen_has_non_default_formatting,
-    };
-    use crate::{
-        terminal::AlacrittyTermState,
-        types::{PaneTextSnapshot, SnapshotLine},
-    };
-
-    fn parser_with(data: &[u8], rows: u16, cols: u16) -> AlacrittyTermState {
-        let mut parser = AlacrittyTermState::new(rows, cols, 2000);
-        parser.process(data);
-        parser
-    }
-
-    fn plain_row_text(
-        snapshot: &PaneTextSnapshot,
-        height: usize,
-        width: usize,
-    ) -> Vec<String> {
-        build_logical_reflow_view(snapshot, height, width)
-            .rows
-            .into_iter()
-            .map(|row| row.runs.into_iter().map(|run| run.text).collect())
-            .collect()
-    }
-
-    #[test]
-    fn logical_reflow_wraps_long_lines_to_new_width() {
-        let snapshot = PaneTextSnapshot {
-            lines: vec![SnapshotLine {
-                text: "abcdefghij".to_string(),
-                terminated: false,
-            }],
-            cursor_line: 0,
-            cursor_col: 10,
-        };
-        let view = build_logical_reflow_view(&snapshot, 3, 5);
-        let rows = plain_row_text(&snapshot, 3, 5);
-        assert_eq!(rows, vec!["abcde", "fghij", ""]);
-        assert_eq!(view.cursor_row, 1);
-        assert_eq!(view.cursor_col, 5);
-    }
-
-    #[test]
-    fn logical_reflow_keeps_virtual_blank_cursor_line_after_newline() {
-        let snapshot = PaneTextSnapshot {
-            lines: vec![SnapshotLine {
-                text: "hello".to_string(),
-                terminated: true,
-            }],
-            cursor_line: 1,
-            cursor_col: 0,
-        };
-        let view = build_logical_reflow_view(&snapshot, 3, 10);
-        let rows = plain_row_text(&snapshot, 3, 10);
-        assert_eq!(rows, vec!["hello", "", ""]);
-        assert_eq!(view.cursor_row, 1);
-        assert_eq!(view.cursor_col, 0);
-    }
-
-    #[test]
-    fn prompt_line_styling_does_not_disable_logical_reflow() {
-        let parser = parser_with(b"\x1b[31mred", 3, 10);
-        assert!(!screen_has_non_default_formatting(&parser, 3, 10, 0));
-        assert!(can_use_logical_reflow(&parser, 3, 10, true));
-    }
-
-    #[test]
-    fn styling_above_cursor_still_disables_logical_reflow() {
-        let parser = parser_with(b"\x1b[31mred\n\x1b[0mplain", 3, 10);
-        assert!(screen_has_non_default_formatting(&parser, 3, 10, 1));
-        assert!(!can_use_logical_reflow(&parser, 3, 10, true));
-    }
-
-    #[test]
-    fn filled_last_row_does_not_disable_logical_reflow() {
-        let parser = parser_with(b"12345\n67890", 2, 5);
-        assert!(can_use_logical_reflow(&parser, 2, 5, true));
-    }
-
-    #[test]
-    fn actual_alternate_screen_still_disables_logical_reflow() {
-        let parser = parser_with(b"\x1b[?1049h", 3, 10);
-        assert!(!can_use_logical_reflow(&parser, 3, 10, true));
     }
 }

@@ -11,7 +11,6 @@ use chrono::{DateTime, Local};
 use portable_pty::MasterPty;
 
 use super::{
-    history::PaneTextBuffer,
     layout::LayoutNode,
     mode::{CopyModeState, Mode},
     options::{GlobalOptions, SessionOptions, WindowOptions},
@@ -53,7 +52,6 @@ pub struct Pane {
     pub bell_pending: Arc<AtomicBool>,
     pub copy_state: Option<CopyModeState>,
     pub output_ring: Arc<Mutex<VecDeque<u8>>>,
-    pub text_buffer: Arc<Mutex<PaneTextBuffer>>,
     pub start_dir: Option<String>,
 }
 
