@@ -130,9 +130,11 @@ fn snapshot_visible_row(
             wrapped |= cell
                 .flags
                 .contains(alacritty_terminal::term::cell::Flags::WRAPLINE);
-        } else {
-            row_text.push(' ');
         }
+        // None cells are wide-character padding (the trailing half of a 2-cell
+        // CJK/wide glyph).  They do not represent space characters and must be
+        // skipped; emitting a space here adds a spurious gap after every wide
+        // character in copy mode.
     }
     Some(ScreenSnapshotRow {
         text: trim_screen_row(&row_text, min_width),
