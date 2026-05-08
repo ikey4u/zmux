@@ -1170,6 +1170,17 @@ impl ClientApp {
                                                             width: cols,
                                                             height: rows,
                                                         };
+                                                    let content_height = fa
+                                                        .height
+                                                        .saturating_sub(1);
+                                                    let layout_area =
+                                                        ratatui::layout::Rect {
+                                                            x: 0,
+                                                            y: 0,
+                                                            width: fa.width,
+                                                            height:
+                                                                content_height,
+                                                        };
                                                     let pa = active_pane_content_rect(fd, fa, hide_borders);
                                                     if mouse.column >= pa.x
                                                         && mouse.column
@@ -1190,6 +1201,22 @@ impl ClientApp {
                                                                     .row,
                                                             },
                                                         );
+                                                    } else if let Some(
+                                                        pane_id,
+                                                    ) =
+                                                        find_pane_id_at(
+                                                            &fd.layout,
+                                                            layout_area,
+                                                            mouse.column,
+                                                            mouse.row,
+                                                            hide_borders,
+                                                        )
+                                                    {
+                                                        // Clicked on a non-active pane — focus it.
+                                                        server.run_command(&format!(
+                                                            "select-pane -t %{}",
+                                                            pane_id
+                                                        ));
                                                     }
                                                 }
                                             }
@@ -1536,6 +1563,51 @@ fn find_active_pane_content(
             (Vec::new(), area)
         }
         LayoutJson::Leaf { .. } => (Vec::new(), area),
+    }
+}
+
+/// Walk the layout tree and return the pane id whose area contains (col, row).
+/// Returns None if the coordinate falls outside all panes (e.g. on a border).
+fn find_pane_id_at(
+    layout: &LayoutJson,
+    area: ratatui::layout::Rect,
+    col: u16,
+    row: u16,
+    hide_borders: bool,
+) -> Option<usize> {
+    match layout {
+        LayoutJson::Leaf { id, .. } => {
+            if col >= area.x
+                && col < area.x + area.width
+                && row >= area.y
+                && row < area.y + area.height
+            {
+                Some(*id)
+            } else {
+                None
+            }
+        }
+        LayoutJson::Split {
+            direction,
+            sizes,
+            children,
+        } => {
+            let chunks = split_layout_rects_for_extract(
+                area,
+                direction,
+                sizes,
+                children.len(),
+                hide_borders,
+            );
+            for (child, chunk) in children.iter().zip(chunks.into_iter()) {
+                if let Some(id) =
+                    find_pane_id_at(child, chunk, col, row, hide_borders)
+                {
+                    return Some(id);
+                }
+            }
+            None
+        }
     }
 }
 
