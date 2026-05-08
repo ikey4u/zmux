@@ -112,6 +112,7 @@ mod tests {
             lines: vec![SnapshotLine {
                 text: "hello".to_string(),
                 terminated: false,
+                styles: Vec::new(),
             }],
             cursor_line: 0,
             cursor_col: 3,

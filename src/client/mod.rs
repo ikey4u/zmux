@@ -145,6 +145,15 @@ impl ClientApp {
                             mode = InputMode::Normal;
                             copy_mode_confirmed = false;
                         }
+                    } else if mode == InputMode::Normal
+                        && active_in_copy_mode(fd)
+                    {
+                        // The server entered copy mode on its own (e.g. via
+                        // mouse-scroll auto-enter).  Sync the client so that
+                        // copy-mode key bindings (including 'q' to exit) work
+                        // correctly instead of forwarding keys to the shell.
+                        mode = InputMode::CopyMode;
+                        copy_mode_confirmed = true;
                     }
                 }
                 let desired_cursor_style = cursor_style_for_shape(
@@ -280,13 +289,21 @@ impl ClientApp {
                                 InputMode::Normal => {
                                     if (key.code, key.modifiers) == prefix_key {
                                         mode = InputMode::Prefix;
+                                    } else if frame
+                                        .as_ref()
+                                        .map_or(false, active_in_copy_mode)
+                                    {
+                                        // Server is in copy mode but client
+                                        // hasn't synced yet (e.g. scroll-entered
+                                        // copy mode, key arrived before next
+                                        // frame).  Switch to CopyMode and re-
+                                        // dispatch the key through that handler.
+                                        mode = InputMode::CopyMode;
+                                        copy_mode_confirmed = true;
+                                        // fall through on next iteration; for
+                                        // now just eat the key to avoid double
+                                        // output.
                                     } else {
-                                        if frame
-                                            .as_ref()
-                                            .map_or(false, active_in_copy_mode)
-                                        {
-                                            server.exit_copy_mode();
-                                        }
                                         let bytes = key_to_bytes(key);
                                         if !bytes.is_empty() {
                                             server.send_input(&bytes);

@@ -1,10 +1,11 @@
 use unicode_width::UnicodeWidthChar;
 
 use crate::{
-    terminal::AlacrittyTermState,
+    terminal::{color_name, AlacrittyTermState},
     types::{
-        CopyModeState, CopyPoint, CopySnapshotSource, Pane, PaneTextSnapshot,
-        SearchMatch, SelectionMode, SnapshotLine, WrappedRow, WrappedSnapshot,
+        CellStyle, CopyModeState, CopyPoint, CopySnapshotSource, Pane,
+        PaneTextSnapshot, SearchMatch, SelectionMode, SnapshotLine, WrappedRow,
+        WrappedSnapshot,
     },
 };
 
@@ -116,6 +117,8 @@ fn trim_viewport_blank_tail(
 struct ScreenSnapshotRow {
     text: String,
     wrapped: bool,
+    /// One `CellStyle` per *character* in `text`.
+    styles: Vec<CellStyle>,
 }
 
 fn snapshot_visible_row(
@@ -123,10 +126,40 @@ fn snapshot_visible_row(
     min_width: usize,
 ) -> Option<ScreenSnapshotRow> {
     let mut row_text = String::new();
+    let mut row_styles: Vec<CellStyle> = Vec::new();
     let mut wrapped = false;
     for cell in cells {
         if let Some(cell) = cell {
+            // Push one style entry per *character* in cell.text.
+            let n_chars = cell.text.chars().count();
+            let style = CellStyle {
+                fg: color_name(cell.fg),
+                bg: color_name(cell.bg),
+                flags: {
+                    use alacritty_terminal::term::cell::Flags;
+                    let mut f = 0u8;
+                    if cell.flags.contains(Flags::DIM) {
+                        f |= 1;
+                    }
+                    if cell.flags.contains(Flags::BOLD) {
+                        f |= 2;
+                    }
+                    if cell.flags.contains(Flags::ITALIC) {
+                        f |= 4;
+                    }
+                    if cell.flags.intersects(Flags::ALL_UNDERLINES) {
+                        f |= 8;
+                    }
+                    if cell.flags.contains(Flags::INVERSE) {
+                        f |= 16;
+                    }
+                    f
+                },
+            };
             row_text.push_str(&cell.text);
+            for _ in 0..n_chars {
+                row_styles.push(style.clone());
+            }
             wrapped |= cell
                 .flags
                 .contains(alacritty_terminal::term::cell::Flags::WRAPLINE);
@@ -136,9 +169,14 @@ fn snapshot_visible_row(
         // skipped; emitting a space here adds a spurious gap after every wide
         // character in copy mode.
     }
+    let trimmed = trim_screen_row(&row_text, min_width);
+    // Trim styles to match the trimmed text length.
+    let trimmed_char_len = trimmed.chars().count();
+    row_styles.truncate(trimmed_char_len);
     Some(ScreenSnapshotRow {
-        text: trim_screen_row(&row_text, min_width),
+        text: trimmed,
         wrapped,
+        styles: row_styles,
     })
 }
 
@@ -149,6 +187,7 @@ fn snapshot_from_physical_rows(
 ) -> PaneTextSnapshot {
     let mut lines = Vec::new();
     let mut logical_line = String::new();
+    let mut logical_styles: Vec<CellStyle> = Vec::new();
     let mut cursor_line = 0usize;
     let mut cursor_col_chars = 0usize;
     let mut cursor_mapped = false;
@@ -161,10 +200,12 @@ fn snapshot_from_physical_rows(
             cursor_mapped = true;
         }
         logical_line.push_str(&row.text);
+        logical_styles.extend_from_slice(&row.styles);
         if !row.wrapped {
             lines.push(SnapshotLine {
                 text: std::mem::take(&mut logical_line),
                 terminated: row_idx + 1 < rows.len(),
+                styles: std::mem::take(&mut logical_styles),
             });
         }
     }
@@ -177,6 +218,7 @@ fn snapshot_from_physical_rows(
         lines.push(SnapshotLine {
             text: logical_line,
             terminated: false,
+            styles: logical_styles,
         });
     }
 
@@ -1128,27 +1170,59 @@ fn render_row(
     let active = active_match
         .filter(|m| m.line == row.line)
         .map(|m| (m.start, m.end));
-    let mut runs = Vec::new();
-    let mut current_style = StyleKind::Plain;
+
+    // Per-character cell styles from the snapshot (may be empty / shorter than
+    // the text if the snapshot came from a path that didn't record styles).
+    let line_styles = state
+        .snapshot
+        .lines
+        .get(row.line)
+        .map(|l| l.styles.as_slice())
+        .unwrap_or(&[]);
+
+    let default_cell_style = CellStyle::default();
+
+    let mut runs: Vec<CopyRenderRun> = Vec::new();
+    let mut current_kind = StyleKind::Plain;
+    // Track current effective cell-style for plain runs so we can split when it changes.
+    let mut current_cell_style: &CellStyle = &default_cell_style;
     let mut current_text = String::new();
     let mut current_width = 0usize;
+
     for (offset, ch) in row.text.chars().enumerate() {
         let col = row.start_col + offset;
-        let style = style_for_col(col, selected, active, &matches);
-        if !current_text.is_empty() && style != current_style {
-            runs.push(style_run(
-                current_style,
+        let kind = style_for_col(col, selected, active, &matches);
+        let cell_style: &CellStyle =
+            line_styles.get(col).unwrap_or(&default_cell_style);
+
+        // Flush accumulated run when style changes.  For plain runs, we also
+        // split when the underlying terminal cell style changes.
+        let need_flush = !current_text.is_empty()
+            && (kind != current_kind
+                || (kind == StyleKind::Plain
+                    && cell_style != current_cell_style));
+
+        if need_flush {
+            runs.push(make_run(
+                current_kind,
+                current_cell_style,
                 std::mem::take(&mut current_text),
                 current_width,
             ));
             current_width = 0;
         }
-        current_style = style;
+        current_kind = kind;
+        current_cell_style = cell_style;
         current_text.push(ch);
         current_width += char_width(ch);
     }
     if !current_text.is_empty() {
-        runs.push(style_run(current_style, current_text, current_width));
+        runs.push(make_run(
+            current_kind,
+            current_cell_style,
+            current_text,
+            current_width,
+        ));
     }
     CopyRenderRow { runs }
 }
@@ -1231,9 +1305,18 @@ fn ordered_points(a: CopyPoint, b: CopyPoint) -> (CopyPoint, CopyPoint) {
     }
 }
 
-fn style_run(style: StyleKind, text: String, width: usize) -> CopyRenderRun {
-    let (fg, bg, flags) = match style {
-        StyleKind::Plain => ("default", "default", 0),
+fn make_run(
+    kind: StyleKind,
+    cell_style: &CellStyle,
+    text: String,
+    width: usize,
+) -> CopyRenderRun {
+    let (fg, bg, flags) = match kind {
+        StyleKind::Plain => (
+            cell_style.fg.as_str(),
+            cell_style.bg.as_str(),
+            cell_style.flags,
+        ),
         StyleKind::Search => ("black", "yellow", 0),
         StyleKind::ActiveSearch => ("white", "blue", 2),
         StyleKind::Selected => ("black", "cyan", 2),
@@ -1320,6 +1403,7 @@ mod tests {
                 .map(|line| SnapshotLine {
                     text: (*line).to_string(),
                     terminated: true,
+                    styles: Vec::new(),
                 })
                 .collect(),
             cursor_line: lines.len().saturating_sub(1),
