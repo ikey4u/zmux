@@ -431,23 +431,6 @@ pub fn resize_pane(pane: &mut Pane, rows: u16, cols: u16) -> io::Result<()> {
     if rows == pane.last_rows && cols == pane.last_cols {
         return Ok(());
     }
-    let preserve_tui_screen = pane
-        .parser
-        .lock()
-        .map(|p| {
-            let (old_rows, old_cols) = p.size();
-            (rows < old_rows || cols < old_cols)
-                && (p.hide_cursor()
-                    || p.alternate_screen()
-                    || p.mouse_mode() != 0)
-        })
-        .unwrap_or(false);
-
-    // Always send the PTY resize to the OS so that the shell/app inside
-    // receives SIGWINCH and updates $COLUMNS/$LINES correctly.  Skipping
-    // the PTY resize (as the old preserve_tui_screen path did) left the
-    // shell believing it still had the pre-shrink width after zoom-out,
-    // causing long-line input to stop wrapping at the visible column.
     let size = PtySize {
         rows,
         cols,
@@ -458,13 +441,9 @@ pub fn resize_pane(pane: &mut Pane, rows: u16, cols: u16) -> io::Result<()> {
         .resize(size)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-    if !preserve_tui_screen {
-        // For non-TUI panes (regular shell etc.) also reflow the parser
-        // so scrollback and cursor position are recalculated.
-        if let Ok(mut p) = pane.parser.lock() {
-            p.resize(rows, cols);
-            p.scrollback_bottom();
-        }
+    if let Ok(mut p) = pane.parser.lock() {
+        p.resize(rows, cols);
+        p.scrollback_bottom();
     }
     pane.last_rows = rows;
     pane.last_cols = cols;
@@ -547,5 +526,44 @@ mod tests {
         tracker.process(b"\x1b[?1049", &cursor_shape);
         tracker.process(b"l", &cursor_shape);
         assert_eq!(cursor_shape.load(Ordering::Relaxed), 5);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resize_shrink_hidden_cursor_pane_scrolls_to_bottom() -> io::Result<()> {
+        let mut parser = AlacrittyTermState::new(8, 20, 2000);
+        parser.process(b"\x1b[?25l");
+        let mut output = String::new();
+        for i in 0..20 {
+            output.push_str(&format!("line {i}\r\n"));
+        }
+        parser.process(output.as_bytes());
+        parser.scrollback_top();
+
+        let mut pane = spawn_pane(SpawnOptions {
+            pane_id: 1,
+            rows: 8,
+            cols: 20,
+            command: Some("/bin/cat"),
+            start_dir: None,
+            env: vec![],
+        })?;
+        pane.parser = Arc::new(Mutex::new(parser));
+        resize_pane(&mut pane, 4, 20)?;
+
+        let first_visible = pane
+            .parser
+            .lock()
+            .unwrap()
+            .visible_rows()
+            .into_iter()
+            .next()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|cell| cell.map(|cell| cell.text))
+            .collect::<String>();
+        let _ = pane.child.kill();
+        assert_ne!(first_visible.trim_end(), "line 0");
+        Ok(())
     }
 }

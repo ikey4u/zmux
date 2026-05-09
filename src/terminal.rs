@@ -133,15 +133,22 @@ impl AlacrittyTermState {
             .scroll_display(alacritty_terminal::grid::Scroll::Bottom);
     }
 
+    pub fn scrollback_top(&mut self) {
+        self.term
+            .grid_mut()
+            .scroll_display(alacritty_terminal::grid::Scroll::Top);
+    }
+
     pub fn visible_rows(&self) -> Vec<Vec<Option<TerminalCell>>> {
+        let grid = self.term.grid();
+        let top_line = -(grid.display_offset() as i32);
         let mut rows = vec![vec![None; self.cols as usize]; self.rows as usize];
-        let mut line_map = BTreeMap::new();
-        for indexed in self.term.grid().display_iter() {
-            let next = line_map.len();
-            let row_idx = *line_map.entry(indexed.point.line.0).or_insert(next);
-            if row_idx >= rows.len() {
+        for indexed in grid.display_iter() {
+            let relative_line = indexed.point.line.0 - top_line;
+            if relative_line < 0 || relative_line >= rows.len() as i32 {
                 continue;
             }
+            let row_idx = relative_line as usize;
             let col_idx = indexed.point.column.0;
             if col_idx >= rows[row_idx].len() {
                 continue;

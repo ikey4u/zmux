@@ -174,37 +174,67 @@ fn remove_at(node: LayoutNode, path: &[usize]) -> LayoutNode {
         (
             LayoutNode::Split {
                 direction,
-                sizes,
+                mut sizes,
                 mut children,
             },
             [idx, rest @ ..],
         ) => {
+            if *idx >= children.len() {
+                return normalize_split(direction, sizes, children);
+            }
             if rest.is_empty() {
                 children.remove(*idx);
-                if children.len() == 1 {
-                    return children.remove(0);
-                }
-                let n = children.len();
-                let new_sizes = equal_sizes(n);
-                LayoutNode::Split {
-                    direction,
-                    sizes: new_sizes,
-                    children,
+                if *idx < sizes.len() {
+                    sizes.remove(*idx);
                 }
             } else {
                 let child = children.remove(*idx);
                 let new_child = remove_at(child, rest);
                 children.insert(*idx, new_child);
-                let n = children.len();
-                let new_sizes = equal_sizes(n);
-                LayoutNode::Split {
-                    direction,
-                    sizes: new_sizes,
-                    children,
-                }
             }
+            normalize_split(direction, sizes, children)
         }
         (node, _) => node,
+    }
+}
+
+fn normalize_split(
+    direction: SplitDirection,
+    sizes: Vec<u16>,
+    children: Vec<LayoutNode>,
+) -> LayoutNode {
+    let mut children: Vec<LayoutNode> =
+        children.into_iter().map(normalize_layout).collect();
+    if children.len() == 1 {
+        return children.remove(0);
+    }
+    let sizes = normalize_sizes(sizes, children.len());
+    LayoutNode::Split {
+        direction,
+        sizes,
+        children,
+    }
+}
+
+fn normalize_layout(node: LayoutNode) -> LayoutNode {
+    match node {
+        LayoutNode::Split {
+            direction,
+            sizes,
+            children,
+        } => normalize_split(direction, sizes, children),
+        node => node,
+    }
+}
+
+fn normalize_sizes(sizes: Vec<u16>, count: usize) -> Vec<u16> {
+    if count == 0 {
+        return vec![];
+    }
+    if sizes.len() == count && sizes.iter().any(|&size| size > 0) {
+        sizes
+    } else {
+        equal_sizes(count)
     }
 }
 

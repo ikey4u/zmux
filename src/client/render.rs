@@ -158,6 +158,7 @@ pub fn render_frame_ex(
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(area);
 
+    f.render_widget(Clear, chunks[0]);
     render_layout_node(f, &fd.layout, chunks[0], hide_borders);
     if !hide_status {
         render_status_bar(f, &fd.status, chunks[1], in_prefix);

@@ -2160,4 +2160,49 @@ mod tests {
         ));
         Ok(())
     }
+
+    #[test]
+    fn reap_dead_left_pane_expands_nested_right_split() -> io::Result<()> {
+        let sz = Size::new(24, 80);
+        let mut state = Server::new();
+        make_session(&mut state, "0", sz)?;
+
+        let mut split_right_cmd = ParsedCommand::parse("split-window -h");
+        cmd_split_window(&mut state, &split_right_cmd.remove(0), sz);
+        let mut split_bottom_cmd = ParsedCommand::parse("split-window");
+        cmd_split_window(&mut state, &split_bottom_cmd.remove(0), sz);
+
+        {
+            let win = &mut state.sessions[0].windows[0];
+            let LayoutNode::Split { children, .. } = &mut win.root else {
+                panic!("expected horizontal root split");
+            };
+            let LayoutNode::Leaf(pane) = &mut children[0] else {
+                panic!("expected left pane");
+            };
+            pane.dead.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        reap_dead_panes(&mut state, sz);
+
+        let win = &state.sessions[0].windows[0];
+        let LayoutNode::Split {
+            direction,
+            children,
+            ..
+        } = &win.root
+        else {
+            panic!("expected surviving vertical split");
+        };
+        assert_eq!(*direction, SplitDirection::Vertical);
+        assert_eq!(children.len(), 2);
+        for child in children {
+            let LayoutNode::Leaf(pane) = child else {
+                panic!("expected surviving pane");
+            };
+            assert_eq!(pane.last_cols, 78);
+            assert!(pane.last_rows > 0);
+        }
+        Ok(())
+    }
 }
