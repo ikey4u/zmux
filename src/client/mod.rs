@@ -1158,9 +1158,58 @@ impl ClientApp {
                                         );
                                     if mouse_mode != 0 && !shift_overrides {
                                         mouse_select = None;
-                                        let bytes = mouse_to_bytes(mouse);
-                                        if !bytes.is_empty() {
-                                            server.send_input(&bytes);
+                                        let focused_other_pane = if matches!(
+                                            mouse.kind,
+                                            MouseEventKind::Down(
+                                                MouseButton::Left
+                                            )
+                                        ) {
+                                            frame.as_ref().is_some_and(|fd| {
+                                                let (cols, rows) =
+                                                    terminal::size().unwrap_or((
+                                                        80, 24,
+                                                    ));
+                                                let layout_area =
+                                                    ratatui::layout::Rect {
+                                                        x: 0,
+                                                        y: 0,
+                                                        width: cols,
+                                                        height: rows
+                                                            .saturating_sub(1),
+                                                    };
+                                                let clicked = find_pane_id_at(
+                                                    &fd.layout,
+                                                    layout_area,
+                                                    mouse.column,
+                                                    mouse.row,
+                                                    hide_borders,
+                                                );
+                                                let active =
+                                                    active_pane_id(&fd.layout);
+                                                if let Some(clicked_id) = clicked
+                                                {
+                                                    if Some(clicked_id)
+                                                        != active
+                                                    {
+                                                        server.run_command(
+                                                            &format!(
+                                                                "select-pane -t %{}",
+                                                                clicked_id
+                                                            ),
+                                                        );
+                                                        return true;
+                                                    }
+                                                }
+                                                false
+                                            })
+                                        } else {
+                                            false
+                                        };
+                                        if !focused_other_pane {
+                                            let bytes = mouse_to_bytes(mouse);
+                                            if !bytes.is_empty() {
+                                                server.send_input(&bytes);
+                                            }
                                         }
                                     } else {
                                         match mouse.kind {
@@ -1625,6 +1674,18 @@ fn find_pane_id_at(
             }
             None
         }
+    }
+}
+
+fn active_pane_id(layout: &LayoutJson) -> Option<usize> {
+    match layout {
+        LayoutJson::Leaf {
+            id, active: true, ..
+        } => Some(*id),
+        LayoutJson::Split { children, .. } => {
+            children.iter().find_map(active_pane_id)
+        }
+        LayoutJson::Leaf { .. } => None,
     }
 }
 
@@ -2369,5 +2430,53 @@ mod tests {
             _ => None,
         }));
         assert!(!has_ssh_environment(|_| None));
+    }
+
+    #[test]
+    fn active_pane_id_returns_active_leaf() {
+        let layout = LayoutJson::Split {
+            direction: "horizontal".to_string(),
+            sizes: vec![50, 50],
+            children: vec![test_leaf(1, false), test_leaf(2, true)],
+        };
+
+        assert_eq!(active_pane_id(&layout), Some(2));
+    }
+
+    #[test]
+    fn find_pane_id_at_returns_clicked_pane() {
+        let layout = LayoutJson::Split {
+            direction: "horizontal".to_string(),
+            sizes: vec![50, 50],
+            children: vec![test_leaf(1, true), test_leaf(2, false)],
+        };
+        let area = ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: 101,
+            height: 20,
+        };
+
+        assert_eq!(find_pane_id_at(&layout, area, 10, 5, false), Some(1));
+        assert_eq!(find_pane_id_at(&layout, area, 75, 5, false), Some(2));
+    }
+
+    fn test_leaf(id: usize, active: bool) -> LayoutJson {
+        LayoutJson::Leaf {
+            id,
+            rows: 1,
+            cols: 1,
+            cursor_row: 0,
+            cursor_col: 0,
+            hide_cursor: false,
+            alternate_screen: false,
+            mouse_mode: 0,
+            in_copy_mode: false,
+            scroll_ratio: None,
+            cursor_shape: 0,
+            active,
+            rows_v2: vec![],
+            title: None,
+        }
     }
 }
