@@ -1373,6 +1373,117 @@ impl ClientApp {
                                     MouseEventKind::ScrollDown => {
                                         server.scroll_down(SCROLL_LINES);
                                     }
+                                    MouseEventKind::Down(MouseButton::Left) => {
+                                        if let Some(ref fd) = frame {
+                                            let (cols, rows) = terminal::size()
+                                                .unwrap_or((80, 24));
+                                            let fa = ratatui::layout::Rect {
+                                                x: 0,
+                                                y: 0,
+                                                width: cols,
+                                                height: rows,
+                                            };
+                                            let pa = active_pane_content_rect(
+                                                fd,
+                                                fa,
+                                                hide_borders,
+                                            );
+                                            if mouse.column >= pa.x
+                                                && mouse.column
+                                                    < pa.x + pa.width
+                                                && mouse.row >= pa.y
+                                                && mouse.row < pa.y + pa.height
+                                            {
+                                                mouse_select =
+                                                    Some(MouseSelection {
+                                                        start_col: mouse.column,
+                                                        start_row: mouse.row,
+                                                        end_col: mouse.column,
+                                                        end_row: mouse.row,
+                                                    });
+                                            }
+                                        }
+                                    }
+                                    MouseEventKind::Drag(MouseButton::Left) => {
+                                        if let Some(ref mut sel) = mouse_select
+                                        {
+                                            if let Some(ref fd) = frame {
+                                                let (cols, rows) =
+                                                    terminal::size()
+                                                        .unwrap_or((80, 24));
+                                                let fa =
+                                                    ratatui::layout::Rect {
+                                                        x: 0,
+                                                        y: 0,
+                                                        width: cols,
+                                                        height: rows,
+                                                    };
+                                                let pa =
+                                                    active_pane_content_rect(
+                                                        fd,
+                                                        fa,
+                                                        hide_borders,
+                                                    );
+                                                sel.end_col =
+                                                    mouse.column.max(pa.x).min(
+                                                        pa.x + pa
+                                                            .width
+                                                            .saturating_sub(1),
+                                                    );
+                                                sel.end_row =
+                                                    mouse.row.max(pa.y).min(
+                                                        pa.y + pa
+                                                            .height
+                                                            .saturating_sub(1),
+                                                    );
+                                            } else {
+                                                sel.end_col = mouse.column;
+                                                sel.end_row = mouse.row;
+                                            }
+                                        }
+                                    }
+                                    MouseEventKind::Up(MouseButton::Left) => {
+                                        if let Some(sel) = mouse_select.take() {
+                                            if let Some(ref fd) = frame {
+                                                let is_click = sel.start_row
+                                                    == sel.end_row
+                                                    && sel.start_col
+                                                        == sel.end_col;
+                                                if !is_click {
+                                                    let text =
+                                                        extract_text_from_frame(
+                                                            fd,
+                                                            &sel,
+                                                            hide_borders,
+                                                        );
+                                                    if !text.is_empty() {
+                                                        let result =
+                                                            copy_to_clipboard(
+                                                                &text,
+                                                            );
+                                                        status_notice = Some((
+                                                            match result {
+                                                                ClipboardCopyResult::System => format!(
+                                                                    "copied {} chars",
+                                                                    text.chars().count()
+                                                                ),
+                                                                ClipboardCopyResult::Osc52 => format!(
+                                                                    "copied {} chars via OSC 52",
+                                                                    text.chars().count()
+                                                                ),
+                                                                ClipboardCopyResult::Unavailable => format!(
+                                                                    "yanked {} chars (clipboard unavailable)",
+                                                                    text.chars().count()
+                                                                ),
+                                                            },
+                                                            Instant::now()
+                                                                + Duration::from_secs(3),
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                     _ => {}
                                 },
                                 _ => {}
