@@ -240,8 +240,25 @@ impl SocketClient {
     }
 
     pub fn run_command_with_output(&self, cmd: &str) -> String {
-        self.run_command(cmd);
-        String::new()
+        let stream = match connect_client(&self.socket_name) {
+            Ok(s) => s,
+            Err(_) => return String::new(),
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut ws = match stream.try_clone() {
+            Ok(s) => s,
+            Err(_) => return String::new(),
+        };
+        let reader = BufReader::new(stream);
+        if ws
+            .write_all(format!("CMD_OUTPUT {}\n", cmd).as_bytes())
+            .is_err()
+            || ws.flush().is_err()
+        {
+            return String::new();
+        }
+        let mut buf_reader = reader;
+        crate::ipc::recv_resp(&mut buf_reader).unwrap_or_default()
     }
 
     pub fn resize(&self, size: Size) {

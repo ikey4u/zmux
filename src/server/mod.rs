@@ -544,6 +544,17 @@ fn handle_client(
             log_server("OPTIONS served, closing");
             return Ok(());
         }
+        line if line.starts_with("CMD_OUTPUT ") => {
+            let cmd = &line["CMD_OUTPUT ".len()..];
+            let sz = size_arc.lock().map(|s| *s).unwrap_or(Size::new(24, 80));
+            let output = state
+                .lock()
+                .map(|mut s| execute_command_with_output(&mut s, cmd, sz))
+                .unwrap_or_default();
+            send_resp(&mut write_stream, &output)?;
+            log_server("CMD_OUTPUT served, closing");
+            return Ok(());
+        }
         line if line.starts_with("ATTACH") => {}
         _ => {
             log_server(&format!("unknown hello {:?}, closing", hello));
