@@ -66,6 +66,10 @@ enum InputMode {
         collapsed: std::collections::HashSet<String>,
         collapsed_windows: std::collections::HashSet<(String, usize)>,
     },
+    OptionPanel {
+        selected: usize,
+        scroll_on_erase_in_display: bool,
+    },
 }
 
 const RESIZE_IDLE_TIMEOUT: Duration = Duration::from_millis(500);
@@ -190,22 +194,11 @@ impl ClientApp {
                         | InputMode::RenameSession { .. }
                         | InputMode::Command { .. }
                 );
-                let chooser_entries = if let InputMode::SessionChooser {
-                    ref entries,
-                    selected,
-                    ref collapsed,
-                    ref collapsed_windows,
-                } = mode
-                {
-                    Some((
-                        entries.clone(),
-                        selected,
-                        collapsed.clone(),
-                        collapsed_windows.clone(),
-                    ))
-                } else {
-                    None
-                };
+                let has_overlay = matches!(
+                    mode,
+                    InputMode::SessionChooser { .. }
+                        | InputMode::OptionPanel { .. }
+                );
 
                 let current_counter = server.frame_counter();
                 let frame_new = current_counter != last_drawn_counter;
@@ -227,7 +220,7 @@ impl ClientApp {
                                 f,
                                 &display_frame,
                                 in_prefix,
-                                has_prompt || chooser_entries.is_some(),
+                                has_prompt || has_overlay,
                                 hide_borders,
                             );
                         } else {
@@ -261,6 +254,14 @@ impl ClientApp {
                                 *selected,
                                 collapsed,
                                 collapsed_windows,
+                            ),
+                            InputMode::OptionPanel {
+                                selected,
+                                scroll_on_erase_in_display,
+                            } => render_options_panel(
+                                f,
+                                *selected,
+                                *scroll_on_erase_in_display,
                             ),
                             _ => {}
                         }
@@ -368,6 +369,13 @@ impl ClientApp {
                                             mode = InputMode::Command {
                                                 buf: String::new(),
                                                 cursor: 0,
+                                            };
+                                        }
+                                        (KeyCode::Char('O'), _) => {
+                                            mode = InputMode::OptionPanel {
+                                                selected: 0,
+                                                scroll_on_erase_in_display: server
+                                                    .scroll_on_erase_in_display(),
                                             };
                                         }
                                         (KeyCode::Char('['), _) => {
@@ -833,6 +841,32 @@ impl ClientApp {
                                         }
                                     }
                                 }
+
+                                InputMode::OptionPanel {
+                                    selected,
+                                    scroll_on_erase_in_display,
+                                } => match key.code {
+                                    KeyCode::Esc | KeyCode::Char('q') => {
+                                        mode = InputMode::Normal;
+                                    }
+                                    KeyCode::Enter | KeyCode::Char(' ') => {
+                                        let enabled =
+                                            !scroll_on_erase_in_display;
+                                        server.set_scroll_on_erase_in_display(
+                                            enabled,
+                                        );
+                                        mode = InputMode::OptionPanel {
+                                            selected,
+                                            scroll_on_erase_in_display: enabled,
+                                        };
+                                    }
+                                    _ => {
+                                        mode = InputMode::OptionPanel {
+                                            selected,
+                                            scroll_on_erase_in_display,
+                                        };
+                                    }
+                                },
 
                                 InputMode::SessionChooser {
                                     entries,
@@ -2062,7 +2096,9 @@ fn handle_paste_event(
             insert_text_at_cursor(&mut buf, &mut cursor, &text);
             *mode = InputMode::Command { buf, cursor };
         }
-        InputMode::CopyMode | InputMode::SessionChooser { .. } => {}
+        InputMode::CopyMode
+        | InputMode::SessionChooser { .. }
+        | InputMode::OptionPanel { .. } => {}
     }
 }
 

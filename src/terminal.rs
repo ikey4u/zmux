@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use alacritty_terminal::{
     event::VoidListener,
     grid::Dimensions,
-    index::Point,
+    index::{Line, Point},
     term::{
         cell::{Cell, Flags},
         Config, Term, TermMode,
@@ -49,6 +49,9 @@ pub struct AlacrittyTermState {
     parser: Processor,
     rows: u16,
     cols: u16,
+    scroll_on_erase_in_display: bool,
+    scroll_on_erase_history: bool,
+    pending_scroll_erase_escape: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -70,12 +73,93 @@ impl AlacrittyTermState {
             parser: Processor::new(),
             rows: size.screen_lines() as u16,
             cols: size.columns() as u16,
+            scroll_on_erase_in_display: false,
+            scroll_on_erase_history: false,
+            pending_scroll_erase_escape: Vec::new(),
         }
     }
 
+    pub fn set_scroll_on_erase_in_display(&mut self, enabled: bool) {
+        self.scroll_on_erase_in_display = enabled;
+        self.scroll_on_erase_history |= enabled;
+    }
+
+    pub fn scroll_on_erase_in_display(&self) -> bool {
+        self.scroll_on_erase_in_display
+    }
+
+    pub fn scroll_on_erase_history(&self) -> bool {
+        self.scroll_on_erase_history
+    }
+
     pub fn process(&mut self, data: &[u8]) -> bool {
-        self.parser.advance(&mut self.term, data);
+        if self.scroll_on_erase_in_display {
+            self.process_with_scroll_on_erase(data);
+        } else if self.pending_scroll_erase_escape.is_empty() {
+            self.parser.advance(&mut self.term, data);
+        } else {
+            let mut bytes =
+                std::mem::take(&mut self.pending_scroll_erase_escape);
+            bytes.extend_from_slice(data);
+            self.parser.advance(&mut self.term, &bytes);
+        }
         !data.is_empty() && !self.sync_update_active()
+    }
+
+    fn process_with_scroll_on_erase(&mut self, data: &[u8]) {
+        let mut bytes = std::mem::take(&mut self.pending_scroll_erase_escape);
+        bytes.extend_from_slice(data);
+        let mut segment_start = 0usize;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i] != 0x1b {
+                i += 1;
+                continue;
+            }
+            if i + 1 >= bytes.len() {
+                self.parser
+                    .advance(&mut self.term, &bytes[segment_start..i]);
+                self.pending_scroll_erase_escape
+                    .extend_from_slice(&bytes[i..]);
+                return;
+            }
+            if bytes[i + 1] != b'[' {
+                i += 1;
+                continue;
+            }
+            let params_start = i + 2;
+            let Some(rel_end) = bytes[params_start..]
+                .iter()
+                .position(|&b| (0x40..=0x7e).contains(&b))
+            else {
+                self.parser
+                    .advance(&mut self.term, &bytes[segment_start..i]);
+                self.pending_scroll_erase_escape
+                    .extend_from_slice(&bytes[i..]);
+                return;
+            };
+            let final_index = params_start + rel_end;
+            let final_byte = bytes[final_index];
+            let params = &bytes[params_start..final_index];
+            if final_byte == b'J'
+                && is_erase_display_all(params)
+                && !self.alternate_screen()
+            {
+                self.parser
+                    .advance(&mut self.term, &bytes[segment_start..i]);
+                self.scroll_full_viewport_into_history();
+                self.scroll_on_erase_history = true;
+                segment_start = final_index + 1;
+            }
+            i = final_index + 1;
+        }
+        self.parser.advance(&mut self.term, &bytes[segment_start..]);
+    }
+
+    fn scroll_full_viewport_into_history(&mut self) {
+        let rows = self.rows.max(1) as usize;
+        let region = Line(0)..Line(self.rows.max(1) as i32);
+        self.term.grid_mut().scroll_up::<Color>(&region, rows);
     }
 
     fn sync_update_active(&self) -> bool {
@@ -202,6 +286,17 @@ impl AlacrittyTermState {
     }
 }
 
+fn is_erase_display_all(params: &[u8]) -> bool {
+    !params.is_empty() && params.iter().all(|&b| b.is_ascii_digit()) && {
+        let trimmed = params
+            .iter()
+            .position(|&b| b != b'0')
+            .map(|index| &params[index..])
+            .unwrap_or(b"0".as_slice());
+        trimmed == b"2"
+    }
+}
+
 fn cell_to_view(cell: &Cell) -> Option<TerminalCell> {
     if cell.flags.contains(Flags::WIDE_CHAR_SPACER)
         || cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
@@ -265,6 +360,32 @@ mod tests {
             .collect::<String>()
             .trim_end()
             .to_string()
+    }
+
+    fn screen_text(term: &AlacrittyTermState) -> String {
+        term.visible_rows()
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .filter_map(|cell| cell.map(|cell| cell.text))
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn scroll_on_erase_in_display_handles_split_ed2() {
+        let mut term = AlacrittyTermState::new(3, 20, 2000);
+        term.set_scroll_on_erase_in_display(true);
+        term.process(b"abc");
+        term.process(b"\x1b[2");
+        term.process(b"Jxyz");
+        let text = screen_text(&term);
+        assert!(text.contains("xyz"));
+        assert!(!text.contains("Jxyz"));
     }
 
     #[test]

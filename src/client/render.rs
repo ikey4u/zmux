@@ -641,6 +641,84 @@ pub fn render_prompt(f: &mut Frame, label: &str, buf: &str) {
     f.set_cursor_position((cursor_x, prompt_area.y));
 }
 
+pub fn render_options_panel(
+    f: &mut Frame,
+    selected: usize,
+    scroll_on_erase_in_display: bool,
+) {
+    use ratatui::widgets::{Block, Borders, Clear};
+
+    let area = f.area();
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let w = (area.width * 2 / 3).max(64).min(area.width);
+    let h = 7.min(area.height).max(1);
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let panel_area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+
+    f.render_widget(Clear, panel_area);
+    let block = Block::default()
+        .title(" Options  (Space/Enter=toggle  q/Esc=close) ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(panel_area);
+    f.render_widget(block, panel_area);
+
+    let state = if scroll_on_erase_in_display {
+        "on"
+    } else {
+        "off"
+    };
+    let mark = if scroll_on_erase_in_display {
+        "[x]"
+    } else {
+        "[ ]"
+    };
+    let label = format!(
+        " {} scrollOnEraseInDisplay compatibility mode: {}",
+        mark, state
+    );
+    let style = if selected == 0 {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let padded = format!("{:<width$}", label, width = inner.width as usize);
+    f.render_widget(
+        Paragraph::new(padded).style(style),
+        Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: 1,
+        },
+    );
+
+    if inner.height > 2 {
+        let help = " Normal buffer CSI 2J scrolls content into history instead of cutting the screen.";
+        let help = truncate_to_width(help, inner.width as usize);
+        f.render_widget(
+            Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
+            Rect {
+                x: inner.x,
+                y: inner.y + 2,
+                width: inner.width,
+                height: 1,
+            },
+        );
+    }
+}
+
 pub fn render_session_chooser(
     f: &mut Frame,
     entries: &[crate::server::SessionTreeEntry],

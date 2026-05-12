@@ -54,7 +54,11 @@ fn snapshot_for_copy_mode(
         .as_ref()
         .map(|p| p.alternate_screen())
         .unwrap_or(false);
-    let snapshot = if alternate_screen {
+    let scroll_on_erase_history = parser
+        .as_ref()
+        .map(|p| p.scroll_on_erase_history())
+        .unwrap_or(false);
+    let snapshot = if alternate_screen || scroll_on_erase_history {
         parser.as_ref().map(|p| snapshot_from_parser(p))
     } else {
         snapshot_from_output_ring(pane)

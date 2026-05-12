@@ -255,6 +255,42 @@ impl SocketClient {
         ));
     }
 
+    pub fn scroll_on_erase_in_display(&self) -> bool {
+        let stream = match connect_client(&self.socket_name) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut ws = match stream.try_clone() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let reader = BufReader::new(stream);
+        if ws.write_all(b"OPTIONS\n").is_err() || ws.flush().is_err() {
+            return false;
+        }
+        let mut buf_reader = reader;
+        let json = match crate::ipc::recv_resp(&mut buf_reader) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        serde_json::from_str::<serde_json::Value>(&json)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("scroll_on_erase_in_display")
+                    .and_then(|v| v.as_bool())
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn set_scroll_on_erase_in_display(&self, enabled: bool) {
+        self.send_line(&format!(
+            "OPTION scroll_on_erase_in_display {}",
+            if enabled { "1" } else { "0" }
+        ));
+    }
+
     pub fn is_empty(&self) -> bool {
         false
     }

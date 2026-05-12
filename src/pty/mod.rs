@@ -32,6 +32,7 @@ pub struct SpawnOptions<'a> {
     pub command: Option<&'a str>,
     pub start_dir: Option<&'a str>,
     pub env: Vec<(String, String)>,
+    pub scroll_on_erase_in_display: bool,
 }
 
 pub fn spawn_pane(opts: SpawnOptions<'_>) -> io::Result<Pane> {
@@ -93,9 +94,9 @@ pub fn spawn_pane(opts: SpawnOptions<'_>) -> io::Result<Pane> {
         .take_writer()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-    let parser = Arc::new(Mutex::new(AlacrittyTermState::new(
-        opts.rows, opts.cols, 2000,
-    )));
+    let mut term_state = AlacrittyTermState::new(opts.rows, opts.cols, 2000);
+    term_state.set_scroll_on_erase_in_display(opts.scroll_on_erase_in_display);
+    let parser = Arc::new(Mutex::new(term_state));
     let data_version: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let cursor_shape: Arc<AtomicU8> =
         Arc::new(AtomicU8::new(CURSOR_SHAPE_UNSET));
@@ -547,6 +548,7 @@ mod tests {
             command: Some("/bin/cat"),
             start_dir: None,
             env: vec![],
+            scroll_on_erase_in_display: false,
         })?;
         pane.parser = Arc::new(Mutex::new(parser));
         resize_pane(&mut pane, 4, 20)?;

@@ -7,7 +7,8 @@ use zmux::{client::ClientApp, platform::setup_signals};
 #[command(
     name = "zmux",
     version,
-    about = "Cross-platform terminal multiplexer"
+    about = "Cross-platform terminal multiplexer",
+    after_help = "Examples:\n  Start or attach to the default zmux server:\n    zmux\n\n  Start an isolated test instance without touching your current session:\n    zmux --clean -L test-scroll\n\n  Attach to that isolated test instance from another terminal:\n    zmux -L test-scroll a\n\n  List sessions for that isolated test instance:\n    zmux -L test-scroll ls\n\n  Start in a specific working directory:\n    zmux -c /path/to/project\n\n  Open the runtime options panel inside zmux:\n    Prefix + O"
 )]
 struct Cli {
     #[command(subcommand)]

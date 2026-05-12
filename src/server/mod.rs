@@ -152,6 +152,20 @@ impl InProcessServer {
         mark_data_ready();
     }
 
+    pub fn scroll_on_erase_in_display(&self) -> bool {
+        self.state
+            .lock()
+            .map(|s| s.options.scroll_on_erase_in_display)
+            .unwrap_or(false)
+    }
+
+    pub fn set_scroll_on_erase_in_display(&self, enabled: bool) {
+        if let Ok(mut s) = self.state.lock() {
+            set_scroll_on_erase_in_display(&mut s, enabled);
+        }
+        mark_data_ready();
+    }
+
     pub fn is_empty(&self) -> bool {
         self.state
             .lock()
@@ -516,6 +530,15 @@ fn handle_client(
             log_server("SESSION_TREE served, closing");
             return Ok(());
         }
+        "OPTIONS" => {
+            let json = state
+                .lock()
+                .map(|s| options_json(&s))
+                .unwrap_or_else(|_| "{}".to_string());
+            send_resp(&mut write_stream, &json)?;
+            log_server("OPTIONS served, closing");
+            return Ok(());
+        }
         line if line.starts_with("ATTACH") => {}
         _ => {
             log_server(&format!("unknown hello {:?}, closing", hello));
@@ -533,8 +556,10 @@ fn handle_client(
         }
         if let Ok(mut s) = state.lock() {
             resize_all_panes(&mut s, new_size);
+            refresh_latest_frame(&latest_frame, &s, new_size);
         }
     }
+    mark_data_ready();
 
     log_server("entering main loop");
     let mut pending_yank: Option<String> = None;
@@ -617,6 +642,20 @@ fn handle_client(
                 }
                 if let Ok(mut s) = state.lock() {
                     resize_all_panes(&mut s, new_size);
+                    refresh_latest_frame(&latest_frame, &s, new_size);
+                }
+                mark_data_ready();
+            }
+        } else if line.starts_with("OPTION ") {
+            let rest = &line["OPTION ".len()..];
+            let mut parts = rest.split_whitespace();
+            if matches!(parts.next(), Some("scroll_on_erase_in_display")) {
+                if let Some(value) = parts.next() {
+                    let enabled = matches!(value, "1" | "true" | "on");
+                    if let Ok(mut s) = state.lock() {
+                        set_scroll_on_erase_in_display(&mut s, enabled);
+                    }
+                    mark_data_ready();
                 }
             }
         } else if line.starts_with("HIDE_BORDERS ") {
@@ -791,6 +830,31 @@ fn handle_copy_nav(state: &Arc<Mutex<Server>>, dir: &str) {
             f(pane);
         });
         mark_data_ready();
+    }
+}
+
+fn refresh_latest_frame(
+    latest_frame: &Arc<Mutex<Option<FrameData>>>,
+    state: &Server,
+    size: Size,
+) {
+    let Some(session) = state.active_session() else {
+        return;
+    };
+    let Some(win) = session.windows.get(session.active_window_idx) else {
+        return;
+    };
+    let json = build_frame_json(
+        session,
+        win,
+        frame_layout_area(size),
+        None,
+        state.hide_borders,
+    );
+    if let Ok(fd) = serde_json::from_str::<FrameData>(&json) {
+        if let Ok(mut frame) = latest_frame.lock() {
+            *frame = Some(fd);
+        }
     }
 }
 
@@ -1122,6 +1186,7 @@ fn create_initial_session(
         command: None,
         start_dir: start_dir.as_deref(),
         env: vec![],
+        scroll_on_erase_in_display: state.options.scroll_on_erase_in_display,
     })?;
 
     let window = Window {
@@ -1191,6 +1256,37 @@ fn resize_node_panes(
             }
         }
     }
+}
+
+fn set_scroll_on_erase_in_display(state: &mut Server, enabled: bool) {
+    state.options.scroll_on_erase_in_display = enabled;
+    for session in &mut state.sessions {
+        for win in &mut session.windows {
+            set_scroll_on_erase_in_display_node(&mut win.root, enabled);
+        }
+    }
+}
+
+fn set_scroll_on_erase_in_display_node(node: &mut LayoutNode, enabled: bool) {
+    match node {
+        LayoutNode::Leaf(pane) => {
+            if let Ok(mut parser) = pane.parser.lock() {
+                parser.set_scroll_on_erase_in_display(enabled);
+            }
+        }
+        LayoutNode::Split { children, .. } => {
+            for child in children {
+                set_scroll_on_erase_in_display_node(child, enabled);
+            }
+        }
+    }
+}
+
+fn options_json(state: &Server) -> String {
+    format!(
+        "{{\"scroll_on_erase_in_display\":{}}}",
+        state.options.scroll_on_erase_in_display
+    )
 }
 
 fn execute_command_string(state: &mut Server, raw: &str, sz: Size) {
@@ -1353,6 +1449,7 @@ fn make_session(state: &mut Server, name: &str, sz: Size) -> io::Result<()> {
         command: None,
         start_dir: start_dir.as_deref(),
         env: vec![],
+        scroll_on_erase_in_display: state.options.scroll_on_erase_in_display,
     })?;
     let win = Window {
         id: window_id,
@@ -1464,6 +1561,7 @@ fn cmd_split_window(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
     } else {
         SplitDirection::Vertical
     };
+    let scroll_on_erase_in_display = state.options.scroll_on_erase_in_display;
 
     {
         let session = match active_session_mut(state) {
@@ -1504,6 +1602,7 @@ fn cmd_split_window(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
             command: None,
             start_dir: start_dir.as_deref(),
             env: vec![],
+            scroll_on_erase_in_display,
         }) {
             Ok(p) => p,
             Err(_) => return,
@@ -1533,6 +1632,7 @@ fn cmd_split_window(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
 }
 
 fn cmd_new_window(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
+    let scroll_on_erase_in_display = state.options.scroll_on_erase_in_display;
     {
         let session = match active_session_mut(state) {
             Some(s) => s,
@@ -1551,6 +1651,7 @@ fn cmd_new_window(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
             command: None,
             start_dir: start_dir.as_deref(),
             env: vec![],
+            scroll_on_erase_in_display,
         }) {
             Ok(p) => p,
             Err(_) => return,
@@ -2032,11 +2133,14 @@ fn cmd_clear_pane(state: &mut Server) {
             ring.clear();
         }
         if let Ok(mut parser) = pane.parser.lock() {
+            let scroll_on_erase_in_display =
+                parser.scroll_on_erase_in_display();
             *parser = crate::terminal::AlacrittyTermState::new(
                 pane.last_rows,
                 pane.last_cols,
                 2000,
             );
+            parser.set_scroll_on_erase_in_display(scroll_on_erase_in_display);
         }
         let _ = pane.writer.write_all(b"\r");
         let _ = pane.writer.flush();
@@ -2064,6 +2168,40 @@ mod tests {
         let pane = crate::layout::active_pane(&win.root, &win.active_pane_path)
             .unwrap();
         (pane.last_rows, pane.last_cols)
+    }
+
+    fn active_frame_size(
+        layout: &crate::client::LayoutJson,
+    ) -> Option<(u16, u16)> {
+        match layout {
+            crate::client::LayoutJson::Leaf {
+                rows, cols, active, ..
+            } if *active => Some((*rows, *cols)),
+            crate::client::LayoutJson::Leaf { .. } => None,
+            crate::client::LayoutJson::Split { children, .. } => {
+                children.iter().find_map(active_frame_size)
+            }
+        }
+    }
+
+    #[test]
+    fn refresh_latest_frame_rebuilds_after_resize() -> io::Result<()> {
+        let initial = Size::new(50, 180);
+        let resized = Size::new(30, 180);
+        let mut state = Server::new();
+        make_session(&mut state, "0", initial)?;
+        let latest_frame: Arc<Mutex<Option<FrameData>>> =
+            Arc::new(Mutex::new(None));
+
+        refresh_latest_frame(&latest_frame, &state, initial);
+        let first = latest_frame.lock().unwrap().clone().unwrap();
+        assert_eq!(active_frame_size(&first.layout), Some((47, 178)));
+
+        resize_all_panes(&mut state, resized);
+        refresh_latest_frame(&latest_frame, &state, resized);
+        let second = latest_frame.lock().unwrap().clone().unwrap();
+        assert_eq!(active_frame_size(&second.layout), Some((27, 178)));
+        Ok(())
     }
 
     #[test]
