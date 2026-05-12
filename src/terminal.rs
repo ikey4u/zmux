@@ -51,6 +51,7 @@ pub struct AlacrittyTermState {
     cols: u16,
     scroll_on_erase_in_display: bool,
     scroll_on_erase_history: bool,
+    suppress_next_scroll_on_erase: bool,
     pending_scroll_erase_escape: Vec<u8>,
 }
 
@@ -75,13 +76,20 @@ impl AlacrittyTermState {
             cols: size.columns() as u16,
             scroll_on_erase_in_display: false,
             scroll_on_erase_history: false,
+            suppress_next_scroll_on_erase: false,
             pending_scroll_erase_escape: Vec::new(),
         }
     }
 
     pub fn set_scroll_on_erase_in_display(&mut self, enabled: bool) {
         self.scroll_on_erase_in_display = enabled;
-        self.scroll_on_erase_history |= enabled;
+        if !enabled {
+            self.suppress_next_scroll_on_erase = false;
+        }
+    }
+
+    pub fn suppress_next_scroll_on_erase_in_display(&mut self) {
+        self.suppress_next_scroll_on_erase = true;
     }
 
     pub fn scroll_on_erase_in_display(&self) -> bool {
@@ -147,8 +155,14 @@ impl AlacrittyTermState {
             {
                 self.parser
                     .advance(&mut self.term, &bytes[segment_start..i]);
-                self.scroll_full_viewport_into_history();
-                self.scroll_on_erase_history = true;
+                if self.suppress_next_scroll_on_erase {
+                    self.suppress_next_scroll_on_erase = false;
+                    self.parser
+                        .advance(&mut self.term, &bytes[i..=final_index]);
+                } else {
+                    self.scroll_full_viewport_into_history();
+                    self.scroll_on_erase_history = true;
+                }
                 segment_start = final_index + 1;
             }
             i = final_index + 1;
@@ -386,6 +400,16 @@ mod tests {
         let text = screen_text(&term);
         assert!(text.contains("xyz"));
         assert!(!text.contains("Jxyz"));
+    }
+
+    #[test]
+    fn suppressed_scroll_on_erase_uses_real_ed2_once() {
+        let mut term = AlacrittyTermState::new(3, 20, 2000);
+        term.set_scroll_on_erase_in_display(true);
+        term.suppress_next_scroll_on_erase_in_display();
+        term.process(b"abc\x1b[H\x1b[2Jprompt");
+        assert_eq!(first_row_text(&term), "prompt");
+        assert!(!term.scroll_on_erase_history());
     }
 
     #[test]

@@ -2141,8 +2141,11 @@ fn cmd_clear_pane(state: &mut Server) {
                 2000,
             );
             parser.set_scroll_on_erase_in_display(scroll_on_erase_in_display);
+            if scroll_on_erase_in_display {
+                parser.suppress_next_scroll_on_erase_in_display();
+            }
         }
-        let _ = pane.writer.write_all(b"\r");
+        let _ = pane.writer.write_all(b"\x0c");
         let _ = pane.writer.flush();
     });
 }

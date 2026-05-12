@@ -1899,8 +1899,11 @@ fn handle_prefix_key(server: &SocketClient, key: KeyEvent) -> Option<String> {
         (KeyCode::Char('p'), KeyModifiers::NONE) => "select-window -p",
         (KeyCode::Char('x'), KeyModifiers::NONE) => "kill-pane",
         (KeyCode::Char('z'), KeyModifiers::NONE) => "zoom-pane",
-        (KeyCode::Char('K'), KeyModifiers::SHIFT) => "clear-pane",
-        (KeyCode::Char('H'), KeyModifiers::SHIFT) => "set-pane-start-dir",
+        (KeyCode::Char('K'), _) => "clear-pane",
+        (KeyCode::Char('k'), mods) if mods.contains(KeyModifiers::SHIFT) => {
+            "clear-pane"
+        }
+        (KeyCode::Char('H'), _) => "set-pane-start-dir",
         (KeyCode::Char('h'), KeyModifiers::NONE) => "select-pane -L",
         (KeyCode::Char('j'), KeyModifiers::NONE) => "select-pane -D",
         (KeyCode::Char('k'), KeyModifiers::NONE) => "select-pane -U",
