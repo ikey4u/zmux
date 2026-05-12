@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use alacritty_terminal::{
     event::VoidListener,
-    grid::Dimensions,
+    grid::{Dimensions, GridCell},
     index::{Line, Point},
     term::{
         cell::{Cell, Flags},
@@ -159,9 +159,11 @@ impl AlacrittyTermState {
                     self.suppress_next_scroll_on_erase = false;
                     self.parser
                         .advance(&mut self.term, &bytes[i..=final_index]);
-                } else {
+                } else if self.should_scroll_erase_into_history() {
                     self.scroll_full_viewport_into_history();
                     self.scroll_on_erase_history = true;
+                } else {
+                    self.clear_viewport_without_history();
                 }
                 segment_start = final_index + 1;
             }
@@ -170,10 +172,42 @@ impl AlacrittyTermState {
         self.parser.advance(&mut self.term, &bytes[segment_start..]);
     }
 
+    fn should_scroll_erase_into_history(&self) -> bool {
+        let grid = self.term.grid();
+        let rows = self.rows.max(1) as i32;
+        let mut first_non_empty: Option<i32> = None;
+        let mut non_empty_rows = 0usize;
+
+        for line in 0..rows {
+            let row_has_content =
+                (&grid[Line(line)]).into_iter().any(|cell| !cell.is_empty());
+            if row_has_content {
+                first_non_empty.get_or_insert(line);
+                non_empty_rows += 1;
+            }
+        }
+
+        let Some(first_non_empty) = first_non_empty else {
+            return false;
+        };
+        let leading_blank_rows = first_non_empty.max(0) as usize;
+        let sparse_content_limit = (self.rows as usize / 5).max(3);
+        if leading_blank_rows > self.rows as usize / 3
+            && non_empty_rows <= sparse_content_limit
+        {
+            return false;
+        }
+        true
+    }
+
     fn scroll_full_viewport_into_history(&mut self) {
         let rows = self.rows.max(1) as usize;
         let region = Line(0)..Line(self.rows.max(1) as i32);
         self.term.grid_mut().scroll_up::<Color>(&region, rows);
+    }
+
+    fn clear_viewport_without_history(&mut self) {
+        self.term.grid_mut().reset_region::<Color, _>(..);
     }
 
     fn sync_update_active(&self) -> bool {
@@ -410,6 +444,23 @@ mod tests {
         term.process(b"abc\x1b[H\x1b[2Jprompt");
         assert_eq!(first_row_text(&term), "prompt");
         assert!(!term.scroll_on_erase_history());
+    }
+
+    #[test]
+    fn sparse_bottom_content_ed2_does_not_enter_history() {
+        let mut term = AlacrittyTermState::new(6, 20, 2000);
+        term.set_scroll_on_erase_in_display(true);
+        term.process(b"\x1b[6;1Hbottom\x1b[H\x1b[2Jprompt");
+        assert_eq!(first_row_text(&term), "prompt");
+        assert!(!term.scroll_on_erase_history());
+    }
+
+    #[test]
+    fn dense_content_ed2_scrolls_into_history() {
+        let mut term = AlacrittyTermState::new(6, 20, 2000);
+        term.set_scroll_on_erase_in_display(true);
+        term.process(b"alpha\r\nbeta\r\ngamma\x1b[H\x1b[2Jprompt");
+        assert!(term.scroll_on_erase_history());
     }
 
     #[test]

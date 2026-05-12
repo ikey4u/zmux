@@ -138,7 +138,12 @@ impl InProcessServer {
         if let Ok(mut s) = self.state.lock() {
             resize_all_panes(&mut s, new_size);
         }
-        mark_data_ready();
+        schedule_delayed_frame_refresh(
+            &self.state,
+            &self.latest_frame,
+            &self.size,
+            new_size,
+        );
     }
 
     pub fn set_hide_borders(&self, hide: bool) {
@@ -642,9 +647,13 @@ fn handle_client(
                 }
                 if let Ok(mut s) = state.lock() {
                     resize_all_panes(&mut s, new_size);
-                    refresh_latest_frame(&latest_frame, &s, new_size);
                 }
-                mark_data_ready();
+                schedule_delayed_frame_refresh(
+                    &state,
+                    &latest_frame,
+                    &size_arc,
+                    new_size,
+                );
             }
         } else if line.starts_with("OPTION ") {
             let rest = &line["OPTION ".len()..];
@@ -831,6 +840,27 @@ fn handle_copy_nav(state: &Arc<Mutex<Server>>, dir: &str) {
         });
         mark_data_ready();
     }
+}
+
+fn schedule_delayed_frame_refresh(
+    state: &Arc<Mutex<Server>>,
+    latest_frame: &Arc<Mutex<Option<FrameData>>>,
+    size_arc: &Arc<Mutex<Size>>,
+    target_size: Size,
+) {
+    let state = Arc::clone(state);
+    let latest_frame = Arc::clone(latest_frame);
+    let size_arc = Arc::clone(size_arc);
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(60));
+        if size_arc.lock().map(|size| *size).ok() != Some(target_size) {
+            return;
+        }
+        if let Ok(state) = state.lock() {
+            refresh_latest_frame(&latest_frame, &state, target_size);
+            mark_data_ready();
+        }
+    });
 }
 
 fn refresh_latest_frame(

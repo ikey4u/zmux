@@ -97,9 +97,80 @@ fn snapshot_from_parser(parser: &AlacrittyTermState) -> PaneTextSnapshot {
             physical_rows.push(row);
         }
     }
+    let mut cursor_physical_row = cursor_physical_row;
     trim_viewport_blank_tail(&mut physical_rows, cursor_physical_row);
+    compact_blank_gap_before_cursor(
+        &mut physical_rows,
+        &mut cursor_physical_row,
+    );
+    compact_long_blank_runs(&mut physical_rows, &mut cursor_physical_row);
 
     snapshot_from_physical_rows(&physical_rows, cursor_physical_row, cursor_col)
+}
+
+fn compact_long_blank_runs(
+    rows: &mut Vec<ScreenSnapshotRow>,
+    cursor_row: &mut usize,
+) {
+    const COMPACT_THRESHOLD: usize = 3;
+    const KEEP_BLANK_ROWS: usize = 1;
+
+    let mut start = 0usize;
+    while start < rows.len() {
+        if !is_plain_blank_row(&rows[start]) {
+            start += 1;
+            continue;
+        }
+        let mut end = start + 1;
+        while end < rows.len() && is_plain_blank_row(&rows[end]) {
+            end += 1;
+        }
+        let contains_cursor = start <= *cursor_row && *cursor_row < end;
+        let blank_count = end - start;
+        if !contains_cursor && blank_count > COMPACT_THRESHOLD {
+            let remove_start = start + KEEP_BLANK_ROWS;
+            let removed = end - remove_start;
+            rows.drain(remove_start..end);
+            if remove_start <= *cursor_row {
+                *cursor_row = cursor_row.saturating_sub(removed);
+            }
+            start += KEEP_BLANK_ROWS;
+        } else {
+            start = end;
+        }
+    }
+}
+
+fn compact_blank_gap_before_cursor(
+    rows: &mut Vec<ScreenSnapshotRow>,
+    cursor_row: &mut usize,
+) {
+    const COMPACT_THRESHOLD: usize = 3;
+    const KEEP_BLANK_ROWS: usize = 1;
+
+    if *cursor_row == 0 || rows.is_empty() {
+        return;
+    }
+    let end = (*cursor_row).min(rows.len());
+    let mut start = end;
+    while start > 0 && is_plain_blank_row(&rows[start - 1]) {
+        start -= 1;
+    }
+    let blank_count = end.saturating_sub(start);
+    if blank_count <= COMPACT_THRESHOLD {
+        return;
+    }
+    let remove_end = end.saturating_sub(KEEP_BLANK_ROWS);
+    if remove_end <= start {
+        return;
+    }
+    let removed = remove_end - start;
+    rows.drain(start..remove_end);
+    *cursor_row = cursor_row.saturating_sub(removed);
+}
+
+fn is_plain_blank_row(row: &ScreenSnapshotRow) -> bool {
+    !row.wrapped && row.text.trim().is_empty()
 }
 
 fn trim_viewport_blank_tail(
@@ -1499,6 +1570,35 @@ mod tests {
         assert_eq!(snapshot.lines[1].text, "$");
         assert_eq!(snapshot.cursor_line, 1);
         assert_eq!(snapshot.cursor_col, 1);
+    }
+
+    #[test]
+    fn compact_blank_gap_before_cursor_keeps_one_blank_row() {
+        let mut parser = AlacrittyTermState::new(8, 20, 20);
+        parser.process(b"older\r\n\r\n\r\n\r\n\r\n$");
+        let snapshot = snapshot_from_parser(&parser);
+        let lines: Vec<_> = snapshot
+            .lines
+            .iter()
+            .map(|line| (line.text.as_str(), line.terminated))
+            .collect();
+        assert_eq!(lines, vec![("older", true), ("", true), ("$", false)]);
+        assert_eq!(snapshot.cursor_line, 2);
+        assert_eq!(snapshot.cursor_col, 1);
+    }
+
+    #[test]
+    fn compact_long_blank_runs_handles_history_gaps() {
+        let mut parser = AlacrittyTermState::new(12, 20, 30);
+        parser.process(b"older\r\n\r\n\r\n\r\n\r\nmiddle\r\n\r\n\r\n\r\n\r\n$");
+        let snapshot = snapshot_from_parser(&parser);
+        let lines: Vec<_> = snapshot
+            .lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect();
+        assert_eq!(lines, vec!["older", "", "middle", "", "$"]);
+        assert_eq!(snapshot.cursor_line, 4);
     }
 
     #[test]
