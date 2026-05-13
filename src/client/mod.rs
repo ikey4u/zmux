@@ -26,6 +26,7 @@ pub use render::*;
 pub use socket::SocketClient;
 
 use crate::{
+    commands::ParsedCommand,
     server::SessionTreeEntry,
     types::{session::Size, SelectionMode},
 };
@@ -35,6 +36,7 @@ pub struct ClientApp {
     pub session_name: Option<String>,
     pub clean: bool,
     pub start_dir: Option<String>,
+    pub initial_tab_title: Option<String>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -56,6 +58,14 @@ enum InputMode {
         buf: String,
         cursor: usize,
     },
+    RenameTab {
+        code: String,
+        code_cursor: usize,
+        title: String,
+        title_cursor: usize,
+        editing_code: bool,
+        error: Option<String>,
+    },
     Command {
         buf: String,
         cursor: usize,
@@ -70,10 +80,288 @@ enum InputMode {
         selected: usize,
         scroll_on_erase_in_display: bool,
     },
+    TabChooser {
+        query: String,
+        cursor: usize,
+        selected: usize,
+        search_active: bool,
+    },
 }
 
 const RESIZE_IDLE_TIMEOUT: Duration = Duration::from_millis(500);
 const SCROLL_LINES: usize = 3;
+
+struct ClientTab {
+    code: String,
+    title: String,
+    client: SocketClient,
+}
+
+struct TabManager {
+    tabs: Vec<ClientTab>,
+    active: usize,
+    base_socket: String,
+    start_dir: Option<String>,
+    next_id: usize,
+}
+
+impl TabManager {
+    fn new(
+        base_socket: &str,
+        session_name: &str,
+        size: Size,
+        clean: bool,
+        start_dir: Option<String>,
+    ) -> io::Result<Self> {
+        let client = ensure_server_and_connect(
+            base_socket,
+            session_name,
+            size,
+            clean,
+            start_dir.as_deref(),
+        )?;
+        Ok(Self {
+            tabs: vec![ClientTab {
+                code: tab_code(0),
+                title: String::new(),
+                client,
+            }],
+            active: 0,
+            base_socket: base_socket.to_string(),
+            start_dir,
+            next_id: 1,
+        })
+    }
+
+    fn active_client(&self) -> &SocketClient {
+        &self.tabs[self.active].client
+    }
+
+    fn active_index(&self) -> usize {
+        self.active
+    }
+
+    fn active_code(&self) -> String {
+        self.tabs[self.active].code.clone()
+    }
+
+    fn active_title(&self) -> String {
+        self.tabs[self.active].title.clone()
+    }
+
+    fn select(&mut self, index: usize) -> bool {
+        if index >= self.tabs.len() {
+            return false;
+        }
+        self.active = index;
+        true
+    }
+
+    fn set_active_title(&mut self, title: String) {
+        self.tabs[self.active].title = title;
+    }
+
+    fn set_active_metadata(
+        &mut self,
+        code: &str,
+        title: String,
+    ) -> Result<(), String> {
+        let code = normalize_tab_code(code)?;
+        if self
+            .tabs
+            .iter()
+            .enumerate()
+            .any(|(index, tab)| index != self.active && tab.code == code)
+        {
+            return Err(format!("tab code {} already exists", code));
+        }
+        self.tabs[self.active].code = code;
+        self.tabs[self.active].title = title;
+        Ok(())
+    }
+
+    fn create_tab(&mut self, size: Size) -> io::Result<()> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let socket_name =
+            format!("{}.tab.{}.{}", self.base_socket, std::process::id(), id);
+        let client = ensure_server_and_connect(
+            &socket_name,
+            "0",
+            size,
+            true,
+            self.start_dir.as_deref(),
+        )?;
+        let code = next_available_tab_code(&self.tabs, id);
+        self.tabs.push(ClientTab {
+            code,
+            title: String::new(),
+            client,
+        });
+        self.active = self.tabs.len() - 1;
+        Ok(())
+    }
+
+    fn next_tab(&mut self) -> bool {
+        if self.tabs.len() <= 1 {
+            return false;
+        }
+        self.active = (self.active + 1) % self.tabs.len();
+        true
+    }
+
+    fn prev_tab(&mut self) -> bool {
+        if self.tabs.len() <= 1 {
+            return false;
+        }
+        self.active = (self.active + self.tabs.len() - 1) % self.tabs.len();
+        true
+    }
+
+    fn close_active(&mut self) -> bool {
+        self.tabs[self.active].client.detach();
+        self.tabs.remove(self.active);
+        if self.tabs.is_empty() {
+            return true;
+        }
+        if self.active >= self.tabs.len() {
+            self.active = self.tabs.len() - 1;
+        }
+        false
+    }
+
+    fn detach_all(&self) {
+        for tab in &self.tabs {
+            tab.client.detach();
+        }
+    }
+
+    fn resize_all(&self, size: Size) {
+        for tab in &self.tabs {
+            tab.client.resize(size);
+        }
+    }
+
+    fn tab_views(&self) -> Vec<ClientTabView> {
+        self.tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| {
+                let dead = tab
+                    .client
+                    .latest_frame()
+                    .as_ref()
+                    .is_some_and(|frame| frame.exit);
+                let state = if dead {
+                    ClientTabState::Dead
+                } else if index == self.active {
+                    ClientTabState::Active
+                } else {
+                    ClientTabState::Inactive
+                };
+                ClientTabView {
+                    code: tab.code.clone(),
+                    title: tab.title.clone(),
+                    state,
+                }
+            })
+            .collect()
+    }
+}
+
+fn tab_code(index: usize) -> String {
+    let index = index % (26 * 26);
+    let first = (b'A' + (index / 26) as u8) as char;
+    let second = (b'A' + (index % 26) as u8) as char;
+    format!("{}{}", first, second)
+}
+
+fn next_available_tab_code(tabs: &[ClientTab], start: usize) -> String {
+    for offset in 0..(26 * 26) {
+        let code = tab_code(start + offset);
+        if !tabs.iter().any(|tab| tab.code == code) {
+            return code;
+        }
+    }
+    "ZZ".to_string()
+}
+
+fn normalize_tab_code(code: &str) -> Result<String, String> {
+    let code = code.trim().to_ascii_uppercase();
+    if code.len() != 2 || !code.bytes().all(|b| b.is_ascii_uppercase()) {
+        return Err("tab code must be two uppercase letters".to_string());
+    }
+    Ok(code)
+}
+
+fn rename_tab_mode_for_active(tabs: &TabManager) -> InputMode {
+    let code = tabs.active_code();
+    let title = tabs.active_title();
+    InputMode::RenameTab {
+        code_cursor: code.chars().count(),
+        title_cursor: title.chars().count(),
+        code,
+        title,
+        editing_code: true,
+        error: None,
+    }
+}
+
+fn matching_tab_indices(tabs: &[ClientTabView], query: &str) -> Vec<usize> {
+    let query = query.trim().to_lowercase();
+    tabs.iter()
+        .enumerate()
+        .filter_map(|(index, tab)| {
+            if query.is_empty()
+                || tab.code.to_lowercase().contains(&query)
+                || tab.title.to_lowercase().contains(&query)
+            {
+                Some(index)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn tab_target_index(tabs: &TabManager, target: &str) -> Option<usize> {
+    let target = target.trim();
+    if target.is_empty() {
+        return None;
+    }
+    if let Ok(index) = target.parse::<usize>() {
+        if index < tabs.tabs.len() {
+            return Some(index);
+        }
+    }
+    let target_lower = target.to_lowercase();
+    tabs.tabs.iter().position(|tab| {
+        tab.code.to_lowercase() == target_lower
+            || tab.title.to_lowercase() == target_lower
+    })
+}
+
+fn tab_summary(tabs: &TabManager) -> String {
+    tabs.tabs
+        .iter()
+        .enumerate()
+        .map(|(index, tab)| {
+            let active = if index == tabs.active { "*" } else { "-" };
+            let title = if tab.title.is_empty() {
+                "(untitled)".to_string()
+            } else {
+                tab.title.clone()
+            };
+            format!("{}{} {}", tab.code, active, title)
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+enum ClientTabCommandResult {
+    Handled(Option<String>),
+    NotHandled,
+}
 
 impl ClientApp {
     pub fn new(
@@ -82,30 +370,50 @@ impl ClientApp {
         clean: bool,
         start_dir: Option<String>,
     ) -> Self {
+        Self::new_with_initial_tab_title(
+            socket_name,
+            session_name,
+            clean,
+            start_dir,
+            None,
+        )
+    }
+
+    pub fn new_with_initial_tab_title(
+        socket_name: &str,
+        session_name: Option<String>,
+        clean: bool,
+        start_dir: Option<String>,
+        initial_tab_title: Option<String>,
+    ) -> Self {
         Self {
             socket_name: socket_name.to_string(),
             session_name,
             clean,
             start_dir,
+            initial_tab_title,
         }
     }
 
     pub fn run(&self) -> io::Result<()> {
         let (cols, rows) = terminal::size().unwrap_or((80, 24));
-        let size = Size::new(rows, cols);
+        let size = server_content_size(cols, rows);
         let session_name =
             self.session_name.clone().unwrap_or_else(|| "0".to_string());
 
         #[cfg(unix)]
         crate::pty::remember_host_termios();
 
-        let server = ensure_server_and_connect(
+        let mut tabs = TabManager::new(
             &self.socket_name,
             &session_name,
             size,
             self.clean,
-            self.start_dir.as_deref(),
+            self.start_dir.clone(),
         )?;
+        if let Some(title) = &self.initial_tab_title {
+            tabs.set_active_title(title.clone());
+        }
 
         terminal::enable_raw_mode()?;
         let mut stdout = io::stdout();
@@ -136,7 +444,7 @@ impl ClientApp {
 
         let run_result: io::Result<()> = (|| {
             loop {
-                let frame = server.latest_frame();
+                let frame = tabs.active_client().latest_frame();
                 if let Some(ref fd) = frame {
                     if fd.exit {
                         log_client("received exit frame, breaking main loop");
@@ -198,9 +506,11 @@ impl ClientApp {
                     mode,
                     InputMode::SessionChooser { .. }
                         | InputMode::OptionPanel { .. }
+                        | InputMode::TabChooser { .. }
+                        | InputMode::RenameTab { .. }
                 );
 
-                let current_counter = server.frame_counter();
+                let current_counter = tabs.active_client().frame_counter();
                 let frame_new = current_counter != last_drawn_counter;
                 if frame_new
                     || last_draw_time.elapsed() >= Duration::from_millis(16)
@@ -216,15 +526,18 @@ impl ClientApp {
                                     status.right = message.clone();
                                 }
                             }
-                            render_frame_ex(
+                            let tab_views = tabs.tab_views();
+                            render_tabbed_frame(
                                 f,
                                 &display_frame,
+                                &tab_views,
                                 in_prefix,
                                 has_prompt || has_overlay,
                                 hide_borders,
                             );
                         } else {
-                            render_loading(f);
+                            let tab_views = tabs.tab_views();
+                            render_tabbed_loading(f, &tab_views);
                         }
                         match &mode {
                             InputMode::CopySearch { buf, forward, .. } => {
@@ -240,6 +553,19 @@ impl ClientApp {
                             InputMode::RenameSession { buf, .. } => {
                                 render_prompt(f, "Rename session: ", buf)
                             }
+                            InputMode::RenameTab {
+                                code,
+                                title,
+                                editing_code,
+                                error,
+                                ..
+                            } => render_rename_tab_panel(
+                                f,
+                                code,
+                                title,
+                                *editing_code,
+                                error.as_deref(),
+                            ),
                             InputMode::Command { buf, .. } => {
                                 render_prompt(f, ":", buf)
                             }
@@ -263,6 +589,22 @@ impl ClientApp {
                                 *selected,
                                 *scroll_on_erase_in_display,
                             ),
+                            InputMode::TabChooser {
+                                query,
+                                selected,
+                                search_active,
+                                ..
+                            } => {
+                                let tab_views = tabs.tab_views();
+                                render_tab_chooser(
+                                    f,
+                                    &tab_views,
+                                    query,
+                                    *selected,
+                                    *search_active,
+                                );
+                            }
+
                             _ => {}
                         }
                         if let Some(ref sel) = mouse_select {
@@ -307,7 +649,8 @@ impl ClientApp {
                                     } else {
                                         let bytes = key_to_bytes(key);
                                         if !bytes.is_empty() {
-                                            server.send_input(&bytes);
+                                            tabs.active_client()
+                                                .send_input(&bytes);
                                         }
                                     }
                                 }
@@ -317,7 +660,8 @@ impl ClientApp {
                                     if (key.code, key.modifiers) == prefix_key {
                                         let bytes = key_to_bytes(key);
                                         if !bytes.is_empty() {
-                                            server.send_input(&bytes);
+                                            tabs.active_client()
+                                                .send_input(&bytes);
                                         }
                                         continue;
                                     }
@@ -332,7 +676,7 @@ impl ClientApp {
                                     if let Some(cmd) =
                                         resize_command_for_key(key)
                                     {
-                                        server.run_command(cmd);
+                                        tabs.active_client().run_command(cmd);
                                         mode = InputMode::Resize;
                                         resize_deadline = Some(
                                             Instant::now()
@@ -345,12 +689,73 @@ impl ClientApp {
                                             KeyCode::Char('d'),
                                             KeyModifiers::NONE,
                                         ) => {
-                                            server.detach();
+                                            tabs.detach_all();
                                             break;
                                         }
+                                        (
+                                            KeyCode::Char('t'),
+                                            KeyModifiers::NONE,
+                                        ) => {
+                                            mode = InputMode::TabChooser {
+                                                query: String::new(),
+                                                cursor: 0,
+                                                selected: tabs.active_index(),
+                                                search_active: false,
+                                            };
+                                        }
+                                        (KeyCode::Char('T'), _) => {
+                                            mode = rename_tab_mode_for_active(
+                                                &tabs,
+                                            );
+                                        }
+                                        (KeyCode::Tab, _) => {
+                                            if tabs.next_tab() {
+                                                let (cols, rows) =
+                                                    terminal::size()
+                                                        .unwrap_or((80, 24));
+                                                tabs.active_client().resize(
+                                                    server_content_size(
+                                                        cols, rows,
+                                                    ),
+                                                );
+                                                mode = InputMode::Normal;
+                                                copy_mode_confirmed = false;
+                                                mouse_select = None;
+                                                last_drawn_counter = 0;
+                                            }
+                                        }
+                                        (KeyCode::BackTab, _) => {
+                                            if tabs.prev_tab() {
+                                                let (cols, rows) =
+                                                    terminal::size()
+                                                        .unwrap_or((80, 24));
+                                                tabs.active_client().resize(
+                                                    server_content_size(
+                                                        cols, rows,
+                                                    ),
+                                                );
+                                                mode = InputMode::Normal;
+                                                copy_mode_confirmed = false;
+                                                mouse_select = None;
+                                                last_drawn_counter = 0;
+                                            }
+                                        }
+                                        (
+                                            KeyCode::Char('w'),
+                                            KeyModifiers::NONE,
+                                        ) => {
+                                            if tabs.close_active() {
+                                                break;
+                                            }
+                                            mode = InputMode::Normal;
+                                            copy_mode_confirmed = false;
+                                            mouse_select = None;
+                                            last_drawn_counter = 0;
+                                        }
                                         (KeyCode::Char(','), _) => {
-                                            let cur =
-                                                server.active_window_name();
+                                            let cur = tabs
+                                                .active_client()
+                                                .active_window_name();
                                             let len = cur.len();
                                             mode = InputMode::RenameWindow {
                                                 buf: cur,
@@ -358,7 +763,9 @@ impl ClientApp {
                                             };
                                         }
                                         (KeyCode::Char('$'), _) => {
-                                            let cur = server.session_name();
+                                            let cur = tabs
+                                                .active_client()
+                                                .session_name();
                                             let len = cur.len();
                                             mode = InputMode::RenameSession {
                                                 buf: cur,
@@ -374,12 +781,15 @@ impl ClientApp {
                                         (KeyCode::Char('O'), _) => {
                                             mode = InputMode::OptionPanel {
                                                 selected: 0,
-                                                scroll_on_erase_in_display: server
+                                                scroll_on_erase_in_display: tabs.active_client()
                                                     .scroll_on_erase_in_display(),
                                             };
                                         }
                                         (KeyCode::Char('['), _) => {
-                                            if server.enter_copy_mode() {
+                                            if tabs
+                                                .active_client()
+                                                .enter_copy_mode()
+                                            {
                                                 mode = InputMode::CopyMode;
                                                 copy_mode_confirmed = false;
                                             } else {
@@ -397,7 +807,9 @@ impl ClientApp {
                                             KeyCode::Char('s'),
                                             KeyModifiers::NONE,
                                         ) => {
-                                            let entries = server.session_tree();
+                                            let entries = tabs
+                                                .active_client()
+                                                .session_tree();
                                             // 默认折叠所有 session，只展开当前活动 session
                                             let mut collapsed: std::collections::HashSet<String> =
                                                 entries.iter().filter_map(|e| match e {
@@ -428,22 +840,27 @@ impl ClientApp {
                                             };
                                         }
                                         (KeyCode::Char('('), _) => {
-                                            server.run_command("prev-session");
+                                            tabs.active_client()
+                                                .run_command("prev-session");
                                         }
                                         (KeyCode::Char(')'), _) => {
-                                            server.run_command("next-session");
+                                            tabs.active_client()
+                                                .run_command("next-session");
                                         }
                                         (
                                             KeyCode::Char('b'),
                                             KeyModifiers::NONE,
                                         ) => {
                                             hide_borders = !hide_borders;
-                                            server
+                                            tabs.active_client()
                                                 .set_hide_borders(hide_borders);
                                         }
                                         _ => {
                                             if let Some(message) =
-                                                handle_prefix_key(&server, key)
+                                                handle_prefix_key(
+                                                    tabs.active_client(),
+                                                    key,
+                                                )
                                             {
                                                 status_notice = Some((
                                                     message,
@@ -468,7 +885,7 @@ impl ClientApp {
                                     if let Some(cmd) =
                                         resize_command_for_key(key)
                                     {
-                                        server.run_command(cmd);
+                                        tabs.active_client().run_command(cmd);
                                         resize_deadline = Some(
                                             Instant::now()
                                                 + RESIZE_IDLE_TIMEOUT,
@@ -497,18 +914,35 @@ impl ClientApp {
                                         let trimmed = buf.trim().to_string();
                                         mode = InputMode::Normal;
                                         if !trimmed.is_empty() {
-                                            if let Some(message) =
-                                                run_command_notice(
-                                                    &server, &trimmed,
-                                                )
-                                            {
-                                                status_notice = Some((
-                                                    message,
-                                                    Instant::now()
-                                                        + Duration::from_secs(
-                                                            3,
-                                                        ),
-                                                ));
+                                            let (cols, rows) = terminal::size()
+                                                .unwrap_or((80, 24));
+                                            match run_client_tab_command(
+                                                &mut tabs,
+                                                &trimmed,
+                                                server_content_size(cols, rows),
+                                            ) {
+                                                ClientTabCommandResult::Handled(message) => {
+                                                    copy_mode_confirmed = false;
+                                                    mouse_select = None;
+                                                    last_drawn_counter = 0;
+                                                    if let Some(message) = message {
+                                                        status_notice = Some((
+                                                            message,
+                                                            Instant::now() + Duration::from_secs(3),
+                                                        ));
+                                                    }
+                                                }
+                                                ClientTabCommandResult::NotHandled => {
+                                                    if let Some(message) = run_command_notice(
+                                                        tabs.active_client(),
+                                                        &trimmed,
+                                                    ) {
+                                                        status_notice = Some((
+                                                            message,
+                                                            Instant::now() + Duration::from_secs(3),
+                                                        ));
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -567,7 +1001,8 @@ impl ClientApp {
                                             KeyCode::Char('q'),
                                             KeyModifiers::NONE,
                                         ) => {
-                                            server.exit_copy_mode();
+                                            tabs.active_client()
+                                                .exit_copy_mode();
                                             mode = InputMode::Normal;
                                             copy_mode_confirmed = false;
                                         }
@@ -587,43 +1022,49 @@ impl ClientApp {
                                         }
                                         (KeyCode::Char('h'), _)
                                         | (KeyCode::Left, _) => {
-                                            server.copy_move_left();
+                                            tabs.active_client()
+                                                .copy_move_left();
                                             mode = InputMode::CopyMode;
                                         }
                                         (KeyCode::Char('l'), _)
                                         | (KeyCode::Right, _) => {
-                                            server.copy_move_right();
+                                            tabs.active_client()
+                                                .copy_move_right();
                                             mode = InputMode::CopyMode;
                                         }
                                         (KeyCode::Char('k'), _)
                                         | (KeyCode::Up, _) => {
-                                            server.copy_move_up();
+                                            tabs.active_client().copy_move_up();
                                             mode = InputMode::CopyMode;
                                         }
                                         (KeyCode::Char('j'), _)
                                         | (KeyCode::Down, _) => {
-                                            server.copy_move_down();
+                                            tabs.active_client()
+                                                .copy_move_down();
                                             mode = InputMode::CopyMode;
                                         }
                                         (
                                             KeyCode::Char('b'),
                                             KeyModifiers::NONE,
                                         ) => {
-                                            server.copy_move_word_backward();
+                                            tabs.active_client()
+                                                .copy_move_word_backward();
                                             mode = InputMode::CopyMode;
                                         }
                                         (
                                             KeyCode::Char('w'),
                                             KeyModifiers::NONE,
                                         ) => {
-                                            server.copy_move_word_forward();
+                                            tabs.active_client()
+                                                .copy_move_word_forward();
                                             mode = InputMode::CopyMode;
                                         }
                                         (
                                             KeyCode::Char('e'),
                                             KeyModifiers::NONE,
                                         ) => {
-                                            server.copy_move_word_end();
+                                            tabs.active_client()
+                                                .copy_move_word_end();
                                             mode = InputMode::CopyMode;
                                         }
                                         (KeyCode::PageUp, _)
@@ -631,7 +1072,7 @@ impl ClientApp {
                                             KeyCode::Char('b'),
                                             KeyModifiers::CONTROL,
                                         ) => {
-                                            server.copy_page_up();
+                                            tabs.active_client().copy_page_up();
                                             mode = InputMode::CopyMode;
                                         }
                                         (KeyCode::PageDown, _)
@@ -639,26 +1080,31 @@ impl ClientApp {
                                             KeyCode::Char('f'),
                                             KeyModifiers::CONTROL,
                                         ) => {
-                                            server.copy_page_down();
+                                            tabs.active_client()
+                                                .copy_page_down();
                                             mode = InputMode::CopyMode;
                                         }
                                         (
                                             KeyCode::Char('g'),
                                             KeyModifiers::NONE,
                                         ) => {
-                                            server.copy_move_to_top();
+                                            tabs.active_client()
+                                                .copy_move_to_top();
                                             mode = InputMode::CopyMode;
                                         }
                                         (KeyCode::Char('G'), _) => {
-                                            server.copy_move_to_bottom();
+                                            tabs.active_client()
+                                                .copy_move_to_bottom();
                                             mode = InputMode::CopyMode;
                                         }
                                         _ if is_copy_line_start_key(key) => {
-                                            server.copy_move_to_line_start();
+                                            tabs.active_client()
+                                                .copy_move_to_line_start();
                                             mode = InputMode::CopyMode;
                                         }
                                         _ if is_copy_line_end_key(key) => {
-                                            server.copy_move_to_line_end();
+                                            tabs.active_client()
+                                                .copy_move_to_line_end();
                                             mode = InputMode::CopyMode;
                                         }
                                         (
@@ -669,35 +1115,40 @@ impl ClientApp {
                                             KeyCode::Char(' '),
                                             KeyModifiers::NONE,
                                         ) => {
-                                            server.copy_start_selection(
-                                                SelectionMode::Char,
-                                            );
+                                            tabs.active_client()
+                                                .copy_start_selection(
+                                                    SelectionMode::Char,
+                                                );
                                             mode = InputMode::CopyMode;
                                         }
                                         (KeyCode::Char('V'), _) => {
-                                            server.copy_start_selection(
-                                                SelectionMode::Line,
-                                            );
+                                            tabs.active_client()
+                                                .copy_start_selection(
+                                                    SelectionMode::Line,
+                                                );
                                             mode = InputMode::CopyMode;
                                         }
                                         (
                                             KeyCode::Char('v'),
                                             KeyModifiers::CONTROL,
                                         ) => {
-                                            server.copy_start_selection(
-                                                SelectionMode::Rect,
-                                            );
+                                            tabs.active_client()
+                                                .copy_start_selection(
+                                                    SelectionMode::Rect,
+                                                );
                                             mode = InputMode::CopyMode;
                                         }
                                         (
                                             KeyCode::Char('n'),
                                             KeyModifiers::NONE,
                                         ) => {
-                                            server.copy_search_next();
+                                            tabs.active_client()
+                                                .copy_search_next();
                                             mode = InputMode::CopyMode;
                                         }
                                         (KeyCode::Char('N'), _) => {
-                                            server.copy_search_prev();
+                                            tabs.active_client()
+                                                .copy_search_prev();
                                             mode = InputMode::CopyMode;
                                         }
                                         (
@@ -705,8 +1156,9 @@ impl ClientApp {
                                             KeyModifiers::NONE,
                                         )
                                         | (KeyCode::Enter, _) => {
-                                            let text =
-                                                server.copy_yank_selection();
+                                            let text = tabs
+                                                .active_client()
+                                                .copy_yank_selection();
                                             if text.is_empty() {
                                                 status_notice = Some((
                                                     "no selection".to_string(),
@@ -717,7 +1169,8 @@ impl ClientApp {
                                                 ));
                                                 mode = InputMode::CopyMode;
                                             } else {
-                                                server.exit_copy_mode();
+                                                tabs.active_client()
+                                                    .exit_copy_mode();
                                                 mode = InputMode::Normal;
                                                 copy_mode_confirmed = false;
                                                 let copy_result =
@@ -761,10 +1214,12 @@ impl ClientApp {
                                     match key.code {
                                         KeyCode::Enter => {
                                             if !buf.is_empty() {
-                                                let found = server.copy_search(
-                                                    buf.clone(),
-                                                    forward,
-                                                );
+                                                let found = tabs
+                                                    .active_client()
+                                                    .copy_search(
+                                                        buf.clone(),
+                                                        forward,
+                                                    );
                                                 if !found {
                                                     status_notice = Some((
                                                     format!("not found: {}", buf),
@@ -852,9 +1307,10 @@ impl ClientApp {
                                     KeyCode::Enter | KeyCode::Char(' ') => {
                                         let enabled =
                                             !scroll_on_erase_in_display;
-                                        server.set_scroll_on_erase_in_display(
-                                            enabled,
-                                        );
+                                        tabs.active_client()
+                                            .set_scroll_on_erase_in_display(
+                                                enabled,
+                                            );
                                         mode = InputMode::OptionPanel {
                                             selected,
                                             scroll_on_erase_in_display: enabled,
@@ -1006,7 +1462,8 @@ impl ClientApp {
                                                     SessionTreeEntry::Pane { session_name, window_index, pane_id, .. } =>
                                                         format!("switch-client -t {}; select-window -t {}; select-pane -t %{}", session_name, window_index, pane_id),
                                                 };
-                                                server.run_command(&cmd);
+                                                tabs.active_client()
+                                                    .run_command(&cmd);
                                             }
                                             mode = InputMode::Normal;
                                         }
@@ -1021,16 +1478,229 @@ impl ClientApp {
                                     }
                                 }
 
+                                InputMode::TabChooser {
+                                    mut query,
+                                    mut cursor,
+                                    mut selected,
+                                    mut search_active,
+                                } => match (key.code, key.modifiers) {
+                                    (KeyCode::Esc, _)
+                                    | (
+                                        KeyCode::Char('q'),
+                                        KeyModifiers::NONE,
+                                    ) => {
+                                        mode = InputMode::Normal;
+                                    }
+                                    (KeyCode::Char('/'), _)
+                                    | (KeyCode::Char('?'), _) => {
+                                        query.clear();
+                                        cursor = 0;
+                                        selected = 0;
+                                        search_active = true;
+                                        mode = InputMode::TabChooser {
+                                            query,
+                                            cursor,
+                                            selected,
+                                            search_active,
+                                        };
+                                    }
+                                    (KeyCode::Enter, _) => {
+                                        let tab_views = tabs.tab_views();
+                                        let matches = matching_tab_indices(
+                                            &tab_views, &query,
+                                        );
+                                        if let Some(&tab_index) =
+                                            matches.get(selected)
+                                        {
+                                            if tabs.select(tab_index) {
+                                                let (cols, rows) =
+                                                    terminal::size()
+                                                        .unwrap_or((80, 24));
+                                                tabs.active_client().resize(
+                                                    server_content_size(
+                                                        cols, rows,
+                                                    ),
+                                                );
+                                                mode = InputMode::Normal;
+                                                copy_mode_confirmed = false;
+                                                mouse_select = None;
+                                                last_drawn_counter = 0;
+                                            } else {
+                                                mode = InputMode::Normal;
+                                            }
+                                        } else {
+                                            mode = InputMode::TabChooser {
+                                                query,
+                                                cursor,
+                                                selected,
+                                                search_active,
+                                            };
+                                        }
+                                    }
+                                    (KeyCode::Char('R'), _) => {
+                                        let tab_views = tabs.tab_views();
+                                        let matches = matching_tab_indices(
+                                            &tab_views, &query,
+                                        );
+                                        if let Some(&tab_index) =
+                                            matches.get(selected)
+                                        {
+                                            if tabs.select(tab_index) {
+                                                mode =
+                                                    rename_tab_mode_for_active(
+                                                        &tabs,
+                                                    );
+                                            } else {
+                                                mode = InputMode::Normal;
+                                            }
+                                        } else {
+                                            mode = InputMode::TabChooser {
+                                                query,
+                                                cursor,
+                                                selected,
+                                                search_active,
+                                            };
+                                        }
+                                    }
+                                    (KeyCode::Up, _) => {
+                                        selected = selected.saturating_sub(1);
+                                        mode = InputMode::TabChooser {
+                                            query,
+                                            cursor,
+                                            selected,
+                                            search_active,
+                                        };
+                                    }
+                                    (KeyCode::Char('k'), m)
+                                        if m.contains(
+                                            KeyModifiers::CONTROL,
+                                        ) =>
+                                    {
+                                        selected = selected.saturating_sub(1);
+                                        mode = InputMode::TabChooser {
+                                            query,
+                                            cursor,
+                                            selected,
+                                            search_active,
+                                        };
+                                    }
+                                    (KeyCode::Down, _) => {
+                                        let tab_views = tabs.tab_views();
+                                        let len = matching_tab_indices(
+                                            &tab_views, &query,
+                                        )
+                                        .len();
+                                        if selected + 1 < len {
+                                            selected += 1;
+                                        }
+                                        mode = InputMode::TabChooser {
+                                            query,
+                                            cursor,
+                                            selected,
+                                            search_active,
+                                        };
+                                    }
+                                    (KeyCode::Char('j'), m)
+                                        if m.contains(
+                                            KeyModifiers::CONTROL,
+                                        ) =>
+                                    {
+                                        let tab_views = tabs.tab_views();
+                                        let len = matching_tab_indices(
+                                            &tab_views, &query,
+                                        )
+                                        .len();
+                                        if selected + 1 < len {
+                                            selected += 1;
+                                        }
+                                        mode = InputMode::TabChooser {
+                                            query,
+                                            cursor,
+                                            selected,
+                                            search_active,
+                                        };
+                                    }
+                                    (KeyCode::Backspace, _)
+                                        if search_active =>
+                                    {
+                                        if cursor > 0 {
+                                            let bp = char_byte_pos(
+                                                &query,
+                                                cursor - 1,
+                                            );
+                                            let ep =
+                                                char_byte_pos(&query, cursor);
+                                            query.drain(bp..ep);
+                                            cursor -= 1;
+                                            selected = 0;
+                                        }
+                                        mode = InputMode::TabChooser {
+                                            query,
+                                            cursor,
+                                            selected,
+                                            search_active,
+                                        };
+                                    }
+                                    (KeyCode::Left, _) if search_active => {
+                                        if cursor > 0 {
+                                            cursor -= 1;
+                                        }
+                                        mode = InputMode::TabChooser {
+                                            query,
+                                            cursor,
+                                            selected,
+                                            search_active,
+                                        };
+                                    }
+                                    (KeyCode::Right, _) if search_active => {
+                                        let m = query.chars().count();
+                                        if cursor < m {
+                                            cursor += 1;
+                                        }
+                                        mode = InputMode::TabChooser {
+                                            query,
+                                            cursor,
+                                            selected,
+                                            search_active,
+                                        };
+                                    }
+                                    (
+                                        KeyCode::Char(c),
+                                        KeyModifiers::NONE
+                                        | KeyModifiers::SHIFT,
+                                    ) if search_active => {
+                                        let bp = char_byte_pos(&query, cursor);
+                                        query.insert(bp, c);
+                                        cursor += 1;
+                                        mode = InputMode::TabChooser {
+                                            query,
+                                            cursor,
+                                            selected: 0,
+                                            search_active,
+                                        };
+                                    }
+                                    _ => {
+                                        mode = InputMode::TabChooser {
+                                            query,
+                                            cursor,
+                                            selected,
+                                            search_active,
+                                        };
+                                    }
+                                },
+
                                 InputMode::RenameWindow {
                                     mut buf,
                                     mut cursor,
                                 } => match key.code {
                                     KeyCode::Enter => {
                                         if !buf.is_empty() {
-                                            server.run_command(&format!(
-                                                "rename-window {}",
-                                                shell_quote(&buf)
-                                            ));
+                                            tabs.active_client().run_command(
+                                                &format!(
+                                                    "rename-window {}",
+                                                    shell_quote(&buf)
+                                                ),
+                                            );
                                         }
                                         mode = InputMode::Normal;
                                     }
@@ -1098,10 +1768,12 @@ impl ClientApp {
                                 } => match key.code {
                                     KeyCode::Enter => {
                                         if !buf.is_empty() {
-                                            server.run_command(&format!(
-                                                "rename-session {}",
-                                                shell_quote(&buf)
-                                            ));
+                                            tabs.active_client().run_command(
+                                                &format!(
+                                                    "rename-session {}",
+                                                    shell_quote(&buf)
+                                                ),
+                                            );
                                         }
                                         mode = InputMode::Normal;
                                     }
@@ -1162,9 +1834,221 @@ impl ClientApp {
                                         };
                                     }
                                 },
+
+                                InputMode::RenameTab {
+                                    mut code,
+                                    mut code_cursor,
+                                    mut title,
+                                    mut title_cursor,
+                                    mut editing_code,
+                                    ..
+                                } => match key.code {
+                                    KeyCode::Enter => {
+                                        if editing_code {
+                                            editing_code = false;
+                                            mode = InputMode::RenameTab {
+                                                code,
+                                                code_cursor,
+                                                title,
+                                                title_cursor,
+                                                editing_code,
+                                                error: None,
+                                            };
+                                        } else {
+                                            match tabs.set_active_metadata(
+                                                &code,
+                                                title.trim().to_string(),
+                                            ) {
+                                                Ok(()) => {
+                                                    mode = InputMode::Normal;
+                                                    last_drawn_counter = 0;
+                                                }
+                                                Err(error) => {
+                                                    mode =
+                                                        InputMode::RenameTab {
+                                                            code,
+                                                            code_cursor,
+                                                            title,
+                                                            title_cursor,
+                                                            editing_code: true,
+                                                            error: Some(error),
+                                                        };
+                                                }
+                                            }
+                                        }
+                                    }
+                                    KeyCode::Esc => {
+                                        mode = InputMode::Normal;
+                                    }
+                                    KeyCode::Tab | KeyCode::BackTab => {
+                                        editing_code = !editing_code;
+                                        mode = InputMode::RenameTab {
+                                            code,
+                                            code_cursor,
+                                            title,
+                                            title_cursor,
+                                            editing_code,
+                                            error: None,
+                                        };
+                                    }
+                                    KeyCode::Backspace => {
+                                        if editing_code {
+                                            if code_cursor > 0 {
+                                                let bp = char_byte_pos(
+                                                    &code,
+                                                    code_cursor - 1,
+                                                );
+                                                let ep = char_byte_pos(
+                                                    &code,
+                                                    code_cursor,
+                                                );
+                                                code.drain(bp..ep);
+                                                code_cursor -= 1;
+                                            }
+                                        } else if title_cursor > 0 {
+                                            let bp = char_byte_pos(
+                                                &title,
+                                                title_cursor - 1,
+                                            );
+                                            let ep = char_byte_pos(
+                                                &title,
+                                                title_cursor,
+                                            );
+                                            title.drain(bp..ep);
+                                            title_cursor -= 1;
+                                        }
+                                        mode = InputMode::RenameTab {
+                                            code,
+                                            code_cursor,
+                                            title,
+                                            title_cursor,
+                                            editing_code,
+                                            error: None,
+                                        };
+                                    }
+                                    KeyCode::Left => {
+                                        if editing_code {
+                                            code_cursor =
+                                                code_cursor.saturating_sub(1);
+                                        } else {
+                                            title_cursor =
+                                                title_cursor.saturating_sub(1);
+                                        }
+                                        mode = InputMode::RenameTab {
+                                            code,
+                                            code_cursor,
+                                            title,
+                                            title_cursor,
+                                            editing_code,
+                                            error: None,
+                                        };
+                                    }
+                                    KeyCode::Right => {
+                                        if editing_code {
+                                            let m = code.chars().count();
+                                            if code_cursor < m {
+                                                code_cursor += 1;
+                                            }
+                                        } else {
+                                            let m = title.chars().count();
+                                            if title_cursor < m {
+                                                title_cursor += 1;
+                                            }
+                                        }
+                                        mode = InputMode::RenameTab {
+                                            code,
+                                            code_cursor,
+                                            title,
+                                            title_cursor,
+                                            editing_code,
+                                            error: None,
+                                        };
+                                    }
+                                    KeyCode::Char(c)
+                                        if key.modifiers
+                                            == KeyModifiers::NONE
+                                            || key.modifiers
+                                                == KeyModifiers::SHIFT =>
+                                    {
+                                        if editing_code {
+                                            let c = c.to_ascii_uppercase();
+                                            let bp = char_byte_pos(
+                                                &code,
+                                                code_cursor,
+                                            );
+                                            code.insert(bp, c);
+                                            code_cursor += 1;
+                                        } else {
+                                            let bp = char_byte_pos(
+                                                &title,
+                                                title_cursor,
+                                            );
+                                            title.insert(bp, c);
+                                            title_cursor += 1;
+                                        }
+                                        mode = InputMode::RenameTab {
+                                            code,
+                                            code_cursor,
+                                            title,
+                                            title_cursor,
+                                            editing_code,
+                                            error: None,
+                                        };
+                                    }
+                                    _ => {
+                                        mode = InputMode::RenameTab {
+                                            code,
+                                            code_cursor,
+                                            title,
+                                            title_cursor,
+                                            editing_code,
+                                            error: None,
+                                        };
+                                    }
+                                },
                             }
                         }
                         Event::Mouse(mouse) => {
+                            if mouse.row == 0 {
+                                mouse_select = None;
+                                if matches!(
+                                    mouse.kind,
+                                    MouseEventKind::Down(MouseButton::Left)
+                                ) {
+                                    let (cols, rows) =
+                                        terminal::size().unwrap_or((80, 24));
+                                    let tab_views = tabs.tab_views();
+                                    match tab_bar_hit(
+                                        &tab_views,
+                                        cols,
+                                        mouse.column,
+                                    ) {
+                                        Some(ClientTabBarHit::Tab(index)) => {
+                                            if tabs.select(index) {
+                                                tabs.active_client().resize(
+                                                    server_content_size(
+                                                        cols, rows,
+                                                    ),
+                                                );
+                                                mode = InputMode::Normal;
+                                                copy_mode_confirmed = false;
+                                                last_drawn_counter = 0;
+                                            }
+                                        }
+                                        Some(ClientTabBarHit::Overflow) => {
+                                            mode = InputMode::TabChooser {
+                                                query: String::new(),
+                                                cursor: 0,
+                                                selected: tabs.active_index(),
+                                                search_active: false,
+                                            };
+                                            last_drawn_counter = 0;
+                                        }
+                                        None => {}
+                                    }
+                                }
+                                continue;
+                            }
                             match mode {
                                 InputMode::Normal
                                 | InputMode::Prefix
@@ -1204,13 +2088,7 @@ impl ClientApp {
                                                         80, 24,
                                                     ));
                                                 let layout_area =
-                                                    ratatui::layout::Rect {
-                                                        x: 0,
-                                                        y: 0,
-                                                        width: cols,
-                                                        height: rows
-                                                            .saturating_sub(1),
-                                                    };
+                                                    server_layout_area(cols, rows);
                                                 let clicked = find_pane_id_at(
                                                     &fd.layout,
                                                     layout_area,
@@ -1225,7 +2103,7 @@ impl ClientApp {
                                                     if Some(clicked_id)
                                                         != active
                                                     {
-                                                        server.run_command(
+                                                        tabs.active_client().run_command(
                                                             &format!(
                                                                 "select-pane -t %{}",
                                                                 clicked_id
@@ -1240,18 +2118,26 @@ impl ClientApp {
                                             false
                                         };
                                         if !focused_other_pane {
-                                            let bytes = mouse_to_bytes(mouse);
-                                            if !bytes.is_empty() {
-                                                server.send_input(&bytes);
+                                            if let Some(server_mouse) =
+                                                mouse_for_server(mouse)
+                                            {
+                                                let bytes = mouse_to_bytes(
+                                                    server_mouse,
+                                                );
+                                                if !bytes.is_empty() {
+                                                    tabs.active_client()
+                                                        .send_input(&bytes);
+                                                }
                                             }
                                         }
                                     } else {
                                         match mouse.kind {
                                             MouseEventKind::ScrollUp => {
-                                                server.scroll_up(SCROLL_LINES);
+                                                tabs.active_client()
+                                                    .scroll_up(SCROLL_LINES);
                                             }
                                             MouseEventKind::ScrollDown => {
-                                                server
+                                                tabs.active_client()
                                                     .scroll_down(SCROLL_LINES);
                                             }
                                             MouseEventKind::Down(
@@ -1263,24 +2149,13 @@ impl ClientApp {
                                                             .unwrap_or((
                                                                 80, 24,
                                                             ));
-                                                    let fa =
-                                                        ratatui::layout::Rect {
-                                                            x: 0,
-                                                            y: 0,
-                                                            width: cols,
-                                                            height: rows,
-                                                        };
-                                                    let content_height = fa
-                                                        .height
-                                                        .saturating_sub(1);
+                                                    let fa = server_frame_area(
+                                                        cols, rows,
+                                                    );
                                                     let layout_area =
-                                                        ratatui::layout::Rect {
-                                                            x: 0,
-                                                            y: 0,
-                                                            width: fa.width,
-                                                            height:
-                                                                content_height,
-                                                        };
+                                                        server_layout_area(
+                                                            cols, rows,
+                                                        );
                                                     let pa = active_pane_content_rect(fd, fa, hide_borders);
                                                     if mouse.column >= pa.x
                                                         && mouse.column
@@ -1313,7 +2188,7 @@ impl ClientApp {
                                                         )
                                                     {
                                                         // Clicked on a non-active pane — focus it.
-                                                        server.run_command(&format!(
+                                                        tabs.active_client().run_command(&format!(
                                                             "select-pane -t %{}",
                                                             pane_id
                                                         ));
@@ -1333,7 +2208,10 @@ impl ClientApp {
                                                                 .unwrap_or((
                                                                     80, 24,
                                                                 ));
-                                                        let fa = ratatui::layout::Rect { x: 0, y: 0, width: cols, height: rows };
+                                                        let fa =
+                                                            server_frame_area(
+                                                                cols, rows,
+                                                            );
                                                         let pa = active_pane_content_rect(fd, fa, hide_borders);
                                                         sel.end_col = mouse.column
                                                             .max(pa.x)
@@ -1370,7 +2248,13 @@ impl ClientApp {
                                                                 ));
                                                             }
                                                         } else {
-                                                            let text = extract_text_from_frame(fd, &sel, hide_borders);
+                                                            let (cols, rows) =
+                                                                terminal::size(
+                                                                )
+                                                                .unwrap_or((
+                                                                    80, 24,
+                                                                ));
+                                                            let text = extract_text_from_frame_in_area(fd, &sel, server_layout_area(cols, rows), hide_borders);
                                                             if !text.is_empty()
                                                             {
                                                                 let result = copy_to_clipboard(&text);
@@ -1402,21 +2286,19 @@ impl ClientApp {
                                 }
                                 InputMode::CopyMode => match mouse.kind {
                                     MouseEventKind::ScrollUp => {
-                                        server.scroll_up(SCROLL_LINES);
+                                        tabs.active_client()
+                                            .scroll_up(SCROLL_LINES);
                                     }
                                     MouseEventKind::ScrollDown => {
-                                        server.scroll_down(SCROLL_LINES);
+                                        tabs.active_client()
+                                            .scroll_down(SCROLL_LINES);
                                     }
                                     MouseEventKind::Down(MouseButton::Left) => {
                                         if let Some(ref fd) = frame {
                                             let (cols, rows) = terminal::size()
                                                 .unwrap_or((80, 24));
-                                            let fa = ratatui::layout::Rect {
-                                                x: 0,
-                                                y: 0,
-                                                width: cols,
-                                                height: rows,
-                                            };
+                                            let fa =
+                                                server_frame_area(cols, rows);
                                             let pa = active_pane_content_rect(
                                                 fd,
                                                 fa,
@@ -1445,13 +2327,9 @@ impl ClientApp {
                                                 let (cols, rows) =
                                                     terminal::size()
                                                         .unwrap_or((80, 24));
-                                                let fa =
-                                                    ratatui::layout::Rect {
-                                                        x: 0,
-                                                        y: 0,
-                                                        width: cols,
-                                                        height: rows,
-                                                    };
+                                                let fa = server_frame_area(
+                                                    cols, rows,
+                                                );
                                                 let pa =
                                                     active_pane_content_rect(
                                                         fd,
@@ -1484,10 +2362,16 @@ impl ClientApp {
                                                     && sel.start_col
                                                         == sel.end_col;
                                                 if !is_click {
+                                                    let (cols, rows) =
+                                                        terminal::size()
+                                                            .unwrap_or((
+                                                                80, 24,
+                                                            ));
                                                     let text =
-                                                        extract_text_from_frame(
+                                                        extract_text_from_frame_in_area(
                                                             fd,
                                                             &sel,
+                                                            server_layout_area(cols, rows),
                                                             hide_borders,
                                                         );
                                                     if !text.is_empty() {
@@ -1524,10 +2408,16 @@ impl ClientApp {
                             }
                         }
                         Event::Paste(text) => {
-                            handle_paste_event(&server, &mut mode, text);
+                            handle_paste_event(
+                                tabs.active_client(),
+                                &mut mode,
+                                text,
+                            );
                         }
                         Event::Resize(new_cols, new_rows) => {
-                            server.resize(Size::new(new_rows, new_cols));
+                            tabs.resize_all(server_content_size(
+                                new_cols, new_rows,
+                            ));
                         }
                         _ => {}
                     }
@@ -1548,6 +2438,48 @@ impl ClientApp {
         );
         run_result
     }
+}
+
+fn server_content_size(cols: u16, rows: u16) -> Size {
+    Size::new(rows.saturating_sub(1).max(1), cols.max(1))
+}
+
+fn server_frame_area(cols: u16, rows: u16) -> ratatui::layout::Rect {
+    ratatui::layout::Rect {
+        x: 0,
+        y: 1,
+        width: cols,
+        height: rows.saturating_sub(1),
+    }
+}
+
+fn server_frame_area_from(
+    area: ratatui::layout::Rect,
+) -> ratatui::layout::Rect {
+    ratatui::layout::Rect {
+        x: area.x,
+        y: area.y + 1,
+        width: area.width,
+        height: area.height.saturating_sub(1),
+    }
+}
+
+fn server_layout_area(cols: u16, rows: u16) -> ratatui::layout::Rect {
+    let frame = server_frame_area(cols, rows);
+    ratatui::layout::Rect {
+        x: frame.x,
+        y: frame.y,
+        width: frame.width,
+        height: frame.height.saturating_sub(1),
+    }
+}
+
+fn mouse_for_server(mut mouse: MouseEvent) -> Option<MouseEvent> {
+    if mouse.row == 0 {
+        return None;
+    }
+    mouse.row -= 1;
+    Some(mouse)
 }
 
 struct MouseSelection {
@@ -1581,7 +2513,11 @@ fn render_mouse_selection(
     }
 
     let frame_area = f.area();
-    let pa = active_pane_content_rect(fd, frame_area, hide_borders);
+    let pa = active_pane_content_rect(
+        fd,
+        server_frame_area_from(frame_area),
+        hide_borders,
+    );
 
     let clamp_row =
         |r: u16| r.max(pa.y).min(pa.y + pa.height.saturating_sub(1));
@@ -1615,9 +2551,26 @@ fn render_mouse_selection(
     }
 }
 
+#[cfg(test)]
 fn extract_text_from_frame(
     fd: &FrameData,
     sel: &MouseSelection,
+    hide_borders: bool,
+) -> String {
+    let (cols, rows) = terminal::size().unwrap_or((80, 24));
+    let layout_area = ratatui::layout::Rect {
+        x: 0,
+        y: 0,
+        width: cols,
+        height: rows.saturating_sub(1),
+    };
+    extract_text_from_frame_in_area(fd, sel, layout_area, hide_borders)
+}
+
+fn extract_text_from_frame_in_area(
+    fd: &FrameData,
+    sel: &MouseSelection,
+    layout_area: ratatui::layout::Rect,
     hide_borders: bool,
 ) -> String {
     let (start_row, start_col, end_row, end_col) =
@@ -1629,19 +2582,6 @@ fn extract_text_from_frame(
     if start_row == end_row && start_col == end_col {
         return String::new();
     }
-    let term_area = ratatui::layout::Rect {
-        x: 0,
-        y: 0,
-        width: terminal::size().map(|(c, _)| c).unwrap_or(80),
-        height: terminal::size().map(|(_, r)| r).unwrap_or(24),
-    };
-    let content_height = term_area.height.saturating_sub(1);
-    let layout_area = ratatui::layout::Rect {
-        x: 0,
-        y: 0,
-        width: term_area.width,
-        height: content_height,
-    };
     let (rows, content_area) =
         find_active_pane_content(&fd.layout, layout_area, hide_borders);
     if rows.is_empty() {
@@ -1735,8 +2675,8 @@ fn active_pane_content_rect(
 ) -> ratatui::layout::Rect {
     let content_height = frame_area.height.saturating_sub(1);
     let layout_area = ratatui::layout::Rect {
-        x: 0,
-        y: 0,
+        x: frame_area.x,
+        y: frame_area.y,
         width: frame_area.width,
         height: content_height,
     };
@@ -1941,6 +2881,100 @@ fn handle_prefix_key(server: &SocketClient, key: KeyEvent) -> Option<String> {
     run_command_notice(server, cmd)
 }
 
+fn run_client_tab_command(
+    tabs: &mut TabManager,
+    raw: &str,
+    size: Size,
+) -> ClientTabCommandResult {
+    let mut parsed = ParsedCommand::parse(raw);
+    if parsed.len() != 1 {
+        return ClientTabCommandResult::NotHandled;
+    }
+    let cmd = parsed.remove(0);
+    match cmd.name.as_str() {
+        "new-tab" | "newt" => {
+            let title = cmd.flag_value("t").unwrap_or_default().to_string();
+            match tabs.create_tab(size) {
+                Ok(()) => {
+                    tabs.set_active_title(title);
+                    ClientTabCommandResult::Handled(Some("new tab".to_string()))
+                }
+                Err(e) => ClientTabCommandResult::Handled(Some(format!(
+                    "new tab failed: {}",
+                    e
+                ))),
+            }
+        }
+        "new" if cmd.flags.contains_key("t") => {
+            let title = cmd.flag_value("t").unwrap_or_default().to_string();
+            match tabs.create_tab(size) {
+                Ok(()) => {
+                    tabs.set_active_title(title);
+                    ClientTabCommandResult::Handled(Some("new tab".to_string()))
+                }
+                Err(e) => ClientTabCommandResult::Handled(Some(format!(
+                    "new tab failed: {}",
+                    e
+                ))),
+            }
+        }
+        "select-tab" | "selectt" => {
+            let target = cmd
+                .flag_value("t")
+                .or_else(|| cmd.args.first().map(String::as_str));
+            let Some(target) = target else {
+                return ClientTabCommandResult::Handled(Some(
+                    "usage: select-tab -t <code|index|title>".to_string(),
+                ));
+            };
+            if let Some(index) = tab_target_index(tabs, target) {
+                tabs.select(index);
+                tabs.active_client().resize(size);
+                ClientTabCommandResult::Handled(None)
+            } else {
+                ClientTabCommandResult::Handled(Some(format!(
+                    "tab not found: {}",
+                    target
+                )))
+            }
+        }
+        "rename-tab" | "renamet" => {
+            let code = cmd
+                .flag_value("c")
+                .unwrap_or(&tabs.active_code())
+                .to_string();
+            let title = if cmd.flags.contains_key("t") {
+                cmd.flag_value("t").unwrap_or_default().to_string()
+            } else {
+                cmd.args
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| tabs.active_title())
+            };
+            match tabs.set_active_metadata(&code, title) {
+                Ok(()) => ClientTabCommandResult::Handled(Some(
+                    "renamed tab".to_string(),
+                )),
+                Err(e) => ClientTabCommandResult::Handled(Some(e)),
+            }
+        }
+        "next-tab" | "nextt" => {
+            tabs.next_tab();
+            tabs.active_client().resize(size);
+            ClientTabCommandResult::Handled(None)
+        }
+        "prev-tab" | "prevt" => {
+            tabs.prev_tab();
+            tabs.active_client().resize(size);
+            ClientTabCommandResult::Handled(None)
+        }
+        "list-tabs" | "lst" => {
+            ClientTabCommandResult::Handled(Some(tab_summary(tabs)))
+        }
+        _ => ClientTabCommandResult::NotHandled,
+    }
+}
+
 fn run_command_notice(server: &SocketClient, cmd: &str) -> Option<String> {
     if cmd.trim() == "set-pane-start-dir" {
         let output = server.run_command_with_output(cmd);
@@ -2116,12 +3150,48 @@ fn handle_paste_event(
             insert_text_at_cursor(&mut buf, &mut cursor, &text);
             *mode = InputMode::RenameSession { buf, cursor };
         }
+        InputMode::RenameTab {
+            mut code,
+            mut code_cursor,
+            mut title,
+            mut title_cursor,
+            editing_code,
+            ..
+        } => {
+            if editing_code {
+                let text = text.to_ascii_uppercase();
+                insert_text_at_cursor(&mut code, &mut code_cursor, &text);
+            } else {
+                insert_text_at_cursor(&mut title, &mut title_cursor, &text);
+            }
+            *mode = InputMode::RenameTab {
+                code,
+                code_cursor,
+                title,
+                title_cursor,
+                editing_code,
+                error: None,
+            };
+        }
         InputMode::Command {
             mut buf,
             mut cursor,
         } => {
             insert_text_at_cursor(&mut buf, &mut cursor, &text);
             *mode = InputMode::Command { buf, cursor };
+        }
+        InputMode::TabChooser {
+            mut query,
+            mut cursor,
+            ..
+        } => {
+            insert_text_at_cursor(&mut query, &mut cursor, &text);
+            *mode = InputMode::TabChooser {
+                query,
+                cursor,
+                selected: 0,
+                search_active: true,
+            };
         }
         InputMode::CopyMode
         | InputMode::SessionChooser { .. }
@@ -2371,13 +3441,6 @@ fn shell_quote(s: &str) -> String {
     }
 }
 
-fn visible_entries<'a>(
-    entries: &'a [SessionTreeEntry],
-    collapsed: &std::collections::HashSet<String>,
-) -> Vec<&'a SessionTreeEntry> {
-    visible_entries_full(entries, collapsed, &std::collections::HashSet::new())
-}
-
 fn visible_entries_full<'a>(
     entries: &'a [SessionTreeEntry],
     collapsed: &std::collections::HashSet<String>,
@@ -2507,19 +3570,7 @@ fn detect_url_at_click(
     hide_borders: bool,
 ) -> Option<String> {
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
-    let term_area = ratatui::layout::Rect {
-        x: 0,
-        y: 0,
-        width: cols,
-        height: rows,
-    };
-    let content_height = term_area.height.saturating_sub(1);
-    let layout_area = ratatui::layout::Rect {
-        x: 0,
-        y: 0,
-        width: term_area.width,
-        height: content_height,
-    };
+    let layout_area = server_layout_area(cols, rows);
     let (row_texts, content_area) =
         find_active_pane_content(&fd.layout, layout_area, hide_borders);
     if screen_row < content_area.y

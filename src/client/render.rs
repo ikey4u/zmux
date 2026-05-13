@@ -89,6 +89,26 @@ pub struct WindowTabJson {
     pub active: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientTabState {
+    Active,
+    Inactive,
+    Dead,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClientTabView {
+    pub code: String,
+    pub title: String,
+    pub state: ClientTabState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientTabBarHit {
+    Tab(usize),
+    Overflow,
+}
+
 pub fn render_frame(f: &mut Frame, fd: &FrameData, in_prefix: bool) {
     render_frame_ex(f, fd, in_prefix, false, false);
 }
@@ -155,7 +175,55 @@ pub fn render_frame_ex(
     hide_status: bool,
     hide_borders: bool,
 ) {
+    render_frame_area_ex(f, fd, in_prefix, hide_status, hide_borders, f.area());
+}
+
+pub fn render_tabbed_frame(
+    f: &mut Frame,
+    fd: &FrameData,
+    tabs: &[ClientTabView],
+    in_prefix: bool,
+    hide_status: bool,
+    hide_borders: bool,
+) {
     let area = f.area();
+    if area.height == 0 {
+        return;
+    }
+    let tab_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: 1,
+    };
+    render_tab_bar(f, tabs, tab_area);
+    if area.height <= 1 {
+        return;
+    }
+    let frame_area = Rect {
+        x: area.x,
+        y: area.y + 1,
+        width: area.width,
+        height: area.height - 1,
+    };
+    render_frame_area_ex(
+        f,
+        fd,
+        in_prefix,
+        hide_status,
+        hide_borders,
+        frame_area,
+    );
+}
+
+fn render_frame_area_ex(
+    f: &mut Frame,
+    fd: &FrameData,
+    in_prefix: bool,
+    hide_status: bool,
+    hide_borders: bool,
+    area: Rect,
+) {
     if area.height < 2 {
         return;
     }
@@ -421,6 +489,411 @@ fn draw_border(f: &mut Frame, area: Rect, color: Color) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(color));
     f.render_widget(block, area);
+}
+
+pub fn render_tabbed_loading(f: &mut Frame, tabs: &[ClientTabView]) {
+    let area = f.area();
+    if area.height == 0 {
+        return;
+    }
+    let tab_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: 1,
+    };
+    render_tab_bar(f, tabs, tab_area);
+    if area.height <= 1 {
+        return;
+    }
+    let body = Rect {
+        x: area.x,
+        y: area.y + 1,
+        width: area.width,
+        height: area.height - 1,
+    };
+    let para = Paragraph::new(" Starting zmux...")
+        .style(Style::default().fg(Color::Yellow));
+    f.render_widget(para, body);
+}
+
+pub fn tab_bar_hit(
+    tabs: &[ClientTabView],
+    width: u16,
+    col: u16,
+) -> Option<ClientTabBarHit> {
+    let mut used = 0usize;
+    let max_width = width as usize;
+    let col = col as usize;
+    let ellipsis_width = unicode_display_width(" ... ");
+
+    for (index, tab) in tabs.iter().enumerate() {
+        let last = index + 1 == tabs.len();
+        let segment_width = tab_segment_width(tab);
+        if last {
+            if used + segment_width <= max_width {
+                return (col >= used && col < used + segment_width)
+                    .then_some(ClientTabBarHit::Tab(index));
+            }
+            if used + ellipsis_width <= max_width {
+                return (col >= used && col < used + ellipsis_width)
+                    .then_some(ClientTabBarHit::Overflow);
+            }
+            return None;
+        }
+        if used + segment_width + ellipsis_width > max_width {
+            if used + ellipsis_width <= max_width {
+                return (col >= used && col < used + ellipsis_width)
+                    .then_some(ClientTabBarHit::Overflow);
+            }
+            return None;
+        }
+        if col >= used && col < used + segment_width {
+            return Some(ClientTabBarHit::Tab(index));
+        }
+        used += segment_width;
+    }
+    None
+}
+
+fn render_tab_bar(f: &mut Frame, tabs: &[ClientTabView], area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+    let bg = Style::default().fg(Color::White).bg(Color::Rgb(28, 28, 28));
+    f.render_widget(
+        Paragraph::new(" ".repeat(area.width as usize)).style(bg),
+        area,
+    );
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    let max_width = area.width as usize;
+    let ellipsis = " ... ";
+    let ellipsis_width = unicode_display_width(ellipsis);
+
+    for (index, tab) in tabs.iter().enumerate() {
+        let last = index + 1 == tabs.len();
+        let segment_width = tab_segment_width(tab);
+        if last {
+            if used + segment_width <= max_width {
+                push_tab_spans(&mut spans, tab);
+            } else if used + ellipsis_width <= max_width {
+                spans.push(Span::styled(ellipsis.to_string(), bg));
+            }
+            break;
+        }
+        if used + segment_width + ellipsis_width > max_width {
+            if used + ellipsis_width <= max_width {
+                spans.push(Span::styled(ellipsis.to_string(), bg));
+            }
+            break;
+        }
+        push_tab_spans(&mut spans, tab);
+        used += segment_width;
+    }
+
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn tab_segment_width(tab: &ClientTabView) -> usize {
+    let title_width = if tab.title.is_empty() {
+        0
+    } else {
+        1 + unicode_display_width(&tab.title)
+    };
+    2 + 1 + title_width + 1
+}
+
+fn push_tab_spans(spans: &mut Vec<Span<'static>>, tab: &ClientTabView) {
+    let active = tab.state == ClientTabState::Active;
+    let base_bg = if active {
+        Color::Rgb(42, 72, 120)
+    } else {
+        Color::Rgb(48, 48, 48)
+    };
+    let code_style = Style::default()
+        .fg(Color::White)
+        .bg(base_bg)
+        .add_modifier(Modifier::BOLD);
+    let text_style = Style::default().fg(Color::White).bg(base_bg);
+    let (status, status_style) = match tab.state {
+        ClientTabState::Active => (
+            "*",
+            Style::default()
+                .fg(Color::Green)
+                .bg(base_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        ClientTabState::Inactive => {
+            ("-", Style::default().fg(Color::DarkGray).bg(base_bg))
+        }
+        ClientTabState::Dead => (
+            "!",
+            Style::default()
+                .fg(Color::Red)
+                .bg(base_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+    };
+    spans.push(Span::styled(tab.code.clone(), code_style));
+    spans.push(Span::styled(status.to_string(), status_style));
+    if !tab.title.is_empty() {
+        spans.push(Span::styled(format!(" {}", tab.title), text_style));
+    }
+    spans.push(Span::styled(
+        " ".to_string(),
+        Style::default().bg(Color::Rgb(28, 28, 28)),
+    ));
+}
+
+pub fn render_tab_chooser(
+    f: &mut Frame,
+    tabs: &[ClientTabView],
+    query: &str,
+    selected: usize,
+    search_active: bool,
+) {
+    use ratatui::widgets::{Block, Borders};
+
+    let area = f.area();
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let width = area
+        .width
+        .saturating_mul(3)
+        .saturating_div(4)
+        .max(36)
+        .min(area.width);
+    let height = area
+        .height
+        .saturating_sub(4)
+        .max(6)
+        .min(18)
+        .min(area.height);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    let panel = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    f.render_widget(Clear, panel);
+    let block = Block::default()
+        .title(" Tabs  (/ or ?=search  Ctrl+j/k=move  R=rename  Enter=switch  Esc/q=close) ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(panel);
+    f.render_widget(block, panel);
+    if inner.height == 0 {
+        return;
+    }
+
+    let search = if search_active {
+        format!(" search: {}", query)
+    } else if query.is_empty() {
+        " search: <press / or ?>".to_string()
+    } else {
+        format!(" search: {}", query)
+    };
+    let search_style = if search_active {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    f.render_widget(
+        Paragraph::new(truncate_to_width(&search, inner.width as usize))
+            .style(search_style),
+        Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: 1,
+        },
+    );
+
+    let matches: Vec<(usize, &ClientTabView)> = tabs
+        .iter()
+        .enumerate()
+        .filter(|(_, tab)| tab_matches(tab, query))
+        .collect();
+    if inner.height <= 1 {
+        return;
+    }
+    if matches.is_empty() {
+        f.render_widget(
+            Paragraph::new(" no matching tabs")
+                .style(Style::default().fg(Color::DarkGray)),
+            Rect {
+                x: inner.x,
+                y: inner.y + 1,
+                width: inner.width,
+                height: 1,
+            },
+        );
+        return;
+    }
+
+    let list_height = inner.height.saturating_sub(1) as usize;
+    let selected = selected.min(matches.len().saturating_sub(1));
+    let scroll = selected.saturating_sub(list_height.saturating_sub(1));
+    for (row, (_, tab)) in
+        matches.iter().skip(scroll).take(list_height).enumerate()
+    {
+        let y = inner.y + 1 + row as u16;
+        let is_selected = scroll + row == selected;
+        let state = match tab.state {
+            ClientTabState::Active => "*",
+            ClientTabState::Inactive => "-",
+            ClientTabState::Dead => "!",
+        };
+        let title = if tab.title.is_empty() {
+            "(untitled)"
+        } else {
+            &tab.title
+        };
+        let label = format!(" {}{} {}", tab.code, state, title);
+        let style = if is_selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let text = format!(
+            "{:<width$}",
+            truncate_to_width(&label, inner.width as usize),
+            width = inner.width as usize
+        );
+        f.render_widget(
+            Paragraph::new(text).style(style),
+            Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: 1,
+            },
+        );
+    }
+}
+
+fn tab_matches(tab: &ClientTabView, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    query.is_empty()
+        || tab.code.to_lowercase().contains(&query)
+        || tab.title.to_lowercase().contains(&query)
+}
+
+pub fn render_rename_tab_panel(
+    f: &mut Frame,
+    code: &str,
+    title: &str,
+    editing_code: bool,
+    error: Option<&str>,
+) {
+    use ratatui::widgets::{Block, Borders};
+
+    let area = f.area();
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let width = area
+        .width
+        .saturating_mul(2)
+        .saturating_div(3)
+        .max(44)
+        .min(area.width);
+    let height = 9.min(area.height).max(1);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    let panel = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    f.render_widget(Clear, panel);
+    let block = Block::default()
+        .title(" Rename Tab  (Tab=switch field  Enter=next/save  Esc=cancel) ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(panel);
+    f.render_widget(block, panel);
+    if inner.height == 0 {
+        return;
+    }
+
+    render_rename_field(f, inner, 0, "Code", code, editing_code);
+    if inner.height > 2 {
+        render_rename_field(f, inner, 2, "Title", title, !editing_code);
+    }
+    if let Some(error) = error {
+        if inner.height > 4 {
+            f.render_widget(
+                Paragraph::new(truncate_to_width(error, inner.width as usize))
+                    .style(Style::default().fg(Color::Red)),
+                Rect {
+                    x: inner.x,
+                    y: inner.y + 4,
+                    width: inner.width,
+                    height: 1,
+                },
+            );
+        }
+    }
+    if inner.height > 6 {
+        let help = "Code must be two unique uppercase letters.";
+        f.render_widget(
+            Paragraph::new(truncate_to_width(help, inner.width as usize))
+                .style(Style::default().fg(Color::DarkGray)),
+            Rect {
+                x: inner.x,
+                y: inner.y + 6,
+                width: inner.width,
+                height: 1,
+            },
+        );
+    }
+}
+
+fn render_rename_field(
+    f: &mut Frame,
+    area: Rect,
+    row: u16,
+    label: &str,
+    value: &str,
+    active: bool,
+) {
+    if row >= area.height {
+        return;
+    }
+    let text = format!(" {}: {}", label, value);
+    let style = if active {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let padded = format!(
+        "{:<width$}",
+        truncate_to_width(&text, area.width as usize),
+        width = area.width as usize
+    );
+    f.render_widget(
+        Paragraph::new(padded).style(style),
+        Rect {
+            x: area.x,
+            y: area.y + row,
+            width: area.width,
+            height: 1,
+        },
+    );
 }
 
 fn render_status_bar(

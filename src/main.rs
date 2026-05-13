@@ -33,6 +33,8 @@ enum Cmd {
     New {
         #[arg(short = 's', long)]
         session: Option<String>,
+        #[arg(short = 't', long = "tab")]
+        tab: Option<String>,
     },
     #[command(name = "a", alias = "attach", alias = "attach-session")]
     Attach {
@@ -61,9 +63,15 @@ fn main() -> io::Result<()> {
                 cli.directory.as_deref(),
             )?;
         }
-        Some(Cmd::New { session }) => {
-            ClientApp::new(&socket, session, cli.clean, cli.directory.clone())
-                .run()?;
+        Some(Cmd::New { session, tab }) => {
+            ClientApp::new_with_initial_tab_title(
+                &socket,
+                session,
+                cli.clean,
+                cli.directory.clone(),
+                tab,
+            )
+            .run()?;
         }
         Some(Cmd::Attach { target }) => {
             ClientApp::new(&socket, target, cli.clean, cli.directory.clone())
@@ -107,22 +115,98 @@ fn run_server_daemon(
 }
 
 fn run_ls(socket_name: &str) -> io::Result<()> {
+    let mut outputs = Vec::new();
+    for name in matching_socket_names(socket_name)? {
+        if let Some(output) = list_server_sessions(&name)? {
+            outputs.push((name, output));
+        }
+    }
+
+    if outputs.is_empty() {
+        println!("no server running on socket '{}'", socket_name);
+        return Ok(());
+    }
+
+    let multi = outputs.len() > 1;
+    for (index, (name, output)) in outputs.into_iter().enumerate() {
+        if index > 0 {
+            println!();
+        }
+        if multi {
+            println!("{}:", name);
+        }
+        println!("{}", output);
+    }
+    Ok(())
+}
+
+fn list_server_sessions(socket_name: &str) -> io::Result<Option<String>> {
     use std::io::BufReader;
 
     use zmux::ipc::{connect_client, recv_resp};
 
     let stream = match connect_client(socket_name) {
         Ok(s) => s,
-        Err(_) => {
-            println!("no server running on socket '{}'", socket_name);
-            return Ok(());
-        }
+        Err(_) => return Ok(None),
     };
     let mut write_stream = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
     write_stream.write_all(b"LIST\n")?;
     write_stream.flush()?;
-    let output = recv_resp(&mut reader)?;
-    println!("{}", output);
-    Ok(())
+    Ok(Some(recv_resp(&mut reader)?))
+}
+
+#[cfg(unix)]
+fn matching_socket_names(socket_name: &str) -> io::Result<Vec<String>> {
+    use std::collections::BTreeSet;
+
+    let socket_path = zmux::ipc::socket_path(socket_name)?;
+    let Some(dir) = socket_path.parent() else {
+        return Ok(vec![socket_name.to_string()]);
+    };
+    let tab_prefix = format!("{}.tab.", socket_name);
+    let mut names = BTreeSet::new();
+    if socket_path.exists() {
+        names.insert(socket_name.to_string());
+    }
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_string)
+            else {
+                continue;
+            };
+            if name.starts_with(&tab_prefix) {
+                names.insert(name);
+            }
+        }
+    }
+    Ok(names.into_iter().collect())
+}
+
+#[cfg(windows)]
+fn matching_socket_names(socket_name: &str) -> io::Result<Vec<String>> {
+    use std::collections::BTreeSet;
+
+    let pipe_prefix = "zmux-";
+    let base_pipe = format!("{}{}", pipe_prefix, socket_name);
+    let tab_pipe_prefix = format!("{}{}.tab.", pipe_prefix, socket_name);
+    let mut names = BTreeSet::new();
+
+    if let Ok(entries) = std::fs::read_dir(r"\\.\pipe\") {
+        for entry in entries.flatten() {
+            let pipe_name = entry.file_name().to_string_lossy().to_string();
+            if pipe_name == base_pipe {
+                names.insert(socket_name.to_string());
+            } else if pipe_name.starts_with(&tab_pipe_prefix) {
+                if let Some(socket) = pipe_name.strip_prefix(pipe_prefix) {
+                    names.insert(socket.to_string());
+                }
+            }
+        }
+    }
+
+    if names.is_empty() {
+        names.insert(socket_name.to_string());
+    }
+    Ok(names.into_iter().collect())
 }

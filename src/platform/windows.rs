@@ -9,15 +9,15 @@ pub fn spawn_server_background(
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
     let mut cmd = std::process::Command::new(exe);
-    cmd.arg("server");
-    cmd.arg("--socket");
+    cmd.arg("-L");
     cmd.arg(socket_name);
-    cmd.arg("--session");
+    cmd.arg("-s");
     cmd.arg(session_name);
     if let Some(start_dir) = start_dir {
         cmd.arg("--directory");
         cmd.arg(start_dir);
     }
+    cmd.arg("server");
     cmd.creation_flags(CREATE_NO_WINDOW);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());

@@ -4,9 +4,8 @@ import re
 from PIL import Image, ImageDraw, ImageFont
 
 ROOT = Path(__file__).resolve().parent
-SOURCE = ROOT.parent / "SHORTCUT.md"
+SOURCE = ROOT.parent.parent / "README.md"
 OUT_ZH = ROOT / "shortcut-quickstart.png"
-OUT_EN = ROOT / "shortcut-quickstart-en.png"
 
 WIDTH = 1800
 PAGE_PAD = 52
@@ -149,7 +148,7 @@ LOCALE_META = {
         "prefix_title": "PREFIX",
         "prefix_value": "Ctrl+a",
         "prefix_desc": "先按前缀，再按动作键",
-        "footer": "基于 docs/SHORTCUT.md 生成 · 更新文档后重新运行 docs/diagrams/generate_shortcut_quickstart.py",
+        "footer": "基于 README.md 生成 · 更新文档后重新运行 docs/diagrams/generate_shortcut_quickstart.py",
         "intro_title": "先记住 Prefix",
         "intro_subtitle": "所有快捷键都从这里开始",
         "intro_bullets": [
@@ -176,7 +175,7 @@ LOCALE_META = {
         "prefix_title": "PREFIX",
         "prefix_value": "Ctrl+a",
         "prefix_desc": "Press Prefix first, then the action key",
-        "footer": "Generated from docs/SHORTCUT.md · Re-run docs/diagrams/generate_shortcut_quickstart.py after updates",
+        "footer": "Generated from README.md · Re-run docs/diagrams/generate_shortcut_quickstart.py after updates",
         "intro_title": "Memorize Prefix first",
         "intro_subtitle": "Every shortcut starts here",
         "intro_bullets": [
@@ -733,17 +732,35 @@ def render_locale(locale, parsed):
     for card in right_cards:
         right_cursor += draw_card(draw, right_x, right_cursor, col_w, card) + CARD_GAP
     draw.text((PAGE_PAD, height - 34), LOCALE_META[locale]["footer"], font=FONTS["body_small"], fill=MUTED)
-    output = OUT_ZH if locale == "zh" else OUT_EN
+    output = OUT_ZH
     image.convert("RGB").save(output)
     return output, image.size
 
 
 
+def shortcut_markdown_from_readme(text):
+    marker = "## Shortcuts"
+    if marker not in text:
+        return text
+    body = text.split(marker, 1)[1]
+    converted = []
+    for line in body.splitlines():
+        if line.startswith("#### "):
+            converted.append(line[1:])
+        elif line.startswith("### "):
+            converted.append(line[1:])
+        else:
+            converted.append(line)
+    return "\n".join(converted)
+
+
+
 def main():
-    parsed = parse_shortcut_markdown(SOURCE.read_text(encoding="utf-8"))
-    for locale in ("zh", "en"):
-        path, size = render_locale(locale, parsed)
-        print(f"generated {path.name} {size[0]}x{size[1]}")
+    parsed = parse_shortcut_markdown(
+        shortcut_markdown_from_readme(SOURCE.read_text(encoding="utf-8"))
+    )
+    path, size = render_locale("zh", parsed)
+    print(f"generated {path.name} {size[0]}x{size[1]}")
 
 
 if __name__ == "__main__":
