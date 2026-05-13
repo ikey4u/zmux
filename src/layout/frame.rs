@@ -490,6 +490,14 @@ mod tests {
         assert_eq!(rows[1]["line"], Value::from(1));
     }
 
+    #[test]
+    fn terminal_rows_tag_wide_char_soft_wraps_as_same_logical_line() {
+        let rows = serialized_rows_for("abc中x".as_bytes(), 3, 5);
+
+        assert_eq!(rows[0]["line"], Value::from(0));
+        assert_eq!(rows[1]["line"], Value::from(0));
+    }
+
     fn serialized_rows_for(input: &[u8], rows: u16, cols: u16) -> Vec<Value> {
         let mut term = AlacrittyTermState::new(rows, cols, 100);
         term.process(input);

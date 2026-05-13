@@ -285,7 +285,7 @@ impl AlacrittyTermState {
             if col_idx >= rows[row_idx].len() {
                 continue;
             }
-            rows[row_idx][col_idx] = cell_to_view(indexed.cell);
+            write_cell_to_view(&mut rows[row_idx], col_idx, indexed.cell);
         }
         rows
     }
@@ -318,7 +318,7 @@ impl AlacrittyTermState {
                 .or_insert_with(|| vec![None; self.cols as usize]);
             let col = indexed.point.column.0;
             if col < row.len() {
-                row[col] = cell_to_view(indexed.cell);
+                write_cell_to_view(row, col, indexed.cell);
             }
         }
         let cursor_line = cursor.line.0;
@@ -342,6 +342,21 @@ fn is_erase_display_all(params: &[u8]) -> bool {
             .map(|index| &params[index..])
             .unwrap_or(b"0".as_slice());
         trimmed == b"2"
+    }
+}
+
+fn write_cell_to_view(
+    row: &mut [Option<TerminalCell>],
+    col: usize,
+    cell: &Cell,
+) {
+    if let Some(view) = cell_to_view(cell) {
+        row[col] = Some(view);
+    } else if cell.flags.contains(Flags::WRAPLINE) {
+        if let Some(prev) = row[..col].iter_mut().rev().find_map(|c| c.as_mut())
+        {
+            prev.flags.insert(Flags::WRAPLINE);
+        }
     }
 }
 
@@ -461,6 +476,15 @@ mod tests {
         term.set_scroll_on_erase_in_display(true);
         term.process(b"alpha\r\nbeta\r\ngamma\x1b[H\x1b[2Jprompt");
         assert!(term.scroll_on_erase_history());
+    }
+
+    #[test]
+    fn row_wrapped_survives_wide_char_spacer_at_wrap_boundary() {
+        let mut term = AlacrittyTermState::new(3, 5, 100);
+        term.process("abc中x".as_bytes());
+
+        assert_eq!(first_row_text(&term), "abc中");
+        assert!(term.row_wrapped(0));
     }
 
     #[test]
