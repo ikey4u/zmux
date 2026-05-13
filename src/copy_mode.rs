@@ -21,6 +21,9 @@ pub struct CopyRenderRun {
 #[derive(Clone)]
 pub struct CopyRenderRow {
     pub runs: Vec<CopyRenderRun>,
+    pub line: Option<usize>,
+    pub start_col: usize,
+    pub end_col: usize,
 }
 
 #[derive(Clone)]
@@ -1230,10 +1233,20 @@ fn render_row(
     active_match: Option<&SearchMatch>,
 ) -> CopyRenderRow {
     let Some(row) = row else {
-        return CopyRenderRow { runs: Vec::new() };
+        return CopyRenderRow {
+            runs: Vec::new(),
+            line: None,
+            start_col: 0,
+            end_col: 0,
+        };
     };
     if row.text.is_empty() {
-        return CopyRenderRow { runs: Vec::new() };
+        return CopyRenderRow {
+            runs: Vec::new(),
+            line: Some(row.line),
+            start_col: row.start_col,
+            end_col: row.end_col,
+        };
     }
     let selected = selection_range_for_line(state, row.line);
     let matches: Vec<(usize, usize)> = state
@@ -1299,7 +1312,12 @@ fn render_row(
             current_width,
         ));
     }
-    CopyRenderRow { runs }
+    CopyRenderRow {
+        runs,
+        line: Some(row.line),
+        start_col: row.start_col,
+        end_col: row.end_col,
+    }
 }
 
 fn style_for_col(

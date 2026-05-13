@@ -307,6 +307,8 @@ fn write_rows_v2(
     const FLAG_INVERSE: u8 = 16;
 
     let visible_rows = term.visible_rows();
+    let mut logical_line = 0usize;
+    let mut logical_col = 0usize;
     out.push('[');
     for r in 0..rows {
         if r > 0 {
@@ -314,6 +316,8 @@ fn write_rows_v2(
         }
         out.push_str("{\"runs\":[");
 
+        let row_start_col = logical_col;
+        let mut row_wrapped = false;
         let mut runs: Vec<Run> = Vec::new();
         let mut c = 0u16;
 
@@ -323,6 +327,7 @@ fn write_rows_v2(
                 .and_then(|cells| cells.get(c as usize))
                 .and_then(|cell| cell.as_ref())
             {
+                row_wrapped |= cell.flags.contains(Flags::WRAPLINE);
                 let mut fl = 0u8;
                 if cell.flags.contains(Flags::DIM) {
                     fl |= FLAG_DIM;
@@ -389,7 +394,18 @@ fn write_rows_v2(
             );
         }
 
-        out.push_str("]}");
+        let row_end_col = row_start_col + cols as usize;
+        let _ = write!(
+            out,
+            "],\"line\":{},\"start_col\":{},\"end_col\":{}}}",
+            logical_line, row_start_col, row_end_col
+        );
+        if row_wrapped {
+            logical_col = row_end_col;
+        } else {
+            logical_line += 1;
+            logical_col = 0;
+        }
     }
     out.push(']');
 }
@@ -417,7 +433,15 @@ fn write_copy_rows(rows: &[CopyRenderRow], out: &mut String) {
                 run.flags, run.width
             );
         }
-        out.push_str("]}");
+        out.push(']');
+        if let Some(line) = row.line {
+            let _ = write!(
+                out,
+                ",\"line\":{},\"start_col\":{},\"end_col\":{}",
+                line, row.start_col, row.end_col
+            );
+        }
+        out.push('}');
     }
     out.push(']');
 }
@@ -440,5 +464,37 @@ fn json_escape(s: &str, out: &mut String) {
             }
             c => out.push(c),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::Value;
+
+    use super::*;
+
+    #[test]
+    fn terminal_rows_tag_soft_wraps_as_same_logical_line() {
+        let rows = serialized_rows_for(b"abcdef\nXYZ", 4, 5);
+
+        assert_eq!(rows[0]["line"], Value::from(0));
+        assert_eq!(rows[1]["line"], Value::from(0));
+        assert_eq!(rows[2]["line"], Value::from(1));
+    }
+
+    #[test]
+    fn terminal_rows_keep_hard_newlines_as_separate_logical_lines() {
+        let rows = serialized_rows_for(b"abc\ndef", 4, 5);
+
+        assert_eq!(rows[0]["line"], Value::from(0));
+        assert_eq!(rows[1]["line"], Value::from(1));
+    }
+
+    fn serialized_rows_for(input: &[u8], rows: u16, cols: u16) -> Vec<Value> {
+        let mut term = AlacrittyTermState::new(rows, cols, 100);
+        term.process(input);
+        let mut out = String::new();
+        write_rows_v2(&term, rows, cols, &mut out);
+        serde_json::from_str(&out).unwrap()
     }
 }

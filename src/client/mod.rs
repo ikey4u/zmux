@@ -1557,6 +1557,11 @@ struct MouseSelection {
     end_row: u16,
 }
 
+struct PaneContentRow {
+    text: String,
+    line: Option<usize>,
+}
+
 fn render_mouse_selection(
     f: &mut ratatui::Frame,
     sel: &MouseSelection,
@@ -1665,8 +1670,13 @@ fn extract_text_from_frame(
     let pane_start_row = pane_start_row.min(max_row);
     let pane_end_row = pane_end_row.min(max_row);
     let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_line = None;
+    let mut has_current = false;
     for row in pane_start_row..=pane_end_row {
-        let row_text = rows.get(row).map(|s| s.as_str()).unwrap_or("");
+        let Some(row_data) = rows.get(row) else {
+            continue;
+        };
         let col_start = if row == pane_start_row {
             pane_start_col
         } else {
@@ -1677,15 +1687,26 @@ fn extract_text_from_frame(
         } else {
             usize::MAX
         };
-        let s = slice_by_display_col(row_text, col_start, col_end);
-        lines.push(s);
+        let s = slice_by_display_col(&row_data.text, col_start, col_end);
+        if has_current
+            && row_data.line.is_some()
+            && current_line == row_data.line
+        {
+            current.push_str(&s);
+        } else {
+            if has_current {
+                lines.push(current.trim_end().to_string());
+            }
+            current = s;
+            current_line = row_data.line;
+            has_current = true;
+        }
+    }
+    if has_current {
+        lines.push(current.trim_end().to_string());
     }
     while lines.last().is_some_and(|l| l.trim().is_empty()) {
         lines.pop();
-    }
-    for line in &mut lines {
-        let trimmed = line.trim_end().to_string();
-        *line = trimmed;
     }
     lines.join("\n")
 }
@@ -1728,7 +1749,7 @@ fn find_active_pane_content(
     layout: &LayoutJson,
     area: ratatui::layout::Rect,
     hide_borders: bool,
-) -> (Vec<String>, ratatui::layout::Rect) {
+) -> (Vec<PaneContentRow>, ratatui::layout::Rect) {
     match layout {
         LayoutJson::Leaf {
             active: true,
@@ -1748,7 +1769,10 @@ fn find_active_pane_content(
                 };
             let rows = rows_v2
                 .iter()
-                .map(|row| row.runs.iter().map(|r| r.text.as_str()).collect())
+                .map(|row| PaneContentRow {
+                    text: row.runs.iter().map(|r| r.text.as_str()).collect(),
+                    line: row.line,
+                })
                 .collect();
             (rows, content_area)
         }
@@ -2507,7 +2531,7 @@ fn detect_url_at_click(
     }
     let pane_row = (screen_row - content_area.y) as usize;
     let pane_col = (screen_col - content_area.x) as usize;
-    let line = row_texts.get(pane_row)?;
+    let line = &row_texts.get(pane_row)?.text;
     let re = Regex::new(r#"https?://[^\s<>"'()\[\]{}|\\^`\x{FF08}\x{FF09}\x{3001}\x{3002}\x{FF0C}\x{FF1B}]+"#).ok()?;
     for m in re.find_iter(line) {
         use unicode_width::UnicodeWidthChar;
@@ -2609,6 +2633,75 @@ mod tests {
 
         assert_eq!(find_pane_id_at(&layout, area, 10, 5, false), Some(1));
         assert_eq!(find_pane_id_at(&layout, area, 75, 5, false), Some(2));
+    }
+
+    #[test]
+    fn mouse_copy_joins_copy_mode_wrapped_rows() {
+        let fd = test_frame(vec![
+            test_row("abcdef", Some(0)),
+            test_row("ghij", Some(0)),
+        ]);
+        let sel = MouseSelection {
+            start_col: 0,
+            start_row: 0,
+            end_col: 4,
+            end_row: 1,
+        };
+
+        assert_eq!(extract_text_from_frame(&fd, &sel, true), "abcdefghij");
+    }
+
+    #[test]
+    fn mouse_copy_keeps_newline_without_copy_row_metadata() {
+        let fd = test_frame(vec![test_row("abc", None), test_row("def", None)]);
+        let sel = MouseSelection {
+            start_col: 0,
+            start_row: 0,
+            end_col: 3,
+            end_row: 1,
+        };
+
+        assert_eq!(extract_text_from_frame(&fd, &sel, true), "abc\ndef");
+    }
+
+    fn test_frame(rows_v2: Vec<RowRunsJson>) -> FrameData {
+        FrameData {
+            frame_type: "frame".to_string(),
+            layout: LayoutJson::Leaf {
+                id: 1,
+                rows: rows_v2.len() as u16,
+                cols: 20,
+                cursor_row: 0,
+                cursor_col: 0,
+                hide_cursor: false,
+                alternate_screen: false,
+                mouse_mode: 0,
+                in_copy_mode: true,
+                scroll_ratio: None,
+                cursor_shape: 0,
+                active: true,
+                rows_v2,
+                title: None,
+            },
+            status: None,
+            exit: false,
+            yank_text: None,
+        }
+    }
+
+    fn test_row(text: &str, line: Option<usize>) -> RowRunsJson {
+        RowRunsJson {
+            runs: vec![CellRunJson {
+                text: text.to_string(),
+                fg: "default".to_string(),
+                bg: "default".to_string(),
+                flags: 0,
+                width: text.chars().count() as u16,
+            }],
+            line,
+            start_col: 0,
+            end_col: text.chars().count(),
+        }
     }
 
     fn test_leaf(id: usize, active: bool) -> LayoutJson {

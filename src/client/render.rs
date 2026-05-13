@@ -58,6 +58,12 @@ pub enum LayoutJson {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RowRunsJson {
     pub runs: Vec<CellRunJson>,
+    #[serde(default)]
+    pub line: Option<usize>,
+    #[serde(default)]
+    pub start_col: usize,
+    #[serde(default)]
+    pub end_col: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
