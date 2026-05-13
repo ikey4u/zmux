@@ -555,6 +555,24 @@ fn handle_client(
             log_server("CMD_OUTPUT served, closing");
             return Ok(());
         }
+        "COPY_YANK" => {
+            let text = state
+                .lock()
+                .map(|mut s| {
+                    with_active_pane_mut(
+                        &mut s,
+                        crate::copy_mode::yank_selection,
+                    )
+                    .unwrap_or_default()
+                })
+                .unwrap_or_default();
+            if !text.is_empty() {
+                mark_data_ready();
+            }
+            send_resp(&mut write_stream, &text)?;
+            log_server("COPY_YANK served, closing");
+            return Ok(());
+        }
         line if line.starts_with("ATTACH") => {}
         _ => {
             log_server(&format!("unknown hello {:?}, closing", hello));

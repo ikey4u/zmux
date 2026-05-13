@@ -10,7 +10,7 @@ use std::{
 
 use crate::{
     client::{FrameData, LayoutJson},
-    ipc::{connect_client, recv_frame},
+    ipc::{connect_client, recv_frame, recv_resp},
     server::{encode_hex, SessionTreeEntry},
     types::{session::Size, SelectionMode},
 };
@@ -129,16 +129,25 @@ impl SocketClient {
             };
 
         probe_reader.get_ref().set_read_timeout(None)?;
+
+        let mut control_stream = connect_client(socket_name)?;
+        control_stream.write_all(
+            format!("ATTACH\n{}x{}\n", size.rows, size.cols).as_bytes(),
+        )?;
+        control_stream.flush()?;
+        log_socket("opened control connection");
         log_socket("connection established, starting poll thread");
 
         let latest_frame: Arc<Mutex<Option<FrameData>>> =
             Arc::new(Mutex::new(Some(first_frame)));
         let write_arc: Arc<Mutex<Box<dyn Write + Send>>> =
+            Arc::new(Mutex::new(Box::new(control_stream)));
+        let frame_write_arc: Arc<Mutex<Box<dyn Write + Send>>> =
             Arc::new(Mutex::new(Box::new(writer)));
         let frame_counter: Arc<AtomicU64> = Arc::new(AtomicU64::new(1));
 
         let frame_arc = Arc::clone(&latest_frame);
-        let ws_poll = Arc::clone(&write_arc);
+        let ws_poll = Arc::clone(&frame_write_arc);
         let counter_arc = Arc::clone(&frame_counter);
 
         thread::spawn(move || {
@@ -464,23 +473,21 @@ impl SocketClient {
     }
 
     pub fn copy_yank_selection(&self) -> String {
-        self.send_line("COPY_YANK");
-        for _ in 0..50 {
-            thread::sleep(Duration::from_millis(20));
-            if let Some(frame) =
-                self.latest_frame.lock().ok().and_then(|f| f.clone())
-            {
-                if let Some(text) = frame.yank_text {
-                    if let Ok(mut f) = self.latest_frame.lock() {
-                        if let Some(ref mut fd) = *f {
-                            fd.yank_text = None;
-                        }
-                    }
-                    return text;
-                }
-            }
+        let stream = match connect_client(&self.socket_name) {
+            Ok(s) => s,
+            Err(_) => return String::new(),
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut ws = match stream.try_clone() {
+            Ok(s) => s,
+            Err(_) => return String::new(),
+        };
+        let reader = BufReader::new(stream);
+        if ws.write_all(b"COPY_YANK\n").is_err() || ws.flush().is_err() {
+            return String::new();
         }
-        String::new()
+        let mut buf_reader = reader;
+        recv_resp(&mut buf_reader).unwrap_or_default()
     }
 }
 
