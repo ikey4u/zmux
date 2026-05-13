@@ -65,13 +65,17 @@ impl InProcessServer {
 
         {
             let mut s = state.lock().unwrap();
-            create_initial_session(
+            if let Err(e) = create_initial_session(
                 &mut s,
                 &session_name,
                 size,
                 start_dir.as_deref(),
-            )?;
+            ) {
+                log_server(&format!("create initial session failed: {}", e));
+                return Err(e);
+            }
         }
+        log_server("initial session created");
 
         let state2 = Arc::clone(&state);
         let frame2 = Arc::clone(&latest_frame);
@@ -429,6 +433,8 @@ impl InProcessServer {
         use crate::ipc::bind_server;
 
         let listener = bind_server(socket_name)?;
+        log_server(&format!("listening on socket {}", socket_name));
+        #[cfg(unix)]
         let socket_name = socket_name.to_string();
         for stream in listener.incoming() {
             let stream = match stream {
@@ -440,6 +446,7 @@ impl InProcessServer {
             let size_arc = Arc::clone(&self.size);
             let state_check = Arc::clone(&self.state);
             let size_check = Arc::clone(&self.size);
+            #[cfg(unix)]
             let socket_name_clone = socket_name.clone();
             thread::spawn(move || {
                 let _ = handle_client(stream, state, latest_frame, size_arc);
@@ -488,13 +495,13 @@ fn prune_empty_sessions(state: &mut Server) -> bool {
     old_len != state.sessions.len()
 }
 
-#[cfg(unix)]
 fn log_server(msg: &str) {
     use std::io::Write;
+    let path = std::env::temp_dir().join("zmux_server.log");
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/tmp/zmux_server.log")
+        .open(path)
     {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -504,13 +511,15 @@ fn log_server(msg: &str) {
     }
 }
 
-#[cfg(unix)]
-fn handle_client(
-    stream: std::os::unix::net::UnixStream,
+fn handle_client<S>(
+    stream: S,
     state: Arc<Mutex<Server>>,
     latest_frame: Arc<Mutex<Option<FrameData>>>,
     size_arc: Arc<Mutex<Size>>,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    S: crate::ipc::IpcStream,
+{
     use std::io::BufReader;
 
     use crate::ipc::{recv_line, send_frame, send_resp};
@@ -542,6 +551,17 @@ fn handle_client(
                 .unwrap_or_else(|_| "{}".to_string());
             send_resp(&mut write_stream, &json)?;
             log_server("OPTIONS served, closing");
+            return Ok(());
+        }
+        "KILL_SERVER" => {
+            if let Ok(mut s) = state.lock() {
+                kill_all_panes(&mut s);
+                s.sessions.clear();
+                s.active_session_idx = 0;
+            }
+            mark_data_ready();
+            send_resp(&mut write_stream, "OK")?;
+            log_server("KILL_SERVER served, exiting");
             return Ok(());
         }
         line if line.starts_with("CMD_OUTPUT ") => {
@@ -1062,24 +1082,29 @@ fn render_loop(
     socket_name: Option<String>,
 ) {
     let mut first = true;
+    let mut last_reap = Instant::now() - Duration::from_millis(250);
     loop {
         crate::types::events::wait_render(Duration::from_millis(16));
 
         let dirty = PTY_DATA_READY.swap(false, Ordering::Relaxed);
-        if !dirty && !first {
-            continue;
-        }
-        first = false;
-
-        let should_exit = {
+        let should_reap =
+            first || dirty || last_reap.elapsed() >= Duration::from_millis(250);
+        let (should_exit, reaped) = if should_reap {
+            last_reap = Instant::now();
             let mut s = match state.lock() {
                 Ok(s) => s,
                 Err(_) => continue,
             };
             let sz = size.lock().map(|s| *s).unwrap_or(Size::new(24, 80));
-            reap_dead_panes(&mut s, sz);
-            server_is_empty(&s)
+            let reaped = reap_dead_panes(&mut s, sz);
+            (server_is_empty(&s), reaped)
+        } else {
+            (false, false)
         };
+        if !dirty && !first && !reaped {
+            continue;
+        }
+        first = false;
         if should_exit {
             log_server("render loop found server empty, exiting");
             #[cfg(unix)]
@@ -1152,6 +1177,7 @@ fn reap_dead_panes(state: &mut Server, size: Size) -> bool {
     for session in &mut state.sessions {
         let mut win_idx = 0;
         while win_idx < session.windows.len() {
+            mark_exited_panes(&mut session.windows[win_idx].root);
             let dead_ids =
                 collect_dead_pane_ids(&session.windows[win_idx].root);
             if dead_ids.is_empty() {
@@ -1205,8 +1231,48 @@ fn reap_dead_panes(state: &mut Server, size: Size) -> bool {
     changed
 }
 
+fn mark_exited_panes(node: &mut LayoutNode) {
+    match node {
+        LayoutNode::Leaf(p) => {
+            if p.dead.load(Ordering::Relaxed) {
+                return;
+            }
+            if matches!(p.child.try_wait(), Ok(Some(_))) {
+                p.dead.store(true, Ordering::Relaxed);
+                mark_data_ready();
+            }
+        }
+        LayoutNode::Split { children, .. } => {
+            for child in children {
+                mark_exited_panes(child);
+            }
+        }
+    }
+}
+
+fn kill_all_panes(state: &mut Server) {
+    for session in &mut state.sessions {
+        for window in &mut session.windows {
+            kill_node_panes(&mut window.root);
+        }
+    }
+}
+
+fn kill_node_panes(node: &mut LayoutNode) {
+    match node {
+        LayoutNode::Leaf(p) => {
+            let _ = p.child.kill();
+            p.dead.store(true, Ordering::Relaxed);
+        }
+        LayoutNode::Split { children, .. } => {
+            for child in children {
+                kill_node_panes(child);
+            }
+        }
+    }
+}
+
 fn collect_dead_pane_ids(node: &LayoutNode) -> Vec<PaneId> {
-    use std::sync::atomic::Ordering;
     match node {
         LayoutNode::Leaf(p) => {
             if p.dead.load(Ordering::Relaxed) {

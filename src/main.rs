@@ -43,6 +43,13 @@ enum Cmd {
     },
     #[command(name = "ls", alias = "list-sessions")]
     Ls,
+    #[command(name = "kill-server")]
+    KillServer {
+        #[arg(short = 'a', long)]
+        all: bool,
+        #[arg(value_name = "SOCKET")]
+        sockets: Vec<String>,
+    },
     #[command(name = "server")]
     Server,
     #[clap(external_subcommand)]
@@ -79,6 +86,9 @@ fn main() -> io::Result<()> {
         }
         Some(Cmd::Ls) => {
             run_ls(&socket)?;
+        }
+        Some(Cmd::KillServer { all, sockets }) => {
+            run_kill_server(&socket, sockets, all)?;
         }
         Some(Cmd::External(args)) => {
             eprintln!("unknown subcommand: {:?}", args);
@@ -154,6 +164,102 @@ fn list_server_sessions(socket_name: &str) -> io::Result<Option<String>> {
     write_stream.write_all(b"LIST\n")?;
     write_stream.flush()?;
     Ok(Some(recv_resp(&mut reader)?))
+}
+
+fn run_kill_server(
+    socket_name: &str,
+    sockets: Vec<String>,
+    all: bool,
+) -> io::Result<()> {
+    use std::collections::BTreeSet;
+
+    let targets = if all {
+        all_socket_names(socket_name)?
+    } else if sockets.is_empty() {
+        vec![socket_name.to_string()]
+    } else {
+        sockets
+    };
+    let targets = targets.into_iter().collect::<BTreeSet<_>>();
+
+    if targets.is_empty() {
+        println!("no zmux servers running");
+        return Ok(());
+    }
+
+    let mut killed = 0usize;
+    for name in targets {
+        if kill_server(&name)? {
+            killed += 1;
+            println!("killed server '{}'", name);
+        } else {
+            println!("no server running on socket '{}'", name);
+        }
+    }
+
+    if killed == 0 {
+        println!("no zmux servers killed");
+    }
+    Ok(())
+}
+
+fn kill_server(socket_name: &str) -> io::Result<bool> {
+    use std::io::BufReader;
+
+    use zmux::ipc::{connect_client, recv_resp};
+
+    let stream = match connect_client(socket_name) {
+        Ok(s) => s,
+        Err(_) => return Ok(false),
+    };
+    let mut write_stream = stream.try_clone()?;
+    let mut reader = BufReader::new(stream);
+    write_stream.write_all(b"KILL_SERVER\n")?;
+    write_stream.flush()?;
+    let _ = recv_resp(&mut reader)?;
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn all_socket_names(socket_name: &str) -> io::Result<Vec<String>> {
+    use std::{collections::BTreeSet, os::unix::fs::FileTypeExt};
+
+    let socket_path = zmux::ipc::socket_path(socket_name)?;
+    let Some(dir) = socket_path.parent() else {
+        return Ok(Vec::new());
+    };
+    let mut names = BTreeSet::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_socket() {
+                continue;
+            }
+            if let Some(name) = entry.file_name().to_str() {
+                names.insert(name.to_string());
+            }
+        }
+    }
+    Ok(names.into_iter().collect())
+}
+
+#[cfg(windows)]
+fn all_socket_names(_socket_name: &str) -> io::Result<Vec<String>> {
+    use std::collections::BTreeSet;
+
+    let pipe_prefix = "zmux-";
+    let mut names = BTreeSet::new();
+    if let Ok(entries) = std::fs::read_dir(r"\\.\pipe\") {
+        for entry in entries.flatten() {
+            let pipe_name = entry.file_name().to_string_lossy().to_string();
+            if let Some(socket) = pipe_name.strip_prefix(pipe_prefix) {
+                names.insert(socket.to_string());
+            }
+        }
+    }
+    Ok(names.into_iter().collect())
 }
 
 #[cfg(unix)]

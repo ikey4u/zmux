@@ -681,7 +681,7 @@ pub fn render_tab_chooser(
     };
     f.render_widget(Clear, panel);
     let block = Block::default()
-        .title(" Tabs  (/ or ?=search  Ctrl+j/k=move  R=rename  Enter=switch  Esc/q=close) ")
+        .title(" Tabs  (/ or ?=search  j/k=move  search: Ctrl+j/k  R=rename  Enter=switch  Esc/q=close) ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(panel);

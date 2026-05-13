@@ -17,10 +17,11 @@ use crate::{
 
 fn log_socket(msg: &str) {
     use std::io::Write;
+    let path = std::env::temp_dir().join("zmux_client.log");
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/tmp/zmux_client.log")
+        .open(path)
     {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

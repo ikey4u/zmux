@@ -65,6 +65,7 @@ enum InputMode {
         title_cursor: usize,
         editing_code: bool,
         error: Option<String>,
+        return_to_tab_chooser: bool,
     },
     Command {
         buf: String,
@@ -294,7 +295,19 @@ fn normalize_tab_code(code: &str) -> Result<String, String> {
     Ok(code)
 }
 
-fn rename_tab_mode_for_active(tabs: &TabManager) -> InputMode {
+fn default_tab_chooser_mode(tabs: &TabManager) -> InputMode {
+    InputMode::TabChooser {
+        query: String::new(),
+        cursor: 0,
+        selected: tabs.active_index(),
+        search_active: false,
+    }
+}
+
+fn rename_tab_mode_for_active(
+    tabs: &TabManager,
+    return_to_tab_chooser: bool,
+) -> InputMode {
     let code = tabs.active_code();
     let title = tabs.active_title();
     InputMode::RenameTab {
@@ -304,6 +317,7 @@ fn rename_tab_mode_for_active(tabs: &TabManager) -> InputMode {
         title,
         editing_code: true,
         error: None,
+        return_to_tab_chooser,
     }
 }
 
@@ -422,12 +436,19 @@ impl ClientApp {
             EnterAlternateScreen,
             cursor::Hide,
             EnableBracketedPaste,
-            EnableMouseCapture,
+            EnableMouseCapture
+        )?;
+        let keyboard_enhancement_enabled = match execute!(
+            stdout,
             PushKeyboardEnhancementFlags(
                 KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                     | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
             )
-        )?;
+        ) {
+            Ok(()) => true,
+            Err(e) if e.kind() == io::ErrorKind::Unsupported => false,
+            Err(e) => return Err(e),
+        };
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
         let mut mouse_select: Option<MouseSelection> = None;
@@ -696,16 +717,12 @@ impl ClientApp {
                                             KeyCode::Char('t'),
                                             KeyModifiers::NONE,
                                         ) => {
-                                            mode = InputMode::TabChooser {
-                                                query: String::new(),
-                                                cursor: 0,
-                                                selected: tabs.active_index(),
-                                                search_active: false,
-                                            };
+                                            mode =
+                                                default_tab_chooser_mode(&tabs);
                                         }
                                         (KeyCode::Char('T'), _) => {
                                             mode = rename_tab_mode_for_active(
-                                                &tabs,
+                                                &tabs, false,
                                             );
                                         }
                                         (KeyCode::Tab, _) => {
@@ -1484,6 +1501,9 @@ impl ClientApp {
                                     mut selected,
                                     mut search_active,
                                 } => match (key.code, key.modifiers) {
+                                    (KeyCode::Esc, _) if search_active => {
+                                        mode = default_tab_chooser_mode(&tabs);
+                                    }
                                     (KeyCode::Esc, _)
                                     | (
                                         KeyCode::Char('q'),
@@ -1548,7 +1568,7 @@ impl ClientApp {
                                             if tabs.select(tab_index) {
                                                 mode =
                                                     rename_tab_mode_for_active(
-                                                        &tabs,
+                                                        &tabs, true,
                                                     );
                                             } else {
                                                 mode = InputMode::Normal;
@@ -1571,10 +1591,23 @@ impl ClientApp {
                                             search_active,
                                         };
                                     }
+                                    (
+                                        KeyCode::Char('k'),
+                                        KeyModifiers::NONE,
+                                    ) if !search_active => {
+                                        selected = selected.saturating_sub(1);
+                                        mode = InputMode::TabChooser {
+                                            query,
+                                            cursor,
+                                            selected,
+                                            search_active,
+                                        };
+                                    }
                                     (KeyCode::Char('k'), m)
-                                        if m.contains(
-                                            KeyModifiers::CONTROL,
-                                        ) =>
+                                        if search_active
+                                            && m.contains(
+                                                KeyModifiers::CONTROL,
+                                            ) =>
                                     {
                                         selected = selected.saturating_sub(1);
                                         mode = InputMode::TabChooser {
@@ -1600,10 +1633,30 @@ impl ClientApp {
                                             search_active,
                                         };
                                     }
+                                    (
+                                        KeyCode::Char('j'),
+                                        KeyModifiers::NONE,
+                                    ) if !search_active => {
+                                        let tab_views = tabs.tab_views();
+                                        let len = matching_tab_indices(
+                                            &tab_views, &query,
+                                        )
+                                        .len();
+                                        if selected + 1 < len {
+                                            selected += 1;
+                                        }
+                                        mode = InputMode::TabChooser {
+                                            query,
+                                            cursor,
+                                            selected,
+                                            search_active,
+                                        };
+                                    }
                                     (KeyCode::Char('j'), m)
-                                        if m.contains(
-                                            KeyModifiers::CONTROL,
-                                        ) =>
+                                        if search_active
+                                            && m.contains(
+                                                KeyModifiers::CONTROL,
+                                            ) =>
                                     {
                                         let tab_views = tabs.tab_views();
                                         let len = matching_tab_indices(
@@ -1841,6 +1894,7 @@ impl ClientApp {
                                     mut title,
                                     mut title_cursor,
                                     mut editing_code,
+                                    return_to_tab_chooser,
                                     ..
                                 } => match key.code {
                                     KeyCode::Enter => {
@@ -1853,6 +1907,7 @@ impl ClientApp {
                                                 title_cursor,
                                                 editing_code,
                                                 error: None,
+                                                return_to_tab_chooser,
                                             };
                                         } else {
                                             match tabs.set_active_metadata(
@@ -1872,13 +1927,18 @@ impl ClientApp {
                                                             title_cursor,
                                                             editing_code: true,
                                                             error: Some(error),
+                                                            return_to_tab_chooser,
                                                         };
                                                 }
                                             }
                                         }
                                     }
                                     KeyCode::Esc => {
-                                        mode = InputMode::Normal;
+                                        mode = if return_to_tab_chooser {
+                                            default_tab_chooser_mode(&tabs)
+                                        } else {
+                                            InputMode::Normal
+                                        };
                                     }
                                     KeyCode::Tab | KeyCode::BackTab => {
                                         editing_code = !editing_code;
@@ -1889,6 +1949,7 @@ impl ClientApp {
                                             title_cursor,
                                             editing_code,
                                             error: None,
+                                            return_to_tab_chooser,
                                         };
                                     }
                                     KeyCode::Backspace => {
@@ -1924,6 +1985,7 @@ impl ClientApp {
                                             title_cursor,
                                             editing_code,
                                             error: None,
+                                            return_to_tab_chooser,
                                         };
                                     }
                                     KeyCode::Left => {
@@ -1941,6 +2003,7 @@ impl ClientApp {
                                             title_cursor,
                                             editing_code,
                                             error: None,
+                                            return_to_tab_chooser,
                                         };
                                     }
                                     KeyCode::Right => {
@@ -1962,6 +2025,7 @@ impl ClientApp {
                                             title_cursor,
                                             editing_code,
                                             error: None,
+                                            return_to_tab_chooser,
                                         };
                                     }
                                     KeyCode::Char(c)
@@ -1993,6 +2057,7 @@ impl ClientApp {
                                             title_cursor,
                                             editing_code,
                                             error: None,
+                                            return_to_tab_chooser,
                                         };
                                     }
                                     _ => {
@@ -2003,6 +2068,7 @@ impl ClientApp {
                                             title_cursor,
                                             editing_code,
                                             error: None,
+                                            return_to_tab_chooser,
                                         };
                                     }
                                 },
@@ -2427,11 +2493,14 @@ impl ClientApp {
         })();
 
         let _ = terminal::disable_raw_mode();
+        if keyboard_enhancement_enabled {
+            let _ =
+                execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+        }
         let _ = execute!(
             terminal.backend_mut(),
             DisableBracketedPaste,
             DisableMouseCapture,
-            PopKeyboardEnhancementFlags,
             LeaveAlternateScreen,
             SetCursorStyle::DefaultUserShape,
             cursor::Show
@@ -3156,6 +3225,7 @@ fn handle_paste_event(
             mut title,
             mut title_cursor,
             editing_code,
+            return_to_tab_chooser,
             ..
         } => {
             if editing_code {
@@ -3171,6 +3241,7 @@ fn handle_paste_event(
                 title_cursor,
                 editing_code,
                 error: None,
+                return_to_tab_chooser,
             };
         }
         InputMode::Command {
@@ -3468,10 +3539,11 @@ fn visible_entries_full<'a>(
 
 fn log_client(msg: &str) {
     use std::io::Write;
+    let path = std::env::temp_dir().join("zmux_client.log");
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/tmp/zmux_client.log")
+        .open(path)
     {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

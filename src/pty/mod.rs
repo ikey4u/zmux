@@ -59,6 +59,11 @@ pub fn spawn_pane(opts: SpawnOptions<'_>) -> io::Result<Pane> {
         cmd.arg("-i");
     }
 
+    #[cfg(windows)]
+    if opts.command.is_none() {
+        configure_windows_default_shell(&shell, &mut cmd);
+    }
+
     if let Some(dir) = opts.start_dir {
         cmd.cwd(dir);
     }
@@ -75,14 +80,6 @@ pub fn spawn_pane(opts: SpawnOptions<'_>) -> io::Result<Pane> {
     #[cfg(unix)]
     apply_host_termios_to_slave(&*pair.master);
 
-    #[cfg(windows)]
-    send_dsr_response(
-        &mut *pair
-            .master
-            .take_writer()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?,
-    );
-
     let child = pair
         .slave
         .spawn_command(cmd)
@@ -93,6 +90,11 @@ pub fn spawn_pane(opts: SpawnOptions<'_>) -> io::Result<Pane> {
         .master
         .take_writer()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+    #[cfg(windows)]
+    let mut writer = writer;
+    #[cfg(windows)]
+    send_dsr_response(&mut *writer);
 
     let mut term_state = AlacrittyTermState::new(opts.rows, opts.cols, 2000);
     term_state.set_scroll_on_erase_in_display(opts.scroll_on_erase_in_display);
@@ -227,12 +229,80 @@ fn resolve_shell(command: Option<&str>) -> String {
     }
     #[cfg(windows)]
     {
-        which::which("pwsh")
-            .or_else(|_| which::which("powershell"))
-            .or_else(|_| which::which("cmd"))
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| "cmd.exe".to_string())
+        resolve_windows_shell()
     }
+}
+
+#[cfg(windows)]
+fn resolve_windows_shell() -> String {
+    find_windows_executable("pwsh")
+        .or_else(|| find_windows_executable("powershell"))
+        .or_else(|| find_windows_executable("cmd"))
+        .or_else(|| std::env::var("COMSPEC").ok())
+        .unwrap_or_else(|| "cmd.exe".to_string())
+}
+
+#[cfg(windows)]
+fn configure_windows_default_shell(shell: &str, cmd: &mut CommandBuilder) {
+    if is_windows_powershell_shell(shell) {
+        cmd.arg("-NoLogo");
+        cmd.arg("-NoExit");
+        cmd.arg("-Command");
+        cmd.arg(windows_powershell_emacs_script());
+    }
+}
+
+#[cfg(windows)]
+fn is_windows_powershell_shell(shell: &str) -> bool {
+    let Some(name) = std::path::Path::new(shell)
+        .file_stem()
+        .and_then(|name| name.to_str())
+    else {
+        return false;
+    };
+    matches!(name.to_ascii_lowercase().as_str(), "pwsh" | "powershell")
+}
+
+#[cfg(windows)]
+fn windows_powershell_emacs_script() -> &'static str {
+    r"try { Import-Module PSReadLine -ErrorAction Stop; Set-PSReadLineOption -EditMode Emacs -ErrorAction Stop; function global:__zmux_bind($c,$f) { try { Set-PSReadLineKeyHandler -Chord $c -Function $f -ErrorAction Stop } catch {} }; __zmux_bind 'Ctrl+a' BeginningOfLine; __zmux_bind 'Ctrl+b' BackwardChar; __zmux_bind 'Ctrl+d' DeleteCharOrExit; __zmux_bind 'Ctrl+e' EndOfLine; __zmux_bind 'Ctrl+f' ForwardChar; __zmux_bind 'Ctrl+k' KillLine; __zmux_bind 'Ctrl+l' ClearScreen; __zmux_bind 'Ctrl+n' NextHistory; __zmux_bind 'Ctrl+p' PreviousHistory; __zmux_bind 'Ctrl+r' ReverseSearchHistory; __zmux_bind 'Ctrl+s' ForwardSearchHistory; __zmux_bind 'Ctrl+t' SwapCharacters; __zmux_bind 'Ctrl+u' BackwardKillInput; Remove-Item Function:\__zmux_bind -ErrorAction SilentlyContinue } catch {}"
+}
+
+#[cfg(windows)]
+fn find_windows_executable(name: &str) -> Option<String> {
+    let path = std::path::Path::new(name);
+    if path.components().count() > 1 && path.is_file() {
+        return Some(path.to_string_lossy().into_owned());
+    }
+
+    let path_env = std::env::var_os("PATH")?;
+    let pathext = std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    let names = if path.extension().is_some() {
+        vec![name.to_string()]
+    } else {
+        pathext
+            .split(';')
+            .filter(|ext| !ext.is_empty())
+            .map(|ext| {
+                if ext.starts_with('.') {
+                    format!("{}{}", name, ext)
+                } else {
+                    format!("{}.{}", name, ext)
+                }
+            })
+            .collect()
+    };
+
+    for dir in std::env::split_paths(&path_env) {
+        for candidate_name in &names {
+            let candidate = dir.join(candidate_name);
+            if candidate.is_file() {
+                return Some(candidate.to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
 }
 
 #[cfg(unix)]

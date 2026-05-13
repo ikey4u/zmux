@@ -62,7 +62,7 @@ Each tab is backed by an independent server. Sessions, windows, and panes are is
 
 | Shortcut / Action | Action |
 |-------------------|--------|
-| `Prefix + t` | Open the tab chooser. Use `↑`/`↓` or `Ctrl+j`/`Ctrl+k` to move, `/` or `?` to search by tab code/title, `R` to rename the selected tab, `Enter` to switch, and `q` or `Esc` to close |
+| `Prefix + t` | Open the tab chooser. Use `↑`/`↓` or `j`/`k` to move, `/` or `?` to search by tab code/title, `Ctrl+j`/`Ctrl+k` to move within search results while search is active, `R` to rename the selected tab, `Enter` to switch, and `q` or `Esc` to close |
 | `Prefix + Tab` | Switch to the next tab |
 | `Prefix + Shift+Tab` | Switch to the previous tab |
 | `Prefix + T` | Open the tab rename dialog. Use `Tab` to switch between the code and title fields. The two-letter code must be unique; press `Enter` to move from code to title and press `Enter` again to save, or `Esc` to cancel |
@@ -96,6 +96,8 @@ Each tab is backed by an independent server. Sessions, windows, and panes are is
 | `zmux -L <name>` | Specify the base socket name, defaulting to `default`. New tabs use derived socket names like `<name>.tab.<pid>.<id>` |
 | `zmux -s <name>` | Specify the name of the new session |
 | `zmux server` | Start the server in daemon mode. This is usually invoked automatically by zmux and does not need to be run manually |
+| `zmux kill-server [SOCKET]...` | Stop one or more background servers. Without arguments it stops the current `-L` socket |
+| `zmux kill-server --all` | Stop all discoverable background servers |
 
 #### Commands supported in command mode (`Prefix + :`)
 
@@ -154,8 +156,10 @@ follow the current pane's cwd unless one is explicitly set. After pressing
 `Prefix + H`, future splits use the pinned working directory instead. The
 following keys are not intercepted by zmux and are passed directly to the shell
 or program running in the active pane. By default, zsh panes start with the
-Emacs line editor keymap. If your shell configuration switches to another keymap,
-your own configuration takes precedence.
+Emacs line editor keymap. On Windows, default PowerShell panes initialize
+PSReadLine in Emacs mode when PSReadLine is available for cross-platform
+consistency. Explicit shell commands and interactive programs are not modified
+and may define their own bindings.
 
 | Key | Effect in the Shell |
 |-----|----------------------|
@@ -173,7 +177,7 @@ your own configuration takes precedence.
 | `Ctrl+s` | Search command history forward incrementally |
 | `Ctrl+t` | Transpose the two characters around the cursor |
 | `Ctrl+u` | Delete to the beginning of the line |
-| `Ctrl+z` | Suspend the current foreground process with `SIGTSTP` |
+| `Ctrl+z` | Suspend the current foreground process with `SIGTSTP` on Unix-like shells. Windows shells do not provide Unix job-control suspension, so the key is passed through |
 | Any other character or key combination | Pass through to the shell unchanged |
 
 > Type `exit` or press `Ctrl+d` inside a pane to close that pane.  

@@ -1,20 +1,17 @@
 use std::{
     ffi::OsStr,
     fs::OpenOptions,
-    io,
-    os::windows::{ffi::OsStrExt, fs::OpenOptionsExt},
+    io::{self, Read, Write},
+    os::windows::ffi::OsStrExt,
+    time::Duration,
 };
 
 use windows_sys::Win32::{
     Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
-    Storage::FileSystem::{
-        CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_NONE, GENERIC_READ,
-        GENERIC_WRITE, OPEN_EXISTING,
-    },
+    Storage::FileSystem::PIPE_ACCESS_DUPLEX,
     System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, PIPE_ACCESS_DUPLEX,
-        PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
-        PIPE_WAIT,
+        ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
+        PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     },
 };
 
@@ -37,7 +34,15 @@ pub struct PipeStream {
     inner: std::fs::File,
 }
 
+pub struct PipeIncoming<'a> {
+    listener: &'a PipeListener,
+}
+
 impl PipeListener {
+    pub fn incoming(&self) -> PipeIncoming<'_> {
+        PipeIncoming { listener: self }
+    }
+
     pub fn accept(&self) -> io::Result<PipeStream> {
         let name_w = to_wstring(&self.name);
         let handle = unsafe {
@@ -72,16 +77,38 @@ impl PipeListener {
     }
 }
 
-impl io::Read for PipeStream {
+impl Iterator for PipeIncoming<'_> {
+    type Item = io::Result<PipeStream>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        Some(self.listener.accept())
+    }
+}
+
+impl PipeStream {
+    pub fn try_clone(&self) -> io::Result<Self> {
+        self.inner.try_clone().map(|inner| Self { inner })
+    }
+
+    pub fn set_read_timeout(
+        &self,
+        _timeout: Option<Duration>,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Read for PipeStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.inner.read(buf)
     }
 }
 
-impl io::Write for PipeStream {
+impl Write for PipeStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.inner.write(buf)
     }
+
     fn flush(&mut self) -> io::Result<()> {
         self.inner.flush()
     }
