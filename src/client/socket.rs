@@ -31,6 +31,8 @@ fn log_socket(msg: &str) {
     }
 }
 
+const INPUT_CHUNK_SIZE: usize = 4096;
+
 pub struct SocketClient {
     socket_name: String,
     latest_frame: Arc<Mutex<Option<FrameData>>>,
@@ -242,7 +244,15 @@ impl SocketClient {
         self.frame_counter.load(Ordering::Relaxed)
     }
     pub fn send_input(&self, bytes: &[u8]) {
-        self.send_line(&format!("INPUT {}", encode_hex(bytes)));
+        let mut chunks = bytes.chunks(INPUT_CHUNK_SIZE).peekable();
+        while let Some(chunk) = chunks.next() {
+            if !self.send_line(&format!("INPUT {}", encode_hex(chunk))) {
+                break;
+            }
+            if chunks.peek().is_some() {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
     }
 
     pub fn run_command(&self, cmd: &str) {

@@ -79,11 +79,22 @@ fn snapshot_from_output_ring(pane: &Pane) -> Option<PaneTextSnapshot> {
     if ring_data.is_empty() {
         return None;
     }
-    let wide_cols = 500u16;
-    let rows = pane.last_rows.max(24);
-    let mut tmp_parser = AlacrittyTermState::new(rows, wide_cols, 2000);
-    tmp_parser.process(&ring_data);
-    Some(snapshot_from_parser(&tmp_parser))
+    Some(snapshot_from_output_bytes(
+        &ring_data,
+        pane.last_rows,
+        pane.last_cols,
+    ))
+}
+
+fn snapshot_from_output_bytes(
+    bytes: &[u8],
+    rows: u16,
+    cols: u16,
+) -> PaneTextSnapshot {
+    let mut tmp_parser =
+        AlacrittyTermState::new(rows.max(1), cols.max(1), 2000);
+    tmp_parser.process(bytes);
+    snapshot_from_parser(&tmp_parser)
 }
 
 fn snapshot_from_parser(parser: &AlacrittyTermState) -> PaneTextSnapshot {
@@ -1588,6 +1599,16 @@ mod tests {
         assert_eq!(snapshot.lines[1].text, "$");
         assert_eq!(snapshot.cursor_line, 1);
         assert_eq!(snapshot.cursor_col, 1);
+    }
+
+    #[test]
+    fn output_replay_preserves_zsh_missing_newline_output() {
+        let bytes = b"$ bash test.sh\r\n{\"code\":10008,\"msg\":\"access denied\"}\x1b[1m\x1b[7m%\x1b[27m\x1b[1m\x1b[0m                                                                               \r \r\r\x1b[0m\x1b[27m\x1b[24m\x1b[J$ ";
+        let snapshot = snapshot_from_output_bytes(bytes, 5, 80);
+        assert!(snapshot
+            .lines
+            .iter()
+            .any(|line| line.text.contains("access denied")));
     }
 
     #[test]

@@ -112,8 +112,9 @@ impl InProcessServer {
         if let Some(pane) =
             crate::layout::active_pane_mut(&mut win.root, &win.active_pane_path)
         {
-            let _ = pane.writer.write_all(bytes);
-            let _ = pane.writer.flush();
+            if let Err(e) = write_pty_input(&mut *pane.writer, bytes) {
+                log_server(&format!("input write failed: {}", e));
+            }
         }
     }
 
@@ -649,8 +650,9 @@ where
                     &mut win.root,
                     &win.active_pane_path,
                 ) {
-                    let _ = pane.writer.write_all(&bytes);
-                    let _ = pane.writer.flush();
+                    if let Err(e) = write_pty_input(&mut *pane.writer, &bytes) {
+                        log_server(&format!("input write failed: {}", e));
+                    }
                 }
             }
         } else if line.starts_with("CMD ") {
@@ -1036,6 +1038,33 @@ fn build_session_tree_json(state: &Arc<Mutex<Server>>) -> String {
     }
     out.push(']');
     out
+}
+
+fn write_pty_input(writer: &mut dyn Write, bytes: &[u8]) -> io::Result<()> {
+    let mut written = 0usize;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while written < bytes.len() {
+        match writer.write(&bytes[written..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "pty write returned zero bytes",
+                ));
+            }
+            Ok(n) => {
+                written += n;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(e);
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    writer.flush()
 }
 
 fn parse_size_line(s: &str) -> Option<(u16, u16)> {
@@ -1695,6 +1724,16 @@ fn cmd_split_window(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
         };
         let pane_id = session.next_pane_id;
         session.next_pane_id += 1;
+
+        if let Some(win) = session.windows.get_mut(session.active_window_idx) {
+            if let Some(zoom) = win.zoom_state.take() {
+                let active_id = zoom.zoomed_pane_id;
+                restore_split_sizes(&mut win.root, &[], &zoom.saved_sizes);
+                win.active_pane_path =
+                    crate::layout::find_pane_path(&win.root, active_id)
+                        .unwrap_or_else(|| first_leaf_path(&win.root));
+            }
+        }
 
         let (fallback_rows, fallback_cols) = root_pane_size(sz);
         let (rows, cols, start_dir) = {
@@ -2393,6 +2432,39 @@ mod tests {
 
         assert_eq!(state.active_session_idx, 1);
         assert_eq!(active_pane_size(&state), expected);
+        Ok(())
+    }
+
+    #[test]
+    fn split_window_unzooms_before_splitting() -> io::Result<()> {
+        let sz = Size::new(24, 80);
+        let full_size = root_pane_size(sz);
+        let mut state = Server::new();
+        make_session(&mut state, "0", sz)?;
+
+        let mut split_cmd = ParsedCommand::parse("split-window -h");
+        cmd_split_window(&mut state, &split_cmd.remove(0), sz);
+        let zoomed_id = {
+            let session = &state.sessions[0];
+            let win = &session.windows[0];
+            crate::layout::active_pane(&win.root, &win.active_pane_path)
+                .unwrap()
+                .id
+        };
+
+        cmd_zoom_pane(&mut state, sz);
+        assert!(state.sessions[0].windows[0].zoom_state.is_some());
+        assert_eq!(active_pane_size(&state), full_size);
+
+        let mut split_zoomed_cmd = ParsedCommand::parse("split-window -h");
+        cmd_split_window(&mut state, &split_zoomed_cmd.remove(0), sz);
+
+        let win = &state.sessions[0].windows[0];
+        assert!(win.zoom_state.is_none());
+        assert_eq!(crate::layout::leaf_count(&win.root), 3);
+        let zoomed_pane =
+            crate::layout::find_pane_by_id(&win.root, zoomed_id).unwrap();
+        assert!(zoomed_pane.last_cols < full_size.1);
         Ok(())
     }
 
