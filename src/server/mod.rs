@@ -1588,13 +1588,27 @@ fn active_window_start_dir(session: &Session) -> Option<String> {
         .or_else(crate::pty::default_start_dir)
 }
 
+#[cfg(test)]
 fn make_session(state: &mut Server, name: &str, sz: Size) -> io::Result<()> {
+    make_session_with_start_dir(
+        state,
+        name,
+        sz,
+        crate::pty::default_start_dir(),
+    )
+}
+
+fn make_session_with_start_dir(
+    state: &mut Server,
+    name: &str,
+    sz: Size,
+    start_dir: Option<String>,
+) -> io::Result<()> {
     let session_id = state.alloc_session_id();
     let mut session = Session::new(session_id, name.to_string());
     session.options = SessionOptions::with_defaults();
     let pane_id = session.alloc_pane_id();
     let window_id = session.alloc_window_id();
-    let start_dir = crate::pty::default_start_dir();
     let (rows, cols) = root_pane_size(sz);
     let pane = spawn_pane(SpawnOptions {
         pane_id,
@@ -1617,7 +1631,7 @@ fn make_session(state: &mut Server, name: &str, sz: Size) -> io::Result<()> {
         layout_index: 0,
         last_output_time: Instant::now(),
         last_seen_version: 0,
-        default_start_dir: None,
+        default_start_dir: start_dir.clone(),
     };
     session.windows.push(win);
     state.sessions.push(session);
@@ -1632,7 +1646,13 @@ fn cmd_new_session(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
     if state.find_session(&name).is_some() {
         return;
     }
-    let _ = make_session(state, &name, sz);
+    let start_dir = state
+        .active_session()
+        .and_then(active_window_start_dir)
+        .or_else(crate::pty::default_start_dir);
+    if make_session_with_start_dir(state, &name, sz, start_dir).is_err() {
+        return;
+    }
     let new_idx = state.sessions.len() - 1;
     if !cmd.flag("d") {
         state.active_session_idx = new_idx;
