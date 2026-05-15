@@ -288,9 +288,21 @@ impl SocketClient {
         ws.write_all(b"KILL_SERVER\n")?;
         ws.flush()?;
         let mut buf_reader = reader;
-        let _ = recv_resp(&mut buf_reader)?;
-        cleanup_killed_socket(socket_name);
-        Ok(())
+        match recv_resp(&mut buf_reader) {
+            Ok(_) => {
+                cleanup_killed_socket(socket_name);
+                Ok(())
+            }
+            Err(e) => {
+                thread::sleep(Duration::from_millis(50));
+                if server_reachable(socket_name) {
+                    Err(e)
+                } else {
+                    cleanup_killed_socket(socket_name);
+                    Ok(())
+                }
+            }
+        }
     }
 
     pub fn run_command_with_output(&self, cmd: &str) -> String {
@@ -539,6 +551,10 @@ impl SocketClient {
         let mut buf_reader = reader;
         recv_resp(&mut buf_reader).unwrap_or_default()
     }
+}
+
+fn server_reachable(socket_name: &str) -> bool {
+    connect_client(socket_name).is_ok()
 }
 
 #[cfg(unix)]

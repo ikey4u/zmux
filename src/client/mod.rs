@@ -130,14 +130,19 @@ impl TabManager {
         clean: bool,
         start_dir: Option<String>,
     ) -> io::Result<Self> {
-        let client = ensure_server_and_connect(
+        let (client, existing_server) = ensure_server_and_connect(
             base_socket,
             session_name,
             size,
             clean,
             start_dir.as_deref(),
         )?;
-        let stored = load_tab_metadata().remove(base_socket);
+        let stored = if existing_server {
+            load_tab_metadata().remove(base_socket)
+        } else {
+            remove_tab_metadata_for_socket_family(base_socket);
+            None
+        };
         let code = stored
             .as_ref()
             .and_then(|meta| meta.code.as_deref())
@@ -320,7 +325,7 @@ impl TabManager {
         self.next_id += 1;
         let socket_name =
             format!("{}.tab.{}.{}", self.base_socket, std::process::id(), id);
-        let client = ensure_server_and_connect(
+        let (client, _) = ensure_server_and_connect(
             &socket_name,
             "0",
             size,
@@ -476,7 +481,15 @@ impl TabManager {
     }
 
     fn kill_socket(&mut self, socket_name: &str) -> io::Result<bool> {
-        SocketClient::kill_server_socket(socket_name)?;
+        match SocketClient::kill_server_socket(socket_name) {
+            Ok(()) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+                ) => {}
+            Err(e) => return Err(e),
+        }
         self.killed_sockets.insert(socket_name.to_string());
         if let Err(e) = remove_tab_metadata(socket_name) {
             log_client(&format!(
@@ -765,6 +778,31 @@ fn remove_tab_metadata(socket_name: &str) -> io::Result<()> {
     let _lock = TabMetadataLock::acquire(&path)?;
     let mut metadata = read_tab_metadata_file(&path).unwrap_or_default();
     metadata.remove(socket_name);
+    write_tab_metadata_atomic(&path, &metadata)
+}
+
+fn remove_tab_metadata_for_socket_family(socket_name: &str) {
+    if let Err(e) = remove_tab_metadata_for_socket_family_inner(socket_name) {
+        log_client(&format!(
+            "failed to remove stale tab metadata for '{}': {}",
+            socket_name, e
+        ));
+    }
+}
+
+fn remove_tab_metadata_for_socket_family_inner(
+    socket_name: &str,
+) -> io::Result<()> {
+    let path = tab_metadata_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _lock = TabMetadataLock::acquire(&path)?;
+    let mut metadata = read_tab_metadata_file(&path).unwrap_or_default();
+    let tab_prefix = format!("{}.tab.", socket_name);
+    metadata.retain(|name, _| {
+        name != socket_name && !name.starts_with(&tab_prefix)
+    });
     write_tab_metadata_atomic(&path, &metadata)
 }
 
@@ -4550,7 +4588,7 @@ fn ensure_server_and_connect(
     size: Size,
     clean: bool,
     start_dir: Option<&str>,
-) -> io::Result<SocketClient> {
+) -> io::Result<(SocketClient, bool)> {
     log_client(&format!(
         "ensure_server_and_connect socket='{}' session='{}' size={}x{} clean={} start_dir={:?}",
         socket_name, session_name, size.rows, size.cols, clean, start_dir
@@ -4560,7 +4598,7 @@ fn ensure_server_and_connect(
         match SocketClient::connect(socket_name, size) {
             Ok(client) => {
                 log_client("connected to existing server");
-                return Ok(client);
+                return Ok((client, true));
             }
             Err(e) => {
                 log_client(&format!("connect failed: {}", e));
@@ -4605,7 +4643,7 @@ fn ensure_server_and_connect(
         match SocketClient::connect(socket_name, size) {
             Ok(client) => {
                 log_client(&format!("connected after {}ms", (i + 1) * 50));
-                return Ok(client);
+                return Ok((client, false));
             }
             Err(e) if i % 10 == 9 => {
                 log_client(&format!(
