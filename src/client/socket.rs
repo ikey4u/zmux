@@ -1,7 +1,7 @@
 use std::{
     io::{self, BufReader, Write},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     thread,
@@ -38,6 +38,7 @@ pub struct SocketClient {
     latest_frame: Arc<Mutex<Option<FrameData>>>,
     write_stream: Arc<Mutex<Box<dyn Write + Send>>>,
     frame_counter: Arc<AtomicU64>,
+    shutdown: Arc<AtomicBool>,
 }
 
 fn exit_frame() -> FrameData {
@@ -131,7 +132,9 @@ impl SocketClient {
                 }
             };
 
-        probe_reader.get_ref().set_read_timeout(None)?;
+        probe_reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(2)))?;
 
         let mut control_stream = connect_client(socket_name)?;
         control_stream.write_all(
@@ -148,15 +151,20 @@ impl SocketClient {
         let frame_write_arc: Arc<Mutex<Box<dyn Write + Send>>> =
             Arc::new(Mutex::new(Box::new(writer)));
         let frame_counter: Arc<AtomicU64> = Arc::new(AtomicU64::new(1));
+        let shutdown: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
         let frame_arc = Arc::clone(&latest_frame);
         let ws_poll = Arc::clone(&frame_write_arc);
         let counter_arc = Arc::clone(&frame_counter);
+        let shutdown_poll = Arc::clone(&shutdown);
 
         thread::spawn(move || {
             let mut reader = probe_reader;
             let mut last_frame_json = first_frame_json;
             loop {
+                if shutdown_poll.load(Ordering::Relaxed) {
+                    break;
+                }
                 {
                     let mut ws = match ws_poll.lock() {
                         Ok(ws) => ws,
@@ -181,6 +189,9 @@ impl SocketClient {
                     Ok(json) => {
                         if json == last_frame_json {
                             thread::sleep(Duration::from_millis(16));
+                            if shutdown_poll.load(Ordering::Relaxed) {
+                                break;
+                            }
                             continue;
                         }
                         last_frame_json = json.clone();
@@ -205,6 +216,15 @@ impl SocketClient {
                         }
                     }
                     Err(e) => {
+                        if shutdown_poll.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                        ) {
+                            continue;
+                        }
                         store_exit_frame(
                             &frame_arc,
                             &format!(
@@ -224,6 +244,7 @@ impl SocketClient {
             latest_frame,
             write_stream: write_arc,
             frame_counter,
+            shutdown,
         })
     }
 
@@ -257,6 +278,19 @@ impl SocketClient {
 
     pub fn run_command(&self, cmd: &str) {
         self.send_line(&format!("CMD {}", cmd));
+    }
+
+    pub fn kill_server_socket(socket_name: &str) -> io::Result<()> {
+        let stream = connect_client(socket_name)?;
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut ws = stream.try_clone()?;
+        let reader = BufReader::new(stream);
+        ws.write_all(b"KILL_SERVER\n")?;
+        ws.flush()?;
+        let mut buf_reader = reader;
+        let _ = recv_resp(&mut buf_reader)?;
+        cleanup_killed_socket(socket_name);
+        Ok(())
     }
 
     pub fn run_command_with_output(&self, cmd: &str) -> String {
@@ -332,8 +366,13 @@ impl SocketClient {
         false
     }
 
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+    }
+
     pub fn detach(&self) {
         self.send_line("CMD detach");
+        self.shutdown();
     }
 
     pub fn active_window_name(&self) -> String {
@@ -499,6 +538,22 @@ impl SocketClient {
         }
         let mut buf_reader = reader;
         recv_resp(&mut buf_reader).unwrap_or_default()
+    }
+}
+
+#[cfg(unix)]
+fn cleanup_killed_socket(socket_name: &str) {
+    if let Ok(path) = crate::ipc::socket_path(socket_name) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(windows)]
+fn cleanup_killed_socket(_socket_name: &str) {}
+
+impl Drop for SocketClient {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
     }
 }
 

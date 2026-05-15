@@ -101,6 +101,8 @@ pub struct ClientTabView {
     pub code: String,
     pub title: String,
     pub state: ClientTabState,
+    pub socket_name: String,
+    pub visible: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -556,6 +558,28 @@ pub fn tab_bar_hit(
     None
 }
 
+pub fn last_visible_tab_index(
+    tabs: &[ClientTabView],
+    width: u16,
+) -> Option<usize> {
+    let mut used = 0usize;
+    let max_width = width as usize;
+    let ellipsis_width = unicode_display_width(" ... ");
+
+    for (index, tab) in tabs.iter().enumerate() {
+        let last = index + 1 == tabs.len();
+        let segment_width = tab_segment_width(tab);
+        if last {
+            return (used + segment_width <= max_width).then_some(index);
+        }
+        if used + segment_width + ellipsis_width > max_width {
+            return index.checked_sub(1);
+        }
+        used += segment_width;
+    }
+    None
+}
+
 fn render_tab_bar(f: &mut Frame, tabs: &[ClientTabView], area: Rect) {
     if area.height == 0 {
         return;
@@ -681,7 +705,7 @@ pub fn render_tab_chooser(
     };
     f.render_widget(Clear, panel);
     let block = Block::default()
-        .title(" Tabs  (/ or ?=search  j/k=move  search: Ctrl+j/k  R=rename  Enter=switch  Esc/q=close) ")
+        .title(" Tabs  Space=show/hide  K=kill  R=rename  Enter=switch  /=search  Esc/q=close ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(panel);
@@ -755,7 +779,8 @@ pub fn render_tab_chooser(
         } else {
             &tab.title
         };
-        let label = format!(" {}{} {}", tab.code, state, title);
+        let checkbox = if tab.visible { "[x]" } else { "[ ]" };
+        let label = format!(" {} {}{} {}", checkbox, tab.code, state, title);
         let style = if is_selected {
             Style::default()
                 .fg(Color::Black)
@@ -786,6 +811,7 @@ fn tab_matches(tab: &ClientTabView, query: &str) -> bool {
     query.is_empty()
         || tab.code.to_lowercase().contains(&query)
         || tab.title.to_lowercase().contains(&query)
+        || tab.socket_name.to_lowercase().contains(&query)
 }
 
 pub fn render_rename_tab_panel(

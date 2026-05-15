@@ -8,7 +8,7 @@ use zmux::{client::ClientApp, platform::setup_signals};
     name = "zmux",
     version,
     about = "Cross-platform terminal multiplexer",
-    after_help = "Examples:\n  Start or attach to the default zmux server:\n    zmux\n\n  Start an isolated test instance without touching your current session:\n    zmux --clean -L test-scroll\n\n  Attach to that isolated test instance from another terminal:\n    zmux -L test-scroll a\n\n  List sessions for that isolated test instance:\n    zmux -L test-scroll ls\n\n  Start in a specific working directory:\n    zmux -c /path/to/project\n\n  Open the runtime options panel inside zmux:\n    Prefix + O"
+    after_help = "Examples:\n  Start or attach to the default zmux server:\n    zmux\n\n  Start an isolated test instance without touching your current session:\n    zmux --clean -L test-scroll\n\n  Attach to all running servers as tabs:\n    zmux a\n\n  Attach only to the selected socket:\n    zmux -L test-scroll a --single\n\n  List sessions for that isolated test instance:\n    zmux -L test-scroll ls\n\n  Start in a specific working directory:\n    zmux -c /path/to/project\n\n  Open the runtime options panel inside zmux:\n    Prefix + O"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -40,6 +40,10 @@ enum Cmd {
     Attach {
         #[arg(short = 't', long)]
         target: Option<String>,
+        #[arg(short = 'a', long, hide = true)]
+        all: bool,
+        #[arg(long)]
+        single: bool,
     },
     #[command(name = "ls", alias = "list-sessions")]
     Ls,
@@ -80,9 +84,24 @@ fn main() -> io::Result<()> {
             )
             .run()?;
         }
-        Some(Cmd::Attach { target }) => {
-            ClientApp::new(&socket, target, cli.clean, cli.directory.clone())
+        Some(Cmd::Attach { target, single, .. }) => {
+            if single {
+                ClientApp::new(
+                    &socket,
+                    target,
+                    cli.clean,
+                    cli.directory.clone(),
+                )
                 .run()?;
+            } else {
+                ClientApp::new_attach_all(
+                    &socket,
+                    target,
+                    cli.clean,
+                    cli.directory.clone(),
+                )
+                .run()?;
+            }
         }
         Some(Cmd::Ls) => {
             run_ls(&socket)?;

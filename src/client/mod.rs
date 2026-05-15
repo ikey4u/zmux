@@ -18,6 +18,7 @@ use crossterm::{
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
+use serde::{Deserialize, Serialize};
 
 mod render;
 mod socket;
@@ -37,6 +38,7 @@ pub struct ClientApp {
     pub clean: bool,
     pub start_dir: Option<String>,
     pub initial_tab_title: Option<String>,
+    pub attach_all: bool,
 }
 
 #[derive(Clone, PartialEq)]
@@ -67,6 +69,11 @@ enum InputMode {
         error: Option<String>,
         return_to_tab_chooser: bool,
     },
+    ConfirmKillTab {
+        socket_name: String,
+        label: String,
+        return_to_tab_chooser: bool,
+    },
     Command {
         buf: String,
         cursor: usize,
@@ -95,7 +102,15 @@ const SCROLL_LINES: usize = 3;
 struct ClientTab {
     code: String,
     title: String,
+    socket_name: String,
     client: SocketClient,
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+struct StoredTabMetadata {
+    code: Option<String>,
+    title: Option<String>,
+    visible: Option<bool>,
 }
 
 struct TabManager {
@@ -104,6 +119,7 @@ struct TabManager {
     base_socket: String,
     start_dir: Option<String>,
     next_id: usize,
+    killed_sockets: std::collections::HashSet<String>,
 }
 
 impl TabManager {
@@ -121,16 +137,95 @@ impl TabManager {
             clean,
             start_dir.as_deref(),
         )?;
+        let stored = load_tab_metadata().remove(base_socket);
+        let code = stored
+            .as_ref()
+            .and_then(|meta| meta.code.as_deref())
+            .and_then(|code| normalize_tab_code(code).ok())
+            .unwrap_or_else(|| tab_code(0));
+        let title = stored.and_then(|meta| meta.title).unwrap_or_default();
         Ok(Self {
             tabs: vec![ClientTab {
-                code: tab_code(0),
-                title: String::new(),
+                code,
+                title,
+                socket_name: base_socket.to_string(),
                 client,
             }],
             active: 0,
             base_socket: base_socket.to_string(),
             start_dir,
             next_id: 1,
+            killed_sockets: std::collections::HashSet::new(),
+        })
+    }
+
+    fn from_existing_sockets(
+        base_socket: &str,
+        socket_names: Vec<String>,
+        target_session: Option<&str>,
+        size: Size,
+        start_dir: Option<String>,
+    ) -> io::Result<Self> {
+        let metadata = load_tab_metadata();
+        let mut tabs = Vec::new();
+        for socket_name in socket_names {
+            match SocketClient::connect(&socket_name, size) {
+                Ok(client) => {
+                    if let Some(target) = target_session {
+                        client.run_command(&format!(
+                            "switch-client -t {}",
+                            shell_quote(target)
+                        ));
+                    }
+                    let stored = metadata.get(&socket_name);
+                    if stored.and_then(|meta| meta.visible) == Some(false) {
+                        continue;
+                    }
+                    let code = stored
+                        .and_then(|meta| meta.code.as_deref())
+                        .and_then(|code| normalize_tab_code(code).ok())
+                        .filter(|code| {
+                            !tabs
+                                .iter()
+                                .any(|tab: &ClientTab| tab.code == *code)
+                        })
+                        .unwrap_or_else(|| {
+                            next_available_tab_code(&tabs, tabs.len())
+                        });
+                    let title = stored
+                        .and_then(|meta| meta.title.clone())
+                        .unwrap_or_else(|| {
+                            attach_tab_title(base_socket, &socket_name)
+                        });
+                    tabs.push(ClientTab {
+                        code,
+                        title,
+                        socket_name,
+                        client,
+                    });
+                }
+                Err(e) => {
+                    log_client(&format!(
+                        "attach-all skipped socket '{}': {}",
+                        socket_name, e
+                    ));
+                    cleanup_stale_socket(&socket_name, &e);
+                }
+            }
+        }
+        if tabs.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no attachable zmux servers found",
+            ));
+        }
+        Ok(Self {
+            active: 0,
+            base_socket: base_socket.to_string(),
+            start_dir,
+            next_id: tabs.len().max(1),
+            tabs,
+            killed_sockets: std::collections::HashSet::new(),
         })
     }
 
@@ -150,6 +245,18 @@ impl TabManager {
         self.tabs[self.active].title.clone()
     }
 
+    fn active_socket_name(&self) -> String {
+        self.tabs[self.active].socket_name.clone()
+    }
+
+    fn active_title_for_confirm(&self) -> String {
+        if self.tabs[self.active].title.is_empty() {
+            self.tabs[self.active].socket_name.clone()
+        } else {
+            self.tabs[self.active].title.clone()
+        }
+    }
+
     fn select(&mut self, index: usize) -> bool {
         if index >= self.tabs.len() {
             return false;
@@ -158,8 +265,34 @@ impl TabManager {
         true
     }
 
+    fn select_socket(&mut self, socket_name: &str) -> bool {
+        if let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.socket_name == socket_name)
+        {
+            self.active = index;
+            true
+        } else {
+            false
+        }
+    }
+
     fn set_active_title(&mut self, title: String) {
         self.tabs[self.active].title = title;
+        self.persist_active_metadata();
+    }
+
+    fn persist_active_metadata(&self) {
+        let tab = &self.tabs[self.active];
+        if let Err(e) =
+            store_tab_metadata(&tab.socket_name, &tab.code, &tab.title)
+        {
+            log_client(&format!(
+                "failed to store tab metadata for '{}': {}",
+                tab.socket_name, e
+            ));
+        }
     }
 
     fn set_active_metadata(
@@ -178,6 +311,7 @@ impl TabManager {
         }
         self.tabs[self.active].code = code;
         self.tabs[self.active].title = title;
+        self.persist_active_metadata();
         Ok(())
     }
 
@@ -197,6 +331,7 @@ impl TabManager {
         self.tabs.push(ClientTab {
             code,
             title: String::new(),
+            socket_name,
             client,
         });
         self.active = self.tabs.len() - 1;
@@ -219,8 +354,47 @@ impl TabManager {
         true
     }
 
+    fn ensure_active_visible(&mut self, width: u16) -> bool {
+        if self.tabs.len() <= 1 {
+            return false;
+        }
+        let Some(last_visible) =
+            last_visible_tab_index(&self.tab_views(), width)
+        else {
+            return false;
+        };
+        if self.active <= last_visible {
+            return false;
+        }
+        self.tabs.swap(self.active, last_visible);
+        self.active = last_visible;
+        true
+    }
+
     fn close_active(&mut self) -> bool {
+        self.set_active_visibility(false);
         self.tabs[self.active].client.detach();
+        self.remove_active()
+    }
+
+    fn close_dead_active(&mut self) -> bool {
+        self.set_active_visibility(false);
+        self.remove_active()
+    }
+
+    fn set_active_visibility(&self, visible: bool) {
+        let tab = &self.tabs[self.active];
+        if let Err(e) =
+            set_tab_visibility(&tab.socket_name, &tab.code, &tab.title, visible)
+        {
+            log_client(&format!(
+                "failed to store tab visibility for '{}': {}",
+                tab.socket_name, e
+            ));
+        }
+    }
+
+    fn remove_active(&mut self) -> bool {
         self.tabs.remove(self.active);
         if self.tabs.is_empty() {
             return true;
@@ -229,6 +403,129 @@ impl TabManager {
             self.active = self.tabs.len() - 1;
         }
         false
+    }
+
+    fn show_socket(&mut self, socket_name: &str, size: Size) -> io::Result<()> {
+        if self.tabs.iter().any(|tab| tab.socket_name == socket_name) {
+            if let Some(index) = self
+                .tabs
+                .iter()
+                .position(|tab| tab.socket_name == socket_name)
+            {
+                let tab = &self.tabs[index];
+                set_tab_visibility(socket_name, &tab.code, &tab.title, true)?;
+            }
+            return Ok(());
+        }
+        let metadata = load_tab_metadata();
+        let stored = metadata.get(socket_name);
+        let code = stored
+            .and_then(|meta| meta.code.as_deref())
+            .and_then(|code| normalize_tab_code(code).ok())
+            .filter(|code| !self.tabs.iter().any(|tab| tab.code == *code))
+            .unwrap_or_else(|| {
+                next_available_tab_code(&self.tabs, self.tabs.len())
+            });
+        let title =
+            stored
+                .and_then(|meta| meta.title.clone())
+                .unwrap_or_else(|| {
+                    attach_tab_title(&self.base_socket, socket_name)
+                });
+        let client = SocketClient::connect(socket_name, size)?;
+        set_tab_visibility(socket_name, &code, &title, true)?;
+        self.tabs.push(ClientTab {
+            code,
+            title,
+            socket_name: socket_name.to_string(),
+            client,
+        });
+        Ok(())
+    }
+
+    fn hide_socket(&mut self, socket_name: &str) -> Result<(), String> {
+        if self.tabs.len() <= 1 {
+            return Err("cannot hide the last visible tab".to_string());
+        }
+        let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.socket_name == socket_name)
+        else {
+            return Ok(());
+        };
+        if let Err(e) = set_tab_visibility(
+            socket_name,
+            &self.tabs[index].code,
+            &self.tabs[index].title,
+            false,
+        ) {
+            log_client(&format!(
+                "failed to store tab visibility for '{}': {}",
+                socket_name, e
+            ));
+        }
+        self.tabs[index].client.detach();
+        self.tabs.remove(index);
+        if self.active >= self.tabs.len() {
+            self.active = self.tabs.len() - 1;
+        } else if index < self.active {
+            self.active -= 1;
+        }
+        Ok(())
+    }
+
+    fn kill_socket(&mut self, socket_name: &str) -> io::Result<bool> {
+        SocketClient::kill_server_socket(socket_name)?;
+        self.killed_sockets.insert(socket_name.to_string());
+        if let Err(e) = remove_tab_metadata(socket_name) {
+            log_client(&format!(
+                "failed to remove tab metadata for '{}': {}",
+                socket_name, e
+            ));
+        }
+        cleanup_killed_socket(socket_name);
+        if let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.socket_name == socket_name)
+        {
+            self.tabs[index].client.shutdown();
+            self.tabs.remove(index);
+            if self.tabs.is_empty() {
+                return Ok(true);
+            }
+            if self.active >= self.tabs.len() {
+                self.active = self.tabs.len() - 1;
+            } else if index < self.active {
+                self.active -= 1;
+            }
+        }
+        Ok(self.tabs.is_empty())
+    }
+
+    fn remove_dead_inactive(&mut self) -> usize {
+        let mut removed = 0;
+        let mut index = 0;
+        while index < self.tabs.len() {
+            let dead = index != self.active
+                && self.tabs[index]
+                    .client
+                    .latest_frame()
+                    .as_ref()
+                    .is_some_and(|frame| frame.exit);
+            if dead {
+                self.tabs[index].client.shutdown();
+                self.tabs.remove(index);
+                removed += 1;
+                if index < self.active {
+                    self.active -= 1;
+                }
+            } else {
+                index += 1;
+            }
+        }
+        removed
     }
 
     fn detach_all(&self) {
@@ -247,26 +544,65 @@ impl TabManager {
         self.tabs
             .iter()
             .enumerate()
-            .map(|(index, tab)| {
-                let dead = tab
-                    .client
-                    .latest_frame()
-                    .as_ref()
-                    .is_some_and(|frame| frame.exit);
-                let state = if dead {
-                    ClientTabState::Dead
-                } else if index == self.active {
-                    ClientTabState::Active
-                } else {
-                    ClientTabState::Inactive
-                };
-                ClientTabView {
-                    code: tab.code.clone(),
-                    title: tab.title.clone(),
-                    state,
-                }
-            })
+            .map(|(index, tab)| self.tab_view_for(index, tab))
             .collect()
+    }
+
+    fn tab_chooser_views(&self) -> Vec<ClientTabView> {
+        let mut views = self.tab_views();
+        let metadata = load_tab_metadata();
+        let socket_names = discover_all_socket_names(&self.base_socket)
+            .unwrap_or_else(|e| {
+                log_client(&format!("failed to discover sockets: {}", e));
+                Vec::new()
+            });
+        for socket_name in socket_names {
+            if self.killed_sockets.contains(&socket_name) {
+                continue;
+            }
+            if views.iter().any(|tab| tab.socket_name == socket_name) {
+                continue;
+            }
+            let stored = metadata.get(&socket_name);
+            let code =
+                stored.and_then(|meta| meta.code.clone()).unwrap_or_else(
+                    || next_available_view_code(&views, views.len()),
+                );
+            let title =
+                stored.and_then(|meta| meta.title.clone()).unwrap_or_else(
+                    || attach_tab_title(&self.base_socket, &socket_name),
+                );
+            views.push(ClientTabView {
+                code,
+                title,
+                state: ClientTabState::Inactive,
+                socket_name,
+                visible: false,
+            });
+        }
+        views
+    }
+
+    fn tab_view_for(&self, index: usize, tab: &ClientTab) -> ClientTabView {
+        let dead = tab
+            .client
+            .latest_frame()
+            .as_ref()
+            .is_some_and(|frame| frame.exit);
+        let state = if dead {
+            ClientTabState::Dead
+        } else if index == self.active {
+            ClientTabState::Active
+        } else {
+            ClientTabState::Inactive
+        };
+        ClientTabView {
+            code: tab.code.clone(),
+            title: tab.title.clone(),
+            state,
+            socket_name: tab.socket_name.clone(),
+            visible: true,
+        }
     }
 }
 
@@ -277,7 +613,295 @@ fn tab_code(index: usize) -> String {
     format!("{}{}", first, second)
 }
 
+fn attach_tab_title(base_socket: &str, socket_name: &str) -> String {
+    let tab_prefix = format!("{}.tab.", base_socket);
+    if socket_name == base_socket {
+        return socket_name.to_string();
+    }
+    if let Some(rest) = socket_name.strip_prefix(&tab_prefix) {
+        if let Some((_, id)) = rest.rsplit_once('.') {
+            return format!("{}:{}", base_socket, id);
+        }
+    }
+    socket_name.to_string()
+}
+
+type TabMetadataMap = std::collections::BTreeMap<String, StoredTabMetadata>;
+
+struct TabMetadataLock {
+    file: std::fs::File,
+}
+
+impl TabMetadataLock {
+    fn acquire(data_path: &std::path::Path) -> io::Result<Self> {
+        let lock_path = data_path.with_file_name(format!(
+            "{}.lock",
+            data_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("tab-metadata.json")
+        ));
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&lock_path)?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { file }),
+                Err(std::fs::TryLockError::WouldBlock)
+                    if Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+}
+
+impl Drop for TabMetadataLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+fn read_tab_metadata_file(path: &std::path::Path) -> Option<TabMetadataMap> {
+    let data = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+fn load_tab_metadata() -> TabMetadataMap {
+    if let Ok(path) = tab_metadata_path() {
+        let metadata = {
+            let _lock = TabMetadataLock::acquire(&path).ok();
+            read_tab_metadata_file(&path)
+        };
+        if let Some(metadata) = metadata {
+            if !metadata.is_empty() {
+                return metadata;
+            }
+        }
+    }
+    if let Ok(path) = legacy_tab_metadata_path() {
+        if let Some(metadata) = read_tab_metadata_file(&path) {
+            if !metadata.is_empty() {
+                if let Err(e) = write_tab_metadata(&metadata) {
+                    log_client(&format!(
+                        "failed to migrate tab metadata: {}",
+                        e
+                    ));
+                }
+            }
+            return metadata;
+        }
+    }
+    TabMetadataMap::new()
+}
+
+fn store_tab_metadata(
+    socket_name: &str,
+    code: &str,
+    title: &str,
+) -> io::Result<()> {
+    let path = tab_metadata_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _lock = TabMetadataLock::acquire(&path)?;
+    let mut metadata = read_tab_metadata_file(&path)
+        .or_else(|| {
+            legacy_tab_metadata_path()
+                .ok()
+                .and_then(|path| read_tab_metadata_file(&path))
+        })
+        .unwrap_or_default();
+    metadata.insert(
+        socket_name.to_string(),
+        StoredTabMetadata {
+            code: Some(code.to_string()),
+            title: Some(title.to_string()),
+            visible: metadata
+                .get(socket_name)
+                .and_then(|meta| meta.visible)
+                .or(Some(true)),
+        },
+    );
+    write_tab_metadata_atomic(&path, &metadata)
+}
+
+fn set_tab_visibility(
+    socket_name: &str,
+    code: &str,
+    title: &str,
+    visible: bool,
+) -> io::Result<()> {
+    let path = tab_metadata_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _lock = TabMetadataLock::acquire(&path)?;
+    let mut metadata = read_tab_metadata_file(&path).unwrap_or_default();
+    metadata.insert(
+        socket_name.to_string(),
+        StoredTabMetadata {
+            code: Some(code.to_string()),
+            title: Some(title.to_string()),
+            visible: Some(visible),
+        },
+    );
+    write_tab_metadata_atomic(&path, &metadata)
+}
+
+fn remove_tab_metadata(socket_name: &str) -> io::Result<()> {
+    let path = tab_metadata_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _lock = TabMetadataLock::acquire(&path)?;
+    let mut metadata = read_tab_metadata_file(&path).unwrap_or_default();
+    metadata.remove(socket_name);
+    write_tab_metadata_atomic(&path, &metadata)
+}
+
+fn write_tab_metadata(metadata: &TabMetadataMap) -> io::Result<()> {
+    let path = tab_metadata_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _lock = TabMetadataLock::acquire(&path)?;
+    write_tab_metadata_atomic(&path, metadata)
+}
+
+fn write_tab_metadata_atomic(
+    path: &std::path::Path,
+    metadata: &TabMetadataMap,
+) -> io::Result<()> {
+    let data = serde_json::to_string_pretty(metadata)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let tmp_path = path.with_file_name(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("tab-metadata.json"),
+        std::process::id()
+    ));
+    std::fs::write(&tmp_path, data)?;
+    replace_metadata_file(&tmp_path, path)
+}
+
+#[cfg(not(windows))]
+fn replace_metadata_file(
+    tmp_path: &std::path::Path,
+    path: &std::path::Path,
+) -> io::Result<()> {
+    std::fs::rename(tmp_path, path)
+}
+
+#[cfg(windows)]
+fn replace_metadata_file(
+    tmp_path: &std::path::Path,
+    path: &std::path::Path,
+) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let from: Vec<u16> = tmp_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let to: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let ok = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn tab_metadata_path() -> io::Result<std::path::PathBuf> {
+    let home = std::env::var_os("HOME").ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "HOME not set")
+    })?;
+    Ok(std::path::PathBuf::from(home)
+        .join("Library")
+        .join("Application Support")
+        .join("zmux")
+        .join("tab-metadata.json"))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn tab_metadata_path() -> io::Result<std::path::PathBuf> {
+    if let Some(dir) = std::env::var_os("XDG_STATE_HOME") {
+        return Ok(std::path::PathBuf::from(dir)
+            .join("zmux")
+            .join("tab-metadata.json"));
+    }
+    let home = std::env::var_os("HOME").ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "HOME not set")
+    })?;
+    Ok(std::path::PathBuf::from(home)
+        .join(".local")
+        .join("state")
+        .join("zmux")
+        .join("tab-metadata.json"))
+}
+
+#[cfg(windows)]
+fn tab_metadata_path() -> io::Result<std::path::PathBuf> {
+    if let Some(dir) = std::env::var_os("LOCALAPPDATA") {
+        return Ok(std::path::PathBuf::from(dir)
+            .join("zmux")
+            .join("tab-metadata.json"));
+    }
+    if let Some(dir) = std::env::var_os("APPDATA") {
+        return Ok(std::path::PathBuf::from(dir)
+            .join("zmux")
+            .join("tab-metadata.json"));
+    }
+    legacy_tab_metadata_path()
+}
+
+#[cfg(unix)]
+fn legacy_tab_metadata_path() -> io::Result<std::path::PathBuf> {
+    crate::ipc::socket_path("tab-metadata.json")
+}
+
+#[cfg(windows)]
+fn legacy_tab_metadata_path() -> io::Result<std::path::PathBuf> {
+    Ok(std::env::temp_dir().join("zmux-tab-metadata.json"))
+}
+
 fn next_available_tab_code(tabs: &[ClientTab], start: usize) -> String {
+    for offset in 0..(26 * 26) {
+        let code = tab_code(start + offset);
+        if !tabs.iter().any(|tab| tab.code == code) {
+            return code;
+        }
+    }
+    "ZZ".to_string()
+}
+
+fn next_available_view_code(tabs: &[ClientTabView], start: usize) -> String {
     for offset in 0..(26 * 26) {
         let code = tab_code(start + offset);
         if !tabs.iter().any(|tab| tab.code == code) {
@@ -321,6 +945,14 @@ fn rename_tab_mode_for_active(
     }
 }
 
+fn tab_label(tab: &ClientTabView) -> String {
+    if tab.title.is_empty() {
+        tab.socket_name.clone()
+    } else {
+        tab.title.clone()
+    }
+}
+
 fn matching_tab_indices(tabs: &[ClientTabView], query: &str) -> Vec<usize> {
     let query = query.trim().to_lowercase();
     tabs.iter()
@@ -329,6 +961,7 @@ fn matching_tab_indices(tabs: &[ClientTabView], query: &str) -> Vec<usize> {
             if query.is_empty()
                 || tab.code.to_lowercase().contains(&query)
                 || tab.title.to_lowercase().contains(&query)
+                || tab.socket_name.to_lowercase().contains(&query)
             {
                 Some(index)
             } else {
@@ -406,6 +1039,23 @@ impl ClientApp {
             clean,
             start_dir,
             initial_tab_title,
+            attach_all: false,
+        }
+    }
+
+    pub fn new_attach_all(
+        socket_name: &str,
+        session_name: Option<String>,
+        clean: bool,
+        start_dir: Option<String>,
+    ) -> Self {
+        Self {
+            socket_name: socket_name.to_string(),
+            session_name,
+            clean,
+            start_dir,
+            initial_tab_title: None,
+            attach_all: true,
         }
     }
 
@@ -418,13 +1068,36 @@ impl ClientApp {
         #[cfg(unix)]
         crate::pty::remember_host_termios();
 
-        let mut tabs = TabManager::new(
-            &self.socket_name,
-            &session_name,
-            size,
-            self.clean,
-            self.start_dir.clone(),
-        )?;
+        let mut tabs = if self.attach_all {
+            let socket_names = discover_all_socket_names(&self.socket_name)?;
+            match TabManager::from_existing_sockets(
+                &self.socket_name,
+                socket_names,
+                self.session_name.as_deref(),
+                size,
+                self.start_dir.clone(),
+            ) {
+                Ok(tabs) => tabs,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    TabManager::new(
+                        &self.socket_name,
+                        &session_name,
+                        size,
+                        self.clean,
+                        self.start_dir.clone(),
+                    )?
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            TabManager::new(
+                &self.socket_name,
+                &session_name,
+                size,
+                self.clean,
+                self.start_dir.clone(),
+            )?
+        };
         if let Some(title) = &self.initial_tab_title {
             tabs.set_active_title(title.clone());
         }
@@ -468,8 +1141,38 @@ impl ClientApp {
                 let frame = tabs.active_client().latest_frame();
                 if let Some(ref fd) = frame {
                     if fd.exit {
-                        log_client("received exit frame, breaking main loop");
-                        break;
+                        log_client("received exit frame for active tab");
+                        if tabs.close_dead_active() {
+                            break;
+                        }
+                        mode = InputMode::Normal;
+                        copy_mode_confirmed = false;
+                        mouse_select = None;
+                        last_drawn_counter = 0;
+                        status_notice = Some((
+                            "tab closed".to_string(),
+                            Instant::now() + Duration::from_secs(3),
+                        ));
+                        continue;
+                    }
+                    let removed_dead_tabs = tabs.remove_dead_inactive();
+                    if removed_dead_tabs > 0 {
+                        last_drawn_counter = 0;
+                        status_notice = Some((
+                            if removed_dead_tabs == 1 {
+                                "closed 1 dead tab".to_string()
+                            } else {
+                                format!(
+                                    "closed {} dead tabs",
+                                    removed_dead_tabs
+                                )
+                            },
+                            Instant::now() + Duration::from_secs(3),
+                        ));
+                    }
+                    let (cols, _) = terminal::size().unwrap_or((80, 24));
+                    if tabs.ensure_active_visible(cols) {
+                        last_drawn_counter = 0;
                     }
                     if mode == InputMode::CopyMode {
                         if active_in_copy_mode(fd) {
@@ -522,6 +1225,7 @@ impl ClientApp {
                         | InputMode::RenameWindow { .. }
                         | InputMode::RenameSession { .. }
                         | InputMode::Command { .. }
+                        | InputMode::ConfirmKillTab { .. }
                 );
                 let has_overlay = matches!(
                     mode,
@@ -590,6 +1294,16 @@ impl ClientApp {
                             InputMode::Command { buf, .. } => {
                                 render_prompt(f, ":", buf)
                             }
+                            InputMode::ConfirmKillTab { label, .. } => {
+                                render_prompt(
+                                    f,
+                                    &format!(
+                                        "Kill tab '{}' and its server? [y/N] ",
+                                        label
+                                    ),
+                                    "",
+                                )
+                            }
                             InputMode::SessionChooser {
                                 entries,
                                 selected,
@@ -616,7 +1330,7 @@ impl ClientApp {
                                 search_active,
                                 ..
                             } => {
-                                let tab_views = tabs.tab_views();
+                                let tab_views = tabs.tab_chooser_views();
                                 render_tab_chooser(
                                     f,
                                     &tab_views,
@@ -768,6 +1482,15 @@ impl ClientApp {
                                             copy_mode_confirmed = false;
                                             mouse_select = None;
                                             last_drawn_counter = 0;
+                                        }
+                                        (KeyCode::Char('W'), _) => {
+                                            mode = InputMode::ConfirmKillTab {
+                                                socket_name: tabs
+                                                    .active_socket_name(),
+                                                label: tabs
+                                                    .active_title_for_confirm(),
+                                                return_to_tab_chooser: false,
+                                            };
                                         }
                                         (KeyCode::Char(','), _) => {
                                             let cur = tabs
@@ -1525,14 +2248,20 @@ impl ClientApp {
                                         };
                                     }
                                     (KeyCode::Enter, _) => {
-                                        let tab_views = tabs.tab_views();
+                                        let tab_views =
+                                            tabs.tab_chooser_views();
                                         let matches = matching_tab_indices(
                                             &tab_views, &query,
                                         );
                                         if let Some(&tab_index) =
                                             matches.get(selected)
                                         {
-                                            if tabs.select(tab_index) {
+                                            let tab = &tab_views[tab_index];
+                                            if tab.visible
+                                                && tabs.select_socket(
+                                                    &tab.socket_name,
+                                                )
+                                            {
                                                 let (cols, rows) =
                                                     terminal::size()
                                                         .unwrap_or((80, 24));
@@ -1546,7 +2275,16 @@ impl ClientApp {
                                                 mouse_select = None;
                                                 last_drawn_counter = 0;
                                             } else {
-                                                mode = InputMode::Normal;
+                                                status_notice = Some((
+                                                    "tab is hidden; press Space to show it".to_string(),
+                                                    Instant::now() + Duration::from_secs(3),
+                                                ));
+                                                mode = InputMode::TabChooser {
+                                                    query,
+                                                    cursor,
+                                                    selected,
+                                                    search_active,
+                                                };
                                             }
                                         } else {
                                             mode = InputMode::TabChooser {
@@ -1558,20 +2296,35 @@ impl ClientApp {
                                         }
                                     }
                                     (KeyCode::Char('R'), _) => {
-                                        let tab_views = tabs.tab_views();
+                                        let tab_views =
+                                            tabs.tab_chooser_views();
                                         let matches = matching_tab_indices(
                                             &tab_views, &query,
                                         );
                                         if let Some(&tab_index) =
                                             matches.get(selected)
                                         {
-                                            if tabs.select(tab_index) {
+                                            let tab = &tab_views[tab_index];
+                                            if tab.visible
+                                                && tabs.select_socket(
+                                                    &tab.socket_name,
+                                                )
+                                            {
                                                 mode =
                                                     rename_tab_mode_for_active(
                                                         &tabs, true,
                                                     );
                                             } else {
-                                                mode = InputMode::Normal;
+                                                status_notice = Some((
+                                                    "show the tab before renaming".to_string(),
+                                                    Instant::now() + Duration::from_secs(3),
+                                                ));
+                                                mode = InputMode::TabChooser {
+                                                    query,
+                                                    cursor,
+                                                    selected,
+                                                    search_active,
+                                                };
                                             }
                                         } else {
                                             mode = InputMode::TabChooser {
@@ -1581,6 +2334,100 @@ impl ClientApp {
                                                 search_active,
                                             };
                                         }
+                                    }
+                                    (KeyCode::Char('K'), _) => {
+                                        let tab_views =
+                                            tabs.tab_chooser_views();
+                                        let matches = matching_tab_indices(
+                                            &tab_views, &query,
+                                        );
+                                        if let Some(&tab_index) =
+                                            matches.get(selected)
+                                        {
+                                            let tab = &tab_views[tab_index];
+                                            mode = InputMode::ConfirmKillTab {
+                                                socket_name: tab
+                                                    .socket_name
+                                                    .clone(),
+                                                label: tab_label(tab),
+                                                return_to_tab_chooser: true,
+                                            };
+                                        } else {
+                                            mode = InputMode::TabChooser {
+                                                query,
+                                                cursor,
+                                                selected,
+                                                search_active,
+                                            };
+                                        }
+                                    }
+                                    (KeyCode::Char(' '), _) => {
+                                        let tab_views =
+                                            tabs.tab_chooser_views();
+                                        let matches = matching_tab_indices(
+                                            &tab_views, &query,
+                                        );
+                                        if let Some(&tab_index) =
+                                            matches.get(selected)
+                                        {
+                                            let tab =
+                                                tab_views[tab_index].clone();
+                                            let (cols, rows) = terminal::size()
+                                                .unwrap_or((80, 24));
+                                            if tab.visible {
+                                                match tabs.hide_socket(
+                                                    &tab.socket_name,
+                                                ) {
+                                                    Ok(()) => {
+                                                        status_notice = Some((
+                                                            format!("hidden {}", tab_label(&tab)),
+                                                            Instant::now() + Duration::from_secs(3),
+                                                        ));
+                                                    }
+                                                    Err(e) => {
+                                                        status_notice = Some((
+                                                            e,
+                                                            Instant::now() + Duration::from_secs(3),
+                                                        ));
+                                                    }
+                                                }
+                                            } else {
+                                                match tabs.show_socket(
+                                                    &tab.socket_name,
+                                                    server_content_size(
+                                                        cols, rows,
+                                                    ),
+                                                ) {
+                                                    Ok(()) => {
+                                                        status_notice = Some((
+                                                            format!("shown {}", tab_label(&tab)),
+                                                            Instant::now() + Duration::from_secs(3),
+                                                        ));
+                                                    }
+                                                    Err(e) => {
+                                                        status_notice = Some((
+                                                            format!("show tab failed: {}", e),
+                                                            Instant::now() + Duration::from_secs(3),
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                            last_drawn_counter = 0;
+                                        }
+                                        let len = matching_tab_indices(
+                                            &tabs.tab_chooser_views(),
+                                            &query,
+                                        )
+                                        .len();
+                                        if selected >= len {
+                                            selected = len.saturating_sub(1);
+                                        }
+                                        mode = InputMode::TabChooser {
+                                            query,
+                                            cursor,
+                                            selected,
+                                            search_active,
+                                        };
                                     }
                                     (KeyCode::Up, _) => {
                                         selected = selected.saturating_sub(1);
@@ -1618,7 +2465,8 @@ impl ClientApp {
                                         };
                                     }
                                     (KeyCode::Down, _) => {
-                                        let tab_views = tabs.tab_views();
+                                        let tab_views =
+                                            tabs.tab_chooser_views();
                                         let len = matching_tab_indices(
                                             &tab_views, &query,
                                         )
@@ -1637,7 +2485,8 @@ impl ClientApp {
                                         KeyCode::Char('j'),
                                         KeyModifiers::NONE,
                                     ) if !search_active => {
-                                        let tab_views = tabs.tab_views();
+                                        let tab_views =
+                                            tabs.tab_chooser_views();
                                         let len = matching_tab_indices(
                                             &tab_views, &query,
                                         )
@@ -1658,7 +2507,8 @@ impl ClientApp {
                                                 KeyModifiers::CONTROL,
                                             ) =>
                                     {
-                                        let tab_views = tabs.tab_views();
+                                        let tab_views =
+                                            tabs.tab_chooser_views();
                                         let len = matching_tab_indices(
                                             &tab_views, &query,
                                         )
@@ -1741,6 +2591,70 @@ impl ClientApp {
                                         };
                                     }
                                 },
+
+                                InputMode::ConfirmKillTab {
+                                    socket_name,
+                                    label,
+                                    return_to_tab_chooser,
+                                } => {
+                                    match key.code {
+                                        KeyCode::Char('y')
+                                        | KeyCode::Char('Y') => {
+                                            match tabs.kill_socket(&socket_name)
+                                            {
+                                                Ok(empty) => {
+                                                    if empty {
+                                                        break;
+                                                    }
+                                                    mode =
+                                                        if return_to_tab_chooser
+                                                        {
+                                                            default_tab_chooser_mode(&tabs)
+                                                        } else {
+                                                            InputMode::Normal
+                                                        };
+                                                    copy_mode_confirmed = false;
+                                                    mouse_select = None;
+                                                    last_drawn_counter = 0;
+                                                    status_notice = Some((
+                                                    format!("killed {}", label),
+                                                    Instant::now() + Duration::from_secs(3),
+                                                ));
+                                                }
+                                                Err(e) => {
+                                                    mode =
+                                                        if return_to_tab_chooser
+                                                        {
+                                                            default_tab_chooser_mode(&tabs)
+                                                        } else {
+                                                            InputMode::Normal
+                                                        };
+                                                    status_notice = Some((
+                                                    format!("kill tab failed: {}", e),
+                                                    Instant::now() + Duration::from_secs(3),
+                                                ));
+                                                }
+                                            }
+                                        }
+                                        KeyCode::Esc
+                                        | KeyCode::Char('n')
+                                        | KeyCode::Char('N')
+                                        | KeyCode::Enter => {
+                                            mode = if return_to_tab_chooser {
+                                                default_tab_chooser_mode(&tabs)
+                                            } else {
+                                                InputMode::Normal
+                                            };
+                                        }
+                                        _ => {
+                                            mode = InputMode::ConfirmKillTab {
+                                                socket_name,
+                                                label,
+                                                return_to_tab_chooser,
+                                            };
+                                        }
+                                    }
+                                }
 
                                 InputMode::RenameWindow {
                                     mut buf,
@@ -3266,7 +4180,8 @@ fn handle_paste_event(
         }
         InputMode::CopyMode
         | InputMode::SessionChooser { .. }
-        | InputMode::OptionPanel { .. } => {}
+        | InputMode::OptionPanel { .. }
+        | InputMode::ConfirmKillTab { .. } => {}
     }
 }
 
@@ -3551,6 +4466,82 @@ fn log_client(msg: &str) {
             .as_secs();
         let _ = writeln!(f, "[{}] {}", ts, msg);
     }
+}
+
+#[cfg(unix)]
+fn cleanup_killed_socket(socket_name: &str) {
+    if let Ok(path) = crate::ipc::socket_path(socket_name) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(windows)]
+fn cleanup_killed_socket(_socket_name: &str) {}
+
+#[cfg(unix)]
+fn cleanup_stale_socket(socket_name: &str, error: &io::Error) {
+    use std::os::unix::fs::FileTypeExt;
+
+    if !matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+    ) {
+        return;
+    }
+    let Ok(path) = crate::ipc::socket_path(socket_name) else {
+        return;
+    };
+    let Ok(metadata) = std::fs::metadata(&path) else {
+        return;
+    };
+    if metadata.file_type().is_socket() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(windows)]
+fn cleanup_stale_socket(_socket_name: &str, _error: &io::Error) {}
+
+#[cfg(unix)]
+fn discover_all_socket_names(socket_name: &str) -> io::Result<Vec<String>> {
+    use std::{collections::BTreeSet, os::unix::fs::FileTypeExt};
+
+    let socket_path = crate::ipc::socket_path(socket_name)?;
+    let Some(dir) = socket_path.parent() else {
+        return Ok(vec![socket_name.to_string()]);
+    };
+    let mut names = BTreeSet::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_socket() {
+                continue;
+            }
+            if let Some(name) = entry.file_name().to_str() {
+                names.insert(name.to_string());
+            }
+        }
+    }
+    Ok(names.into_iter().collect())
+}
+
+#[cfg(windows)]
+fn discover_all_socket_names(_socket_name: &str) -> io::Result<Vec<String>> {
+    use std::collections::BTreeSet;
+
+    let pipe_prefix = "zmux-";
+    let mut names = BTreeSet::new();
+    if let Ok(entries) = std::fs::read_dir(r"\\.\pipe\") {
+        for entry in entries.flatten() {
+            let pipe_name = entry.file_name().to_string_lossy().to_string();
+            if let Some(socket) = pipe_name.strip_prefix(pipe_prefix) {
+                names.insert(socket.to_string());
+            }
+        }
+    }
+    Ok(names.into_iter().collect())
 }
 
 fn ensure_server_and_connect(
