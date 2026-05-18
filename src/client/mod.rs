@@ -94,6 +94,10 @@ enum InputMode {
         selected: usize,
         search_active: bool,
     },
+    TabQuickSwitch {
+        code: String,
+        error: Option<String>,
+    },
 }
 
 const RESIZE_IDLE_TIMEOUT: Duration = Duration::from_millis(500);
@@ -411,6 +415,15 @@ impl TabManager {
     }
 
     fn show_socket(&mut self, socket_name: &str, size: Size) -> io::Result<()> {
+        self.show_socket_with_code(socket_name, size, None)
+    }
+
+    fn show_socket_with_code(
+        &mut self,
+        socket_name: &str,
+        size: Size,
+        preferred_code: Option<&str>,
+    ) -> io::Result<()> {
         if self.tabs.iter().any(|tab| tab.socket_name == socket_name) {
             if let Some(index) = self
                 .tabs
@@ -424,10 +437,14 @@ impl TabManager {
         }
         let metadata = load_tab_metadata();
         let stored = metadata.get(socket_name);
+        let preferred_code = preferred_code
+            .and_then(|code| normalize_tab_code(code).ok())
+            .filter(|code| !self.tabs.iter().any(|tab| tab.code == *code));
         let code = stored
             .and_then(|meta| meta.code.as_deref())
             .and_then(|code| normalize_tab_code(code).ok())
             .filter(|code| !self.tabs.iter().any(|tab| tab.code == *code))
+            .or(preferred_code)
             .unwrap_or_else(|| {
                 next_available_tab_code(&self.tabs, self.tabs.len())
             });
@@ -966,6 +983,42 @@ fn default_tab_chooser_mode(tabs: &TabManager) -> InputMode {
     }
 }
 
+fn tab_quick_switch_mode() -> InputMode {
+    InputMode::TabQuickSwitch {
+        code: String::new(),
+        error: None,
+    }
+}
+
+fn select_tab_by_code(
+    tabs: &mut TabManager,
+    code: &str,
+    size: Size,
+) -> Result<(), String> {
+    let code = normalize_tab_code(code)?;
+    if let Some(index) = tabs.tabs.iter().position(|tab| tab.code == code) {
+        tabs.select(index);
+        tabs.active_client().resize(size);
+        return Ok(());
+    }
+
+    let Some(tab) = tabs.tab_chooser_views().into_iter().find(|tab| {
+        !tab.visible
+            && normalize_tab_code(&tab.code)
+                .is_ok_and(|tab_code| tab_code == code)
+    }) else {
+        return Err(format!("tab not found: {}", code));
+    };
+
+    tabs.show_socket_with_code(&tab.socket_name, size, Some(&code))
+        .map_err(|e| format!("show tab failed: {}", e))?;
+    if !tabs.select_socket(&tab.socket_name) {
+        return Err(format!("tab not found: {}", code));
+    }
+    tabs.active_client().resize(size);
+    Ok(())
+}
+
 fn rename_tab_mode_for_active(
     tabs: &TabManager,
     return_to_tab_chooser: bool,
@@ -1271,6 +1324,7 @@ impl ClientApp {
                         | InputMode::OptionPanel { .. }
                         | InputMode::TabChooser { .. }
                         | InputMode::RenameTab { .. }
+                        | InputMode::TabQuickSwitch { .. }
                 );
 
                 let current_counter = tabs.active_client().frame_counter();
@@ -1331,6 +1385,13 @@ impl ClientApp {
                             ),
                             InputMode::Command { buf, .. } => {
                                 render_prompt(f, ":", buf)
+                            }
+                            InputMode::TabQuickSwitch { code, error } => {
+                                render_tab_quick_switch_panel(
+                                    f,
+                                    code,
+                                    error.as_deref(),
+                                )
                             }
                             InputMode::ConfirmKillTab { label, .. } => {
                                 render_prompt(
@@ -1471,6 +1532,9 @@ impl ClientApp {
                                         ) => {
                                             mode =
                                                 default_tab_chooser_mode(&tabs);
+                                        }
+                                        (KeyCode::Char('/'), _) => {
+                                            mode = tab_quick_switch_mode();
                                         }
                                         (KeyCode::Char('T'), _) => {
                                             mode = rename_tab_mode_for_active(
@@ -2255,6 +2319,67 @@ impl ClientApp {
                                         }
                                     }
                                 }
+
+                                InputMode::TabQuickSwitch {
+                                    mut code,
+                                    error,
+                                } => match (key.code, key.modifiers) {
+                                    (KeyCode::Esc, _) => {
+                                        mode = InputMode::Normal;
+                                    }
+                                    (KeyCode::Backspace, _) => {
+                                        code.pop();
+                                        mode = InputMode::TabQuickSwitch {
+                                            code,
+                                            error: None,
+                                        };
+                                    }
+                                    (KeyCode::Enter, _) => {
+                                        let (cols, rows) = terminal::size()
+                                            .unwrap_or((80, 24));
+                                        match select_tab_by_code(
+                                            &mut tabs,
+                                            &code,
+                                            server_content_size(cols, rows),
+                                        ) {
+                                            Ok(()) => {
+                                                mode = InputMode::Normal;
+                                                copy_mode_confirmed = false;
+                                                mouse_select = None;
+                                                last_drawn_counter = 0;
+                                            }
+                                            Err(e) => {
+                                                mode =
+                                                    InputMode::TabQuickSwitch {
+                                                        code: String::new(),
+                                                        error: Some(e),
+                                                    };
+                                            }
+                                        }
+                                    }
+                                    (KeyCode::Char(c), modifiers)
+                                        if !modifiers.intersects(
+                                            KeyModifiers::CONTROL
+                                                | KeyModifiers::ALT,
+                                        ) =>
+                                    {
+                                        if code.len() < 2
+                                            && c.is_ascii_alphabetic()
+                                        {
+                                            code.push(c.to_ascii_uppercase());
+                                        }
+                                        mode = InputMode::TabQuickSwitch {
+                                            code,
+                                            error: None,
+                                        };
+                                    }
+                                    _ => {
+                                        mode = InputMode::TabQuickSwitch {
+                                            code,
+                                            error,
+                                        };
+                                    }
+                                },
 
                                 InputMode::TabChooser {
                                     mut query,
@@ -4215,6 +4340,17 @@ fn handle_paste_event(
                 selected: 0,
                 search_active: true,
             };
+        }
+        InputMode::TabQuickSwitch { mut code, .. } => {
+            for c in text.chars() {
+                if code.len() >= 2 {
+                    break;
+                }
+                if c.is_ascii_alphabetic() {
+                    code.push(c.to_ascii_uppercase());
+                }
+            }
+            *mode = InputMode::TabQuickSwitch { code, error: None };
         }
         InputMode::CopyMode
         | InputMode::SessionChooser { .. }

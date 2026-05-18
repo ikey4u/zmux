@@ -63,6 +63,7 @@ Each tab is backed by an independent server. Sessions, windows, and panes are is
 | Shortcut / Action | Action |
 |-------------------|--------|
 | `Prefix + t` | Open the tab chooser. Use `↑`/`↓` or `j`/`k` to move, `/` or `?` to search by tab code/title, `Ctrl+j`/`Ctrl+k` to move within search results while search is active, `R` to rename the selected tab, `Enter` to switch, and `q` or `Esc` to close |
+| `Prefix + /` | Open a centered quick-switch input. Enter a two-letter tab code, then press `Enter` to switch directly to that tab. Hidden tabs are shown automatically before switching. If the code is invalid or not found, the input stays open with an error so you can re-enter it. Press `Esc` to cancel |
 | `Prefix + Tab` | Switch to the next tab |
 | `Prefix + Shift+Tab` | Switch to the previous tab |
 | `Prefix + T` | Open the tab rename dialog. Use `Tab` to switch between the code and title fields. The two-letter code must be unique; press `Enter` to move from code to title and press `Enter` again to save, or `Esc` to cancel |

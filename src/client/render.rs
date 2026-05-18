@@ -886,6 +886,100 @@ pub fn render_rename_tab_panel(
     }
 }
 
+pub fn render_tab_quick_switch_panel(
+    f: &mut Frame,
+    code: &str,
+    error: Option<&str>,
+) {
+    use ratatui::widgets::{Block, Borders};
+
+    let area = f.area();
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let width = area
+        .width
+        .saturating_mul(2)
+        .saturating_div(5)
+        .max(36)
+        .min(area.width);
+    let height = 7.min(area.height).max(1);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    let panel = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    f.render_widget(Clear, panel);
+    let block = Block::default()
+        .title(" Switch Tab  (Enter=switch  Esc=cancel) ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(panel);
+    f.render_widget(block, panel);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let field = format!(" Code: {}", code);
+    let field_text = format!(
+        "{:<width$}",
+        truncate_to_width(&field, inner.width as usize),
+        width = inner.width as usize
+    );
+    f.render_widget(
+        Paragraph::new(field_text).style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: 1,
+        },
+    );
+    let cursor_x = inner
+        .x
+        .saturating_add(7)
+        .saturating_add(code.chars().count() as u16)
+        .min(inner.x + inner.width.saturating_sub(1));
+    f.set_cursor_position((cursor_x, inner.y));
+
+    if let Some(error) = error {
+        if inner.height > 2 {
+            f.render_widget(
+                Paragraph::new(truncate_to_width(error, inner.width as usize))
+                    .style(Style::default().fg(Color::Red)),
+                Rect {
+                    x: inner.x,
+                    y: inner.y + 2,
+                    width: inner.width,
+                    height: 1,
+                },
+            );
+        }
+    }
+
+    if inner.height > 4 {
+        let help = "Enter the two-letter code shown in the tab bar.";
+        f.render_widget(
+            Paragraph::new(truncate_to_width(help, inner.width as usize))
+                .style(Style::default().fg(Color::DarkGray)),
+            Rect {
+                x: inner.x,
+                y: inner.y + 4,
+                width: inner.width,
+                height: 1,
+            },
+        );
+    }
+}
+
 fn render_rename_field(
     f: &mut Frame,
     area: Rect,
