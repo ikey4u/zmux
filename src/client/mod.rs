@@ -1220,6 +1220,8 @@ impl ClientApp {
         let prefix_key = (KeyCode::Char('a'), KeyModifiers::CONTROL);
         let mut mode = InputMode::Normal;
         let mut copy_mode_confirmed = false;
+        let mut prefix_from_copy_mode = false;
+        let mut copy_mode_sync_suppress_frame: Option<u64> = None;
         let mut resize_deadline: Option<Instant> = None;
         let mut status_notice: Option<(String, Instant)> = None;
         let mut hide_borders = false;
@@ -1230,6 +1232,13 @@ impl ClientApp {
         let run_result: io::Result<()> = (|| {
             loop {
                 let frame = tabs.active_client().latest_frame();
+                let current_counter = tabs.active_client().frame_counter();
+                if matches!(
+                    copy_mode_sync_suppress_frame,
+                    Some(counter) if counter != current_counter
+                ) {
+                    copy_mode_sync_suppress_frame = None;
+                }
                 if let Some(ref fd) = frame {
                     if fd.exit {
                         log_client("received exit frame for active tab");
@@ -1274,6 +1283,10 @@ impl ClientApp {
                         }
                     } else if mode == InputMode::Normal
                         && active_in_copy_mode(fd)
+                        && !matches!(
+                            copy_mode_sync_suppress_frame,
+                            Some(suppressed) if suppressed == current_counter
+                        )
                     {
                         // The server entered copy mode on its own (e.g. via
                         // mouse-scroll auto-enter).  Sync the client so that
@@ -1327,7 +1340,6 @@ impl ClientApp {
                         | InputMode::TabQuickSwitch { .. }
                 );
 
-                let current_counter = tabs.active_client().frame_counter();
                 let frame_new = current_counter != last_drawn_counter;
                 if frame_new
                     || last_draw_time.elapsed() >= Duration::from_millis(16)
@@ -1491,6 +1503,9 @@ impl ClientApp {
 
                                 InputMode::Prefix => {
                                     mode = InputMode::Normal;
+                                    let prefix_started_from_copy_mode =
+                                        prefix_from_copy_mode;
+                                    prefix_from_copy_mode = false;
                                     if (key.code, key.modifiers) == prefix_key {
                                         let bytes = key_to_bytes(key);
                                         if !bytes.is_empty() {
@@ -1498,6 +1513,13 @@ impl ClientApp {
                                                 .send_input(&bytes);
                                         }
                                         continue;
+                                    }
+                                    if prefix_started_from_copy_mode {
+                                        suppress_copy_mode_client_sync(
+                                            &mut copy_mode_confirmed,
+                                            &mut copy_mode_sync_suppress_frame,
+                                            current_counter,
+                                        );
                                     }
                                     if is_resize_modifier_key(key) {
                                         mode = InputMode::Resize;
@@ -1837,6 +1859,11 @@ impl ClientApp {
                                 },
 
                                 InputMode::CopyMode => {
+                                    if (key.code, key.modifiers) == prefix_key {
+                                        mode = InputMode::Prefix;
+                                        prefix_from_copy_mode = true;
+                                        continue;
+                                    }
                                     match (key.code, key.modifiers) {
                                         (KeyCode::Esc, _)
                                         | (
@@ -1848,39 +1875,60 @@ impl ClientApp {
                                             mode = InputMode::Normal;
                                             copy_mode_confirmed = false;
                                         }
-                                        (KeyCode::Char('/'), _) => {
+                                        (KeyCode::Char('/'), mods)
+                                            if is_copy_plain_key(mods) =>
+                                        {
                                             mode = InputMode::CopySearch {
                                                 buf: String::new(),
                                                 cursor: 0,
                                                 forward: true,
                                             };
                                         }
-                                        (KeyCode::Char('?'), _) => {
+                                        (KeyCode::Char('?'), mods)
+                                            if is_copy_plain_key(mods) =>
+                                        {
                                             mode = InputMode::CopySearch {
                                                 buf: String::new(),
                                                 cursor: 0,
                                                 forward: false,
                                             };
                                         }
-                                        (KeyCode::Char('h'), _)
-                                        | (KeyCode::Left, _) => {
+                                        (
+                                            KeyCode::Char('h'),
+                                            KeyModifiers::NONE,
+                                        )
+                                        | (KeyCode::Left, KeyModifiers::NONE) =>
+                                        {
                                             tabs.active_client()
                                                 .copy_move_left();
                                             mode = InputMode::CopyMode;
                                         }
-                                        (KeyCode::Char('l'), _)
-                                        | (KeyCode::Right, _) => {
+                                        (
+                                            KeyCode::Char('l'),
+                                            KeyModifiers::NONE,
+                                        )
+                                        | (
+                                            KeyCode::Right,
+                                            KeyModifiers::NONE,
+                                        ) => {
                                             tabs.active_client()
                                                 .copy_move_right();
                                             mode = InputMode::CopyMode;
                                         }
-                                        (KeyCode::Char('k'), _)
-                                        | (KeyCode::Up, _) => {
+                                        (
+                                            KeyCode::Char('k'),
+                                            KeyModifiers::NONE,
+                                        )
+                                        | (KeyCode::Up, KeyModifiers::NONE) => {
                                             tabs.active_client().copy_move_up();
                                             mode = InputMode::CopyMode;
                                         }
-                                        (KeyCode::Char('j'), _)
-                                        | (KeyCode::Down, _) => {
+                                        (
+                                            KeyCode::Char('j'),
+                                            KeyModifiers::NONE,
+                                        )
+                                        | (KeyCode::Down, KeyModifiers::NONE) =>
+                                        {
                                             tabs.active_client()
                                                 .copy_move_down();
                                             mode = InputMode::CopyMode;
@@ -1909,7 +1957,10 @@ impl ClientApp {
                                                 .copy_move_word_end();
                                             mode = InputMode::CopyMode;
                                         }
-                                        (KeyCode::PageUp, _)
+                                        (
+                                            KeyCode::PageUp,
+                                            KeyModifiers::NONE,
+                                        )
                                         | (
                                             KeyCode::Char('b'),
                                             KeyModifiers::CONTROL,
@@ -1917,7 +1968,10 @@ impl ClientApp {
                                             tabs.active_client().copy_page_up();
                                             mode = InputMode::CopyMode;
                                         }
-                                        (KeyCode::PageDown, _)
+                                        (
+                                            KeyCode::PageDown,
+                                            KeyModifiers::NONE,
+                                        )
                                         | (
                                             KeyCode::Char('f'),
                                             KeyModifiers::CONTROL,
@@ -1934,7 +1988,9 @@ impl ClientApp {
                                                 .copy_move_to_top();
                                             mode = InputMode::CopyMode;
                                         }
-                                        (KeyCode::Char('G'), _) => {
+                                        (KeyCode::Char('G'), mods)
+                                            if is_copy_plain_key(mods) =>
+                                        {
                                             tabs.active_client()
                                                 .copy_move_to_bottom();
                                             mode = InputMode::CopyMode;
@@ -1963,7 +2019,9 @@ impl ClientApp {
                                                 );
                                             mode = InputMode::CopyMode;
                                         }
-                                        (KeyCode::Char('V'), _) => {
+                                        (KeyCode::Char('V'), mods)
+                                            if is_copy_plain_key(mods) =>
+                                        {
                                             tabs.active_client()
                                                 .copy_start_selection(
                                                     SelectionMode::Line,
@@ -1988,7 +2046,9 @@ impl ClientApp {
                                                 .copy_search_next();
                                             mode = InputMode::CopyMode;
                                         }
-                                        (KeyCode::Char('N'), _) => {
+                                        (KeyCode::Char('N'), mods)
+                                            if is_copy_plain_key(mods) =>
+                                        {
                                             tabs.active_client()
                                                 .copy_search_prev();
                                             mode = InputMode::CopyMode;
@@ -2053,6 +2113,11 @@ impl ClientApp {
                                     mut cursor,
                                     forward,
                                 } => {
+                                    if (key.code, key.modifiers) == prefix_key {
+                                        mode = InputMode::Prefix;
+                                        prefix_from_copy_mode = true;
+                                        continue;
+                                    }
                                     match key.code {
                                         KeyCode::Enter => {
                                             if !buf.is_empty() {
@@ -3152,6 +3217,9 @@ impl ClientApp {
                             }
                         }
                         Event::Mouse(mouse) => {
+                            if mode == InputMode::Prefix {
+                                prefix_from_copy_mode = false;
+                            }
                             if mouse.row == 0 {
                                 mouse_select = None;
                                 if matches!(
@@ -3442,6 +3510,8 @@ impl ClientApp {
                                                 .unwrap_or((80, 24));
                                             let fa =
                                                 server_frame_area(cols, rows);
+                                            let layout_area =
+                                                server_layout_area(cols, rows);
                                             let pa = active_pane_content_rect(
                                                 fd,
                                                 fa,
@@ -3460,6 +3530,31 @@ impl ClientApp {
                                                         end_col: mouse.column,
                                                         end_row: mouse.row,
                                                     });
+                                            } else if let Some(pane_id) =
+                                                find_pane_id_at(
+                                                    &fd.layout,
+                                                    layout_area,
+                                                    mouse.column,
+                                                    mouse.row,
+                                                    hide_borders,
+                                                )
+                                            {
+                                                if Some(pane_id)
+                                                    != active_pane_id(
+                                                        &fd.layout,
+                                                    )
+                                                {
+                                                    tabs.active_client()
+                                                        .run_command(&format!(
+                                                        "select-pane -t %{}",
+                                                        pane_id
+                                                    ));
+                                                    mode = InputMode::Normal;
+                                                    copy_mode_confirmed = false;
+                                                    copy_mode_sync_suppress_frame =
+                                                        Some(current_counter);
+                                                    mouse_select = None;
+                                                }
                                             }
                                         }
                                     }
@@ -3998,6 +4093,18 @@ fn cursor_style_for_shape(shape: Option<u8>) -> SetCursorStyle {
         6 => SetCursorStyle::SteadyBar,
         _ => SetCursorStyle::DefaultUserShape,
     }
+}
+
+/// After prefix navigation from copy mode, keep server copy state on the
+/// scrolled pane but stop the client from re-entering CopyMode until the
+/// next frame reflects the new focus.
+fn suppress_copy_mode_client_sync(
+    copy_mode_confirmed: &mut bool,
+    copy_mode_sync_suppress_frame: &mut Option<u64>,
+    current_counter: u64,
+) {
+    *copy_mode_confirmed = false;
+    *copy_mode_sync_suppress_frame = Some(current_counter);
 }
 
 fn handle_prefix_key(server: &SocketClient, key: KeyEvent) -> Option<String> {
