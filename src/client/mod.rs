@@ -3329,15 +3329,27 @@ impl ClientApp {
                                             false
                                         };
                                         if !focused_other_pane {
-                                            if let Some(server_mouse) =
-                                                mouse_for_server(mouse)
-                                            {
-                                                let bytes = mouse_to_bytes(
-                                                    server_mouse,
-                                                );
-                                                if !bytes.is_empty() {
-                                                    tabs.active_client()
-                                                        .send_input(&bytes);
+                                            if let Some(fd) = frame.as_ref() {
+                                                let (cols, rows) =
+                                                    terminal::size()
+                                                        .unwrap_or((80, 24));
+                                                if let Some(server_mouse) =
+                                                    mouse_for_pane(
+                                                        mouse,
+                                                        fd,
+                                                        server_layout_area(
+                                                            cols, rows,
+                                                        ),
+                                                        hide_borders,
+                                                    )
+                                                {
+                                                    let bytes = mouse_to_bytes(
+                                                        server_mouse,
+                                                    );
+                                                    if !bytes.is_empty() {
+                                                        tabs.active_client()
+                                                            .send_input(&bytes);
+                                                    }
                                                 }
                                             }
                                         }
@@ -3715,11 +3727,26 @@ fn server_layout_area(cols: u16, rows: u16) -> ratatui::layout::Rect {
     }
 }
 
-fn mouse_for_server(mut mouse: MouseEvent) -> Option<MouseEvent> {
+fn mouse_for_pane(
+    mut mouse: MouseEvent,
+    fd: &FrameData,
+    layout_area: ratatui::layout::Rect,
+    hide_borders: bool,
+) -> Option<MouseEvent> {
     if mouse.row == 0 {
         return None;
     }
-    mouse.row -= 1;
+    let (_, pa) =
+        find_active_pane_content(&fd.layout, layout_area, hide_borders);
+    if mouse.column < pa.x
+        || mouse.column >= pa.x + pa.width
+        || mouse.row < pa.y
+        || mouse.row >= pa.y + pa.height
+    {
+        return None;
+    }
+    mouse.column -= pa.x;
+    mouse.row -= pa.y;
     Some(mouse)
 }
 
@@ -5057,6 +5084,107 @@ mod tests {
         };
 
         assert_eq!(extract_text_from_frame(&fd, &sel, true), "abc\ndef");
+    }
+
+    #[test]
+    fn mouse_for_pane_maps_screen_coords_to_pane_local() {
+        use crossterm::event::{
+            KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        };
+
+        let layout_area = ratatui::layout::Rect {
+            x: 0,
+            y: 1,
+            width: 80,
+            height: 22,
+        };
+        let fd = test_frame(vec![test_row("hello", None)]);
+
+        let screen_col = 10u16;
+        let screen_row = 5u16;
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: screen_col,
+            row: screen_row,
+            modifiers: KeyModifiers::empty(),
+        };
+        let pane_mouse =
+            mouse_for_pane(mouse, &fd, layout_area, true).expect("inside pane");
+        assert_eq!(pane_mouse.column, screen_col);
+        assert_eq!(pane_mouse.row, screen_row - layout_area.y);
+
+        let bytes = mouse_to_bytes(pane_mouse);
+        let expected = format!(
+            "\x1b[<0;{};{}M",
+            pane_mouse.column + 1,
+            pane_mouse.row + 1
+        );
+        assert_eq!(String::from_utf8(bytes).unwrap(), expected);
+    }
+
+    #[test]
+    fn mouse_for_pane_with_border_subtracts_content_origin() {
+        use crossterm::event::{
+            KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        };
+
+        let layout_area = ratatui::layout::Rect {
+            x: 0,
+            y: 1,
+            width: 80,
+            height: 22,
+        };
+        let fd = test_frame(vec![test_row("hello", None)]);
+        let (_, pa) = find_active_pane_content(&fd.layout, layout_area, false);
+
+        let pane_col = 4u16;
+        let pane_row = 2u16;
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: pa.x + pane_col,
+            row: pa.y + pane_row,
+            modifiers: KeyModifiers::empty(),
+        };
+        let mapped = mouse_for_pane(mouse, &fd, layout_area, false)
+            .expect("inside pane");
+        assert_eq!(mapped.column, pane_col);
+        assert_eq!(mapped.row, pane_row);
+
+        let bytes = mouse_to_bytes(mapped);
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            format!("\x1b[<0;{};{}M", pane_col + 1, pane_row + 1)
+        );
+    }
+
+    #[test]
+    fn mouse_for_pane_ignores_tab_row_and_outside_content() {
+        use crossterm::event::{
+            KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        };
+
+        let layout_area = ratatui::layout::Rect {
+            x: 0,
+            y: 1,
+            width: 80,
+            height: 22,
+        };
+        let fd = test_frame(vec![test_row("hello", None)]);
+        let tab_mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert!(mouse_for_pane(tab_mouse, &fd, layout_area, false).is_none());
+
+        let border_mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert!(mouse_for_pane(border_mouse, &fd, layout_area, false).is_none());
     }
 
     fn test_frame(rows_v2: Vec<RowRunsJson>) -> FrameData {
