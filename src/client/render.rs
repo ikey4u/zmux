@@ -127,6 +127,24 @@ pub fn active_in_copy_mode(fd: &FrameData) -> bool {
     active_in_copy_mode_in_layout(&fd.layout)
 }
 
+pub fn active_scroll_ratio(fd: &FrameData) -> Option<f32> {
+    active_scroll_ratio_in_layout(&fd.layout)
+}
+
+fn active_scroll_ratio_in_layout(layout: &LayoutJson) -> Option<f32> {
+    match layout {
+        LayoutJson::Split { children, .. } => {
+            children.iter().find_map(active_scroll_ratio_in_layout)
+        }
+        LayoutJson::Leaf {
+            active,
+            scroll_ratio,
+            ..
+        } if *active => *scroll_ratio,
+        LayoutJson::Leaf { .. } => None,
+    }
+}
+
 fn active_in_copy_mode_in_layout(layout: &LayoutJson) -> bool {
     match layout {
         LayoutJson::Split { children, .. } => {
@@ -177,7 +195,15 @@ pub fn render_frame_ex(
     hide_status: bool,
     hide_borders: bool,
 ) {
-    render_frame_area_ex(f, fd, in_prefix, hide_status, hide_borders, f.area());
+    render_frame_area_ex(
+        f,
+        fd,
+        in_prefix,
+        hide_status,
+        hide_borders,
+        false,
+        f.area(),
+    );
 }
 
 pub fn render_tabbed_frame(
@@ -187,6 +213,7 @@ pub fn render_tabbed_frame(
     in_prefix: bool,
     hide_status: bool,
     hide_borders: bool,
+    scroll_repaint_stripe: bool,
 ) {
     let area = f.area();
     if area.height == 0 {
@@ -214,6 +241,7 @@ pub fn render_tabbed_frame(
         in_prefix,
         hide_status,
         hide_borders,
+        scroll_repaint_stripe,
         frame_area,
     );
 }
@@ -224,6 +252,7 @@ fn render_frame_area_ex(
     in_prefix: bool,
     hide_status: bool,
     hide_borders: bool,
+    scroll_repaint_stripe: bool,
     area: Rect,
 ) {
     if area.height < 2 {
@@ -235,7 +264,13 @@ fn render_frame_area_ex(
         .split(area);
 
     f.render_widget(Clear, chunks[0]);
-    render_layout_node(f, &fd.layout, chunks[0], hide_borders);
+    render_layout_node(
+        f,
+        &fd.layout,
+        chunks[0],
+        hide_borders,
+        scroll_repaint_stripe,
+    );
     if !hide_status {
         render_status_bar(f, &fd.status, chunks[1], in_prefix);
     }
@@ -246,6 +281,7 @@ fn render_layout_node(
     layout: &LayoutJson,
     area: Rect,
     hide_borders: bool,
+    scroll_repaint_stripe: bool,
 ) {
     match layout {
         LayoutJson::Split {
@@ -264,7 +300,13 @@ fn render_layout_node(
                 hide_borders,
             );
             for (child, chunk) in children.iter().zip(chunks.into_iter()) {
-                render_layout_node(f, child, chunk, hide_borders);
+                render_layout_node(
+                    f,
+                    child,
+                    chunk,
+                    hide_borders,
+                    scroll_repaint_stripe,
+                );
             }
         }
         LayoutJson::Leaf {
@@ -288,6 +330,7 @@ fn render_layout_node(
                 *scroll_ratio,
                 area,
                 hide_borders,
+                scroll_repaint_stripe,
             );
         }
     }
@@ -348,6 +391,7 @@ fn render_pane_content(
     scroll_ratio: Option<f32>,
     area: Rect,
     hide_borders: bool,
+    scroll_repaint_stripe: bool,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -372,70 +416,80 @@ fn render_pane_content(
             (area, false)
         };
 
+    // Clear content before drawing borders so ratatui's Block widget does not
+    // paint the full pane rect (which can leave green border-color artifacts on
+    // some terminals when combined with partial row updates).
+    f.render_widget(Clear, content_area);
     if has_border {
         draw_border(f, area, border_color);
     }
-    f.render_widget(Clear, content_area);
 
     let max_rows = content_area.height as usize;
     let max_cols = content_area.width as usize;
 
-    for (row_idx, row_data) in rows_v2.iter().enumerate().take(max_rows) {
+    let pad_fill =
+        pane_pad_fill(scroll_ratio.is_some() && scroll_repaint_stripe);
+    let pad_style = Style::default();
+    for row_idx in 0..max_rows {
         let y = content_area.y + row_idx as u16;
-        if y >= content_area.y + content_area.height {
-            break;
-        }
+        let row_rect = Rect {
+            x: content_area.x,
+            y,
+            width: max_cols as u16,
+            height: 1,
+        };
 
         let mut spans: Vec<Span<'static>> = Vec::new();
         let mut col_used = 0usize;
 
-        for run in &row_data.runs {
-            if col_used >= max_cols {
-                break;
-            }
-            let available = max_cols - col_used;
-            let text = truncate_to_width(&run.text, available);
-            let actual_width = unicode_display_width(&text);
-            if text.is_empty() {
-                break;
-            }
+        if let Some(row_data) = rows_v2.get(row_idx) {
+            for run in &row_data.runs {
+                if col_used >= max_cols {
+                    break;
+                }
+                let available = max_cols - col_used;
+                let text = truncate_to_width(&run.text, available);
+                if text.is_empty() {
+                    break;
+                }
+                let actual_width = unicode_display_width(&text);
 
-            let fg = parse_color_str(&run.fg);
-            let bg = parse_color_str(&run.bg);
-            let mut style = Style::default().fg(fg).bg(bg);
-            if run.flags & 2 != 0 {
-                style = style.add_modifier(Modifier::BOLD);
-            }
-            if run.flags & 1 != 0 {
-                style = style.add_modifier(Modifier::DIM);
-            }
-            if run.flags & 4 != 0 {
-                style = style.add_modifier(Modifier::ITALIC);
-            }
-            if run.flags & 8 != 0 {
-                style = style.add_modifier(Modifier::UNDERLINED);
-            }
-            if run.flags & 16 != 0 {
-                style = style.add_modifier(Modifier::REVERSED);
-            }
+                let fg = parse_color_str(&run.fg);
+                let bg = parse_color_str(&run.bg);
+                let mut style = Style::default().fg(fg).bg(bg);
+                if run.flags & 2 != 0 {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                if run.flags & 1 != 0 {
+                    style = style.add_modifier(Modifier::DIM);
+                }
+                if run.flags & 4 != 0 {
+                    style = style.add_modifier(Modifier::ITALIC);
+                }
+                if run.flags & 8 != 0 {
+                    style = style.add_modifier(Modifier::UNDERLINED);
+                }
+                if run.flags & 16 != 0 {
+                    style = style.add_modifier(Modifier::REVERSED);
+                }
 
-            spans.push(Span::styled(text, style));
-            col_used += actual_width;
+                spans.push(Span::styled(text, style));
+                col_used += actual_width;
+            }
         }
 
-        if !spans.is_empty() {
-            let line = Line::from(spans);
-            let para = Paragraph::new(line);
-            f.render_widget(
-                para,
-                Rect {
-                    x: content_area.x,
-                    y,
-                    width: content_area.width,
-                    height: 1,
-                },
-            );
+        if col_used < max_cols {
+            spans.push(Span::styled(
+                pad_fill.repeat(max_cols - col_used),
+                pad_style,
+            ));
         }
+        let line = if spans.is_empty() {
+            Line::from(Span::styled(pad_fill.repeat(max_cols), pad_style))
+        } else {
+            Line::from(spans)
+        };
+        f.render_widget(Paragraph::new(line), row_rect);
     }
 
     if let Some(ratio) = scroll_ratio {
@@ -486,11 +540,48 @@ fn draw_scrollbar(f: &mut Frame, content_area: Rect, ratio: f32) {
 }
 
 fn draw_border(f: &mut Frame, area: Rect, color: Color) {
-    use ratatui::widgets::{Block, Borders};
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(color));
-    f.render_widget(block, area);
+    use ratatui::widgets::BorderType;
+
+    if area.width < 2 || area.height < 2 {
+        return;
+    }
+
+    // Draw only the perimeter cells.  The Block widget also calls
+    // `buf.set_style` on the full rect, which can leave colored cells inside
+    // the pane when row updates do not repaint every column.
+    let style = Style::default().fg(color);
+    let set = BorderType::Plain.to_border_set();
+    let buf = f.buffer_mut();
+    let left = area.left();
+    let top = area.top();
+    let right = area.right().saturating_sub(1);
+    let bottom = area.bottom().saturating_sub(1);
+
+    buf[(left, top)].set_symbol(set.top_left).set_style(style);
+    buf[(right, top)].set_symbol(set.top_right).set_style(style);
+    buf[(left, bottom)]
+        .set_symbol(set.bottom_left)
+        .set_style(style);
+    buf[(right, bottom)]
+        .set_symbol(set.bottom_right)
+        .set_style(style);
+
+    for x in (left + 1)..right {
+        buf[(x, top)]
+            .set_symbol(set.horizontal_top)
+            .set_style(style);
+        buf[(x, bottom)]
+            .set_symbol(set.horizontal_bottom)
+            .set_style(style);
+    }
+    for y in (top + 1)..bottom {
+        buf[(left, y)]
+            .set_symbol(set.vertical_left)
+            .set_style(style);
+        buf[(right, y)]
+            .set_symbol(set.vertical_right)
+            .set_style(style);
+    }
 }
 
 pub fn render_tabbed_loading(f: &mut Frame, tabs: &[ClientTabView]) {
@@ -517,6 +608,43 @@ pub fn render_tabbed_loading(f: &mut Frame, tabs: &[ClientTabView]) {
     let para = Paragraph::new(" Starting zmux...")
         .style(Style::default().fg(Color::Yellow));
     f.render_widget(para, body);
+}
+
+pub fn status_bar_screen_row(
+    screen_rows: u16,
+    hide_status: bool,
+) -> Option<u16> {
+    if hide_status || screen_rows < 2 {
+        None
+    } else {
+        Some(screen_rows - 1)
+    }
+}
+
+pub fn status_window_tab_hit(
+    status: &StatusJson,
+    _width: u16,
+    col: u16,
+) -> Option<usize> {
+    let col = col as usize;
+    let mut used = 0usize;
+
+    let left = format!(" {} ", status.left);
+    used += unicode_display_width(&left);
+
+    for w in &status.windows {
+        let label = if w.active {
+            format!(" *[{}] {}* ", w.index, w.name)
+        } else {
+            format!("  [{}] {}  ", w.index, w.name)
+        };
+        let label_width = unicode_display_width(&label);
+        if col >= used && col < used + label_width {
+            return Some(w.index);
+        }
+        used += label_width;
+    }
+    None
 }
 
 pub fn tab_bar_hit(
@@ -1187,6 +1315,17 @@ fn unicode_char_width(c: char) -> usize {
     c.width().unwrap_or(1)
 }
 
+/// Padding fill for scrollback rows.  Alternates two visually identical spaces
+/// on each scroll step so ratatui re-emits default backgrounds and clears
+/// colored cells left on the physical terminal.
+fn pane_pad_fill(scrollback_stripe: bool) -> &'static str {
+    if scrollback_stripe {
+        "\u{00a0}"
+    } else {
+        " "
+    }
+}
+
 fn parse_color_str(s: &str) -> Color {
     match s {
         "default" | "" => Color::Reset,
@@ -1370,11 +1509,22 @@ pub fn render_session_chooser(
     let inner = block.inner(chooser_area);
     f.render_widget(block, chooser_area);
 
-    for (i, entry) in visible.iter().enumerate() {
-        if i >= inner.height as usize {
+    let view_height = inner.height as usize;
+    let scroll = if view_height == 0 {
+        0
+    } else if selected >= view_height {
+        selected + 1 - view_height
+    } else {
+        0
+    }
+    .min(visible.len().saturating_sub(view_height));
+
+    for row in 0..view_height {
+        let i = scroll + row;
+        let Some(entry) = visible.get(i) else {
             break;
-        }
-        let row_y = inner.y + i as u16;
+        };
+        let row_y = inner.y + row as u16;
         let is_sel = i == selected;
 
         let (label, style) = match entry {
@@ -1467,6 +1617,40 @@ pub fn render_session_chooser(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_window_tab_hit_matches_rendered_labels() {
+        let status = StatusJson {
+            left: "[main]".to_string(),
+            right: String::new(),
+            windows: vec![
+                WindowTabJson {
+                    index: 0,
+                    name: "zsh".to_string(),
+                    active: true,
+                },
+                WindowTabJson {
+                    index: 1,
+                    name: "vim".to_string(),
+                    active: false,
+                },
+            ],
+        };
+        let left_width = unicode_display_width(" [main] ");
+        let first_width = unicode_display_width(" *[0] zsh* ");
+        assert_eq!(
+            status_window_tab_hit(&status, 120, left_width as u16),
+            Some(0)
+        );
+        assert_eq!(
+            status_window_tab_hit(
+                &status,
+                120,
+                (left_width + first_width + 1) as u16
+            ),
+            Some(1)
+        );
+    }
 
     #[test]
     fn split_layout_rects_keeps_server_gap_rules() {

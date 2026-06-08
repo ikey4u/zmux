@@ -52,6 +52,7 @@ pub struct Pane {
     pub bell_pending: Arc<AtomicBool>,
     pub copy_state: Option<CopyModeState>,
     pub output_ring: Arc<Mutex<VecDeque<u8>>>,
+    pub reported_cwd: Arc<Mutex<Option<String>>>,
     pub start_dir: Option<String>,
 }
 

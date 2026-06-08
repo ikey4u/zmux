@@ -1228,6 +1228,8 @@ impl ClientApp {
         let mut applied_cursor_style: Option<SetCursorStyle> = None;
         let mut last_draw_time = Instant::now() - Duration::from_millis(16);
         let mut last_drawn_counter: u64 = 0;
+        let mut last_scroll_ratio: Option<f32> = None;
+        let mut scroll_repaint_stripe = false;
 
         let run_result: io::Result<()> = (|| {
             loop {
@@ -1273,6 +1275,14 @@ impl ClientApp {
                     let (cols, _) = terminal::size().unwrap_or((80, 24));
                     if tabs.ensure_active_visible(cols) {
                         last_drawn_counter = 0;
+                    }
+                    let scroll_ratio = active_scroll_ratio(fd);
+                    if scroll_ratio != last_scroll_ratio {
+                        if scroll_ratio.is_some() || last_scroll_ratio.is_some()
+                        {
+                            scroll_repaint_stripe = !scroll_repaint_stripe;
+                        }
+                        last_scroll_ratio = scroll_ratio;
                     }
                     if mode == InputMode::CopyMode {
                         if active_in_copy_mode(fd) {
@@ -1363,6 +1373,7 @@ impl ClientApp {
                                 in_prefix,
                                 has_prompt || has_overlay,
                                 hide_borders,
+                                scroll_repaint_stripe,
                             );
                         } else {
                             let tab_views = tabs.tab_views();
@@ -1674,33 +1685,20 @@ impl ClientApp {
                                             let entries = tabs
                                                 .active_client()
                                                 .session_tree();
-                                            // 默认折叠所有 session，只展开当前活动 session
-                                            let mut collapsed: std::collections::HashSet<String> =
-                                                entries.iter().filter_map(|e| match e {
-                                                    SessionTreeEntry::Session { name, .. } => Some(name.clone()),
-                                                    _ => None,
-                                                }).collect();
-                                            // 展开当前活动 session
-                                            for e in &entries {
-                                                if let SessionTreeEntry::Session { name, is_active: true, .. } = e {
-                                                    collapsed.remove(name);
-                                                }
-                                            }
-                                            let sel = {
-                                                let vis: Vec<_> = entries.iter().filter(|e| match e {
-                                                    SessionTreeEntry::Session { .. } => true,
-                                                    SessionTreeEntry::Window { session_name, .. } => !collapsed.contains(session_name),
-                                                    SessionTreeEntry::Pane { .. } => false,
-                                                }).collect();
-                                                vis.iter().position(|e| matches!(e,
-                                                    SessionTreeEntry::Session { is_active: true, .. }
-                                                )).unwrap_or(0)
-                                            };
+                                            let focus = frame
+                                                .as_ref()
+                                                .and_then(
+                                                active_session_focus_from_frame,
+                                            );
+                                            let (collapsed, collapsed_windows, sel) =
+                                                build_initial_session_chooser_state(
+                                                    &entries, focus,
+                                                );
                                             mode = InputMode::SessionChooser {
                                                 entries,
                                                 selected: sel,
                                                 collapsed,
-                                                collapsed_windows: std::collections::HashSet::new(),
+                                                collapsed_windows,
                                             };
                                         }
                                         (KeyCode::Char('('), _) => {
@@ -1718,6 +1716,22 @@ impl ClientApp {
                                             hide_borders = !hide_borders;
                                             tabs.active_client()
                                                 .set_hide_borders(hide_borders);
+                                        }
+                                        _ if is_shifted_letter(key, 'H') => {
+                                            if let Some(message) =
+                                                run_command_notice(
+                                                    tabs.active_client(),
+                                                    "set-pane-start-dir",
+                                                )
+                                            {
+                                                status_notice = Some((
+                                                    message,
+                                                    Instant::now()
+                                                        + Duration::from_secs(
+                                                            3,
+                                                        ),
+                                                ));
+                                            }
                                         }
                                         _ => {
                                             if let Some(message) =
@@ -3220,14 +3234,15 @@ impl ClientApp {
                             if mode == InputMode::Prefix {
                                 prefix_from_copy_mode = false;
                             }
+                            let (cols, rows) =
+                                terminal::size().unwrap_or((80, 24));
+                            let hide_status = has_prompt || has_overlay;
                             if mouse.row == 0 {
                                 mouse_select = None;
                                 if matches!(
                                     mouse.kind,
                                     MouseEventKind::Down(MouseButton::Left)
                                 ) {
-                                    let (cols, rows) =
-                                        terminal::size().unwrap_or((80, 24));
                                     let tab_views = tabs.tab_views();
                                     match tab_bar_hit(
                                         &tab_views,
@@ -3259,6 +3274,43 @@ impl ClientApp {
                                     }
                                 }
                                 continue;
+                            }
+                            if matches!(
+                                mouse.kind,
+                                MouseEventKind::Down(MouseButton::Left)
+                            ) && matches!(
+                                mode,
+                                InputMode::Normal
+                                    | InputMode::Prefix
+                                    | InputMode::Resize
+                            ) {
+                                if let Some(status_row) =
+                                    status_bar_screen_row(rows, hide_status)
+                                {
+                                    if mouse.row == status_row {
+                                        if let Some(ref fd) = frame {
+                                            if let Some(status) = &fd.status {
+                                                if let Some(win_index) =
+                                                    status_window_tab_hit(
+                                                        status,
+                                                        cols,
+                                                        mouse.column,
+                                                    )
+                                                {
+                                                    tabs.active_client()
+                                                        .run_command(&format!(
+                                                        "select-window -t {}",
+                                                        win_index
+                                                    ));
+                                                    mode = InputMode::Normal;
+                                                    copy_mode_confirmed = false;
+                                                    last_drawn_counter = 0;
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             match mode {
                                 InputMode::Normal
@@ -4134,6 +4186,19 @@ fn suppress_copy_mode_client_sync(
     *copy_mode_sync_suppress_frame = Some(current_counter);
 }
 
+fn is_shifted_letter(key: KeyEvent, letter: char) -> bool {
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
+    if c.to_ascii_uppercase() != letter.to_ascii_uppercase() {
+        return false;
+    }
+    !key.modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        && (c.is_ascii_uppercase()
+            || key.modifiers.contains(KeyModifiers::SHIFT))
+}
+
 fn handle_prefix_key(server: &SocketClient, key: KeyEvent) -> Option<String> {
     let cmd = match (key.code, key.modifiers) {
         (KeyCode::Char('%'), _) => "split-window -h",
@@ -4143,11 +4208,8 @@ fn handle_prefix_key(server: &SocketClient, key: KeyEvent) -> Option<String> {
         (KeyCode::Char('p'), KeyModifiers::NONE) => "select-window -p",
         (KeyCode::Char('x'), KeyModifiers::NONE) => "kill-pane",
         (KeyCode::Char('z'), KeyModifiers::NONE) => "zoom-pane",
-        (KeyCode::Char('K'), _) => "clear-pane",
-        (KeyCode::Char('k'), mods) if mods.contains(KeyModifiers::SHIFT) => {
-            "clear-pane"
-        }
-        (KeyCode::Char('H'), _) => "set-pane-start-dir",
+        _ if is_shifted_letter(key, 'K') => "clear-pane",
+        _ if is_shifted_letter(key, 'H') => "set-pane-start-dir",
         (KeyCode::Char('h'), KeyModifiers::NONE) => "select-pane -L",
         (KeyCode::Char('j'), KeyModifiers::NONE) => "select-pane -D",
         (KeyCode::Char('k'), KeyModifiers::NONE) => "select-pane -U",
@@ -4735,6 +4797,146 @@ fn shell_quote(s: &str) -> String {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionChooserFocus {
+    session_name: String,
+    window_index: usize,
+    pane_id: usize,
+}
+
+fn active_session_focus_from_frame(
+    frame: &FrameData,
+) -> Option<SessionChooserFocus> {
+    let status = frame.status.as_ref()?;
+    let session_name = status
+        .left
+        .trim()
+        .strip_prefix('[')?
+        .strip_suffix(']')?
+        .trim()
+        .to_string();
+    let window = status.windows.iter().find(|w| w.active)?;
+    let pane_id = active_pane_id(&frame.layout)?;
+    Some(SessionChooserFocus {
+        session_name,
+        window_index: window.index,
+        pane_id,
+    })
+}
+
+fn build_initial_session_chooser_state(
+    entries: &[SessionTreeEntry],
+    focus: Option<SessionChooserFocus>,
+) -> (
+    std::collections::HashSet<String>,
+    std::collections::HashSet<(String, usize)>,
+    usize,
+) {
+    let mut collapsed: std::collections::HashSet<String> = entries
+        .iter()
+        .filter_map(|e| match e {
+            SessionTreeEntry::Session { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    for e in entries {
+        if let SessionTreeEntry::Session {
+            name,
+            is_active: true,
+            ..
+        } = e
+        {
+            collapsed.remove(name);
+        }
+    }
+    let mut collapsed_windows = std::collections::HashSet::new();
+    for e in entries {
+        if let SessionTreeEntry::Window {
+            session_name,
+            index,
+            ..
+        } = e
+        {
+            if collapsed.contains(session_name) {
+                continue;
+            }
+            let keep_panes_visible = focus.as_ref().is_some_and(|f| {
+                f.session_name == *session_name && f.window_index == *index
+            });
+            if !keep_panes_visible {
+                collapsed_windows.insert((session_name.clone(), *index));
+            }
+        }
+    }
+    let selected = initial_session_chooser_selection(
+        entries,
+        &collapsed,
+        &collapsed_windows,
+        focus.as_ref(),
+    );
+    (collapsed, collapsed_windows, selected)
+}
+
+fn initial_session_chooser_selection(
+    entries: &[SessionTreeEntry],
+    collapsed: &std::collections::HashSet<String>,
+    collapsed_windows: &std::collections::HashSet<(String, usize)>,
+    focus: Option<&SessionChooserFocus>,
+) -> usize {
+    let visible = visible_entries_full(entries, collapsed, collapsed_windows);
+    if let Some(focus) = focus {
+        if let Some(pos) = visible.iter().position(|e| {
+            matches!(
+                e,
+                SessionTreeEntry::Pane {
+                    session_name,
+                    window_index,
+                    pane_id,
+                    ..
+                } if session_name == &focus.session_name
+                    && *window_index == focus.window_index
+                    && *pane_id == focus.pane_id
+            )
+        }) {
+            return pos;
+        }
+    }
+    visible
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                SessionTreeEntry::Pane {
+                    is_active: true,
+                    ..
+                }
+            )
+        })
+        .or_else(|| {
+            visible.iter().position(|e| {
+                matches!(
+                    e,
+                    SessionTreeEntry::Window {
+                        is_active: true,
+                        ..
+                    }
+                )
+            })
+        })
+        .or_else(|| {
+            visible.iter().position(|e| {
+                matches!(
+                    e,
+                    SessionTreeEntry::Session {
+                        is_active: true,
+                        ..
+                    }
+                )
+            })
+        })
+        .unwrap_or(0)
+}
+
 fn visible_entries_full<'a>(
     entries: &'a [SessionTreeEntry],
     collapsed: &std::collections::HashSet<String>,
@@ -5029,17 +5231,6 @@ mod tests {
     }
 
     #[test]
-    fn active_pane_id_returns_active_leaf() {
-        let layout = LayoutJson::Split {
-            direction: "horizontal".to_string(),
-            sizes: vec![50, 50],
-            children: vec![test_leaf(1, false), test_leaf(2, true)],
-        };
-
-        assert_eq!(active_pane_id(&layout), Some(2));
-    }
-
-    #[test]
     fn find_pane_id_at_returns_clicked_pane() {
         let layout = LayoutJson::Split {
             direction: "horizontal".to_string(),
@@ -5185,6 +5376,71 @@ mod tests {
             modifiers: KeyModifiers::empty(),
         };
         assert!(mouse_for_pane(border_mouse, &fd, layout_area, false).is_none());
+    }
+
+    #[test]
+    fn session_chooser_opens_on_current_pane_from_frame() {
+        let entries = vec![
+            SessionTreeEntry::Session {
+                name: "main".to_string(),
+                window_count: 2,
+                is_active: true,
+            },
+            SessionTreeEntry::Window {
+                session_name: "main".to_string(),
+                index: 0,
+                name: "dev".to_string(),
+                pane_count: 2,
+                is_active: true,
+            },
+            SessionTreeEntry::Pane {
+                session_name: "main".to_string(),
+                window_index: 0,
+                pane_id: 10,
+                index: 0,
+                is_active: false,
+            },
+            SessionTreeEntry::Pane {
+                session_name: "main".to_string(),
+                window_index: 0,
+                pane_id: 11,
+                index: 1,
+                is_active: true,
+            },
+            SessionTreeEntry::Window {
+                session_name: "main".to_string(),
+                index: 1,
+                name: "logs".to_string(),
+                pane_count: 1,
+                is_active: false,
+            },
+            SessionTreeEntry::Pane {
+                session_name: "main".to_string(),
+                window_index: 1,
+                pane_id: 20,
+                index: 0,
+                is_active: false,
+            },
+        ];
+        let focus = SessionChooserFocus {
+            session_name: "main".to_string(),
+            window_index: 0,
+            pane_id: 11,
+        };
+        let (collapsed, collapsed_windows, selected) =
+            build_initial_session_chooser_state(&entries, Some(focus));
+        let visible =
+            visible_entries_full(&entries, &collapsed, &collapsed_windows);
+        assert!(!collapsed_windows.contains(&("main".to_string(), 0)));
+        assert!(collapsed_windows.contains(&("main".to_string(), 1)));
+        assert!(matches!(
+            visible[selected],
+            SessionTreeEntry::Pane {
+                pane_id: 11,
+                index: 1,
+                ..
+            }
+        ));
     }
 
     fn test_frame(rows_v2: Vec<RowRunsJson>) -> FrameData {

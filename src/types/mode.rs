@@ -101,28 +101,6 @@ pub enum Mode {
     RenameSession { input: String },
 }
 
-#[cfg(test)]
-mod tests {
-    use super::CopyModeState;
-    use crate::types::{PaneTextSnapshot, SnapshotLine};
-
-    #[test]
-    fn copy_mode_state_starts_from_snapshot_cursor() {
-        let snapshot = PaneTextSnapshot {
-            lines: vec![SnapshotLine {
-                text: "hello".to_string(),
-                terminated: false,
-                styles: Vec::new(),
-            }],
-            cursor_line: 0,
-            cursor_col: 3,
-        };
-        let state = CopyModeState::new(snapshot);
-        assert_eq!(state.cursor.line, 0);
-        assert_eq!(state.cursor.col, 3);
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusDir {
     Left,

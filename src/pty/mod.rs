@@ -20,6 +20,8 @@ use crate::{
     types::{Pane, PaneId},
 };
 
+mod osc7;
+
 pub const CURSOR_SHAPE_UNSET: u8 = 255;
 
 #[cfg(unix)]
@@ -106,6 +108,7 @@ pub fn spawn_pane(opts: SpawnOptions<'_>) -> io::Result<Pane> {
     let output_ring: Arc<Mutex<VecDeque<u8>>> =
         Arc::new(Mutex::new(VecDeque::new()));
     let dead: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    let reported_cwd: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     start_reader_thread(
         pair.master
@@ -118,6 +121,7 @@ pub fn spawn_pane(opts: SpawnOptions<'_>) -> io::Result<Pane> {
         Arc::clone(&bell_pending),
         Arc::clone(&output_ring),
         Arc::clone(&dead),
+        Arc::clone(&reported_cwd),
     );
 
     Ok(Pane {
@@ -138,6 +142,7 @@ pub fn spawn_pane(opts: SpawnOptions<'_>) -> io::Result<Pane> {
         bell_pending,
         copy_state: None,
         output_ring,
+        reported_cwd,
         start_dir: opts.start_dir.map(|s| s.to_string()),
     })
 }
@@ -163,9 +168,15 @@ pub fn default_start_dir() -> Option<String> {
 }
 
 pub fn pane_current_dir(pane: &Pane) -> Option<String> {
-    pane.child_pid
-        .or_else(|| pane.child.process_id())
-        .and_then(process_current_dir)
+    pane.reported_cwd
+        .lock()
+        .ok()
+        .and_then(|cwd| cwd.clone())
+        .or_else(|| {
+            pane.child_pid
+                .or_else(|| pane.child.process_id())
+                .and_then(process_current_dir)
+        })
         .or_else(|| pane.start_dir.clone())
 }
 
@@ -207,7 +218,15 @@ fn process_current_dir(_pid: u32) -> Option<String> {
     None
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+mod windows_cwd;
+
+#[cfg(windows)]
+fn process_current_dir(pid: u32) -> Option<String> {
+    windows_cwd::process_current_dir(pid)
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn process_current_dir(_pid: u32) -> Option<String> {
     None
 }
@@ -249,7 +268,21 @@ fn configure_windows_default_shell(shell: &str, cmd: &mut CommandBuilder) {
         cmd.arg("-NoExit");
         cmd.arg("-Command");
         cmd.arg(windows_powershell_emacs_script());
+    } else if is_windows_cmd_shell(shell) {
+        cmd.arg("/K");
+        cmd.arg(r"prompt $E]7;file://$P$E\$G");
     }
+}
+
+#[cfg(windows)]
+fn is_windows_cmd_shell(shell: &str) -> bool {
+    let Some(name) = std::path::Path::new(shell)
+        .file_stem()
+        .and_then(|name| name.to_str())
+    else {
+        return false;
+    };
+    name.eq_ignore_ascii_case("cmd")
 }
 
 #[cfg(windows)]
@@ -265,7 +298,7 @@ fn is_windows_powershell_shell(shell: &str) -> bool {
 
 #[cfg(windows)]
 fn windows_powershell_emacs_script() -> &'static str {
-    r"try { Import-Module PSReadLine -ErrorAction Stop; Set-PSReadLineOption -EditMode Emacs -ErrorAction Stop; function global:__zmux_bind($c,$f) { try { Set-PSReadLineKeyHandler -Chord $c -Function $f -ErrorAction Stop } catch {} }; __zmux_bind 'Ctrl+a' BeginningOfLine; __zmux_bind 'Ctrl+b' BackwardChar; __zmux_bind 'Ctrl+d' DeleteCharOrExit; __zmux_bind 'Ctrl+e' EndOfLine; __zmux_bind 'Ctrl+f' ForwardChar; __zmux_bind 'Ctrl+k' KillLine; __zmux_bind 'Ctrl+l' ClearScreen; __zmux_bind 'Ctrl+n' NextHistory; __zmux_bind 'Ctrl+p' PreviousHistory; __zmux_bind 'Ctrl+r' ReverseSearchHistory; __zmux_bind 'Ctrl+s' ForwardSearchHistory; __zmux_bind 'Ctrl+t' SwapCharacters; __zmux_bind 'Ctrl+u' BackwardKillInput; Remove-Item Function:\__zmux_bind -ErrorAction SilentlyContinue } catch {}"
+    r"function global:__zmux_emit_cwd { try { $p = (Get-Location).Path -replace '\\','/'; $e = [char]27; [Console]::Write([string]::Concat($e, ']7;file:///', $p, $e, '\')) } catch {} }; function global:prompt { __zmux_emit_cwd; 'PS ' + $executionContext.SessionState.Path.CurrentLocation + '> ' }; __zmux_emit_cwd; try { Import-Module PSReadLine -ErrorAction Stop; Set-PSReadLineOption -EditMode Emacs -ErrorAction Stop; function global:__zmux_bind($c,$f) { try { Set-PSReadLineKeyHandler -Chord $c -Function $f -ErrorAction Stop } catch {} }; __zmux_bind 'Ctrl+a' BeginningOfLine; __zmux_bind 'Ctrl+b' BackwardChar; __zmux_bind 'Ctrl+d' DeleteCharOrExit; __zmux_bind 'Ctrl+e' EndOfLine; __zmux_bind 'Ctrl+f' ForwardChar; __zmux_bind 'Ctrl+k' KillLine; __zmux_bind 'Ctrl+l' ClearScreen; __zmux_bind 'Ctrl+n' NextHistory; __zmux_bind 'Ctrl+p' PreviousHistory; __zmux_bind 'Ctrl+r' ReverseSearchHistory; __zmux_bind 'Ctrl+s' ForwardSearchHistory; __zmux_bind 'Ctrl+t' SwapCharacters; __zmux_bind 'Ctrl+u' BackwardKillInput; Remove-Item Function:\__zmux_bind -ErrorAction SilentlyContinue } catch {}"
 }
 
 #[cfg(windows)]
@@ -322,10 +355,12 @@ fn start_reader_thread(
     bell_pending: Arc<AtomicBool>,
     output_ring: Arc<Mutex<VecDeque<u8>>>,
     dead_flag: Arc<AtomicBool>,
+    reported_cwd: Arc<Mutex<Option<String>>>,
 ) {
     thread::spawn(move || {
         let mut buf = [0u8; 65536];
         let mut cursor_tracker = CursorShapeTracker::default();
+        let mut cwd_tracker = osc7::CwdTracker::default();
         let render_debounce_seq = Arc::new(AtomicU64::new(0));
         let mut burst_window_start = Instant::now();
         let mut burst_bytes = 0usize;
@@ -358,6 +393,7 @@ fn start_reader_thread(
                         }
                     }
                     cursor_tracker.process(data, &cursor_shape);
+                    cwd_tracker.process(data, &reported_cwd);
                     data_version.fetch_add(1, Ordering::Relaxed);
                     let now = Instant::now();
                     if now.duration_since(burst_window_start)
