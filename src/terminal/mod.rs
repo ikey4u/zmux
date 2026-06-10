@@ -1,4 +1,7 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    hash::{Hash, Hasher},
+};
 
 use alacritty_terminal::{
     event::VoidListener,
@@ -14,6 +17,11 @@ use alacritty_terminal::{
     },
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+pub mod osc_colors;
+mod output_buffer;
+
+pub use output_buffer::OutputBuffer;
 
 #[derive(Clone, Copy)]
 pub struct TermSize {
@@ -53,6 +61,11 @@ pub struct AlacrittyTermState {
     scroll_on_erase_history: bool,
     suppress_next_scroll_on_erase: bool,
     pending_scroll_erase_escape: Vec<u8>,
+    pane_default_fg: Option<(u8, u8, u8)>,
+    pane_default_bg: Option<(u8, u8, u8)>,
+    output_buffer: OutputBuffer,
+    row_hashes: Vec<u64>,
+    last_display_offset: usize,
 }
 
 #[derive(Clone)]
@@ -78,7 +91,88 @@ impl AlacrittyTermState {
             scroll_on_erase_history: false,
             suppress_next_scroll_on_erase: false,
             pending_scroll_erase_escape: Vec::new(),
+            pane_default_fg: None,
+            pane_default_bg: None,
+            output_buffer: OutputBuffer::default(),
+            row_hashes: Vec::new(),
+            last_display_offset: 0,
         }
+    }
+
+    pub fn set_pane_default_fg(&mut self, rgb: (u8, u8, u8)) {
+        self.pane_default_fg = Some(rgb);
+        self.output_buffer.update_all_lines();
+    }
+
+    pub fn set_pane_default_bg(&mut self, rgb: (u8, u8, u8)) {
+        self.pane_default_bg = Some(rgb);
+        self.output_buffer.update_all_lines();
+    }
+
+    pub fn reset_pane_default_fg(&mut self) {
+        self.pane_default_fg = None;
+        self.output_buffer.update_all_lines();
+    }
+
+    pub fn reset_pane_default_bg(&mut self) {
+        self.pane_default_bg = None;
+        self.output_buffer.update_all_lines();
+    }
+
+    pub fn pane_default_fg(&self) -> Option<(u8, u8, u8)> {
+        self.pane_default_fg
+    }
+
+    pub fn pane_default_bg(&self) -> Option<(u8, u8, u8)> {
+        self.pane_default_bg
+    }
+
+    pub fn output_buffer(&self) -> &OutputBuffer {
+        &self.output_buffer
+    }
+
+    pub fn clear_output_buffer(&mut self) {
+        self.output_buffer.clear();
+    }
+
+    pub fn force_output_full_repaint(&mut self) {
+        self.output_buffer.update_all_lines();
+    }
+
+    pub fn after_pty_process(&mut self, changed: bool) {
+        if !changed {
+            return;
+        }
+        let display_offset = self.term.grid().display_offset();
+        if display_offset != self.last_display_offset {
+            self.output_buffer.update_all_lines();
+            self.last_display_offset = display_offset;
+            self.rehash_all_rows();
+            return;
+        }
+        self.diff_visible_rows();
+    }
+
+    fn diff_visible_rows(&mut self) {
+        let rows = self.visible_rows();
+        if self.row_hashes.len() != rows.len() {
+            self.row_hashes.resize(rows.len(), 0);
+            self.output_buffer.update_all_lines();
+        }
+        for (i, row) in rows.iter().enumerate() {
+            let hash = hash_row(row);
+            if self.row_hashes.get(i) != Some(&hash) {
+                self.output_buffer.update_line(i);
+                if let Some(slot) = self.row_hashes.get_mut(i) {
+                    *slot = hash;
+                }
+            }
+        }
+    }
+
+    fn rehash_all_rows(&mut self) {
+        let rows = self.visible_rows();
+        self.row_hashes = rows.iter().map(|row| hash_row(row)).collect();
     }
 
     pub fn set_scroll_on_erase_in_display(&mut self, enabled: bool) {
@@ -220,6 +314,9 @@ impl AlacrittyTermState {
         self.term.resize(size);
         self.rows = size.screen_lines() as u16;
         self.cols = size.columns() as u16;
+        self.output_buffer.update_all_lines();
+        self.row_hashes.clear();
+        self.last_display_offset = self.term.grid().display_offset();
     }
 
     pub fn size(&self) -> (u16, u16) {
@@ -263,12 +360,37 @@ impl AlacrittyTermState {
         self.term
             .grid_mut()
             .scroll_display(alacritty_terminal::grid::Scroll::Bottom);
+        self.after_display_scroll();
     }
 
     pub fn scrollback_top(&mut self) {
         self.term
             .grid_mut()
             .scroll_display(alacritty_terminal::grid::Scroll::Top);
+        self.after_display_scroll();
+    }
+
+    /// Scroll the visible viewport through scrollback. Positive delta moves up
+    /// into history; negative delta moves back toward the live bottom.
+    pub fn scroll_display_delta(&mut self, delta: i32) -> bool {
+        if delta == 0 || self.alternate_screen() {
+            return false;
+        }
+        self.term
+            .grid_mut()
+            .scroll_display(alacritty_terminal::grid::Scroll::Delta(delta));
+        self.after_display_scroll();
+        true
+    }
+
+    fn after_display_scroll(&mut self) {
+        self.output_buffer.update_all_lines();
+        self.last_display_offset = self.term.grid().display_offset();
+        self.rehash_all_rows();
+    }
+
+    pub fn display_offset(&self) -> usize {
+        self.term.grid().display_offset()
     }
 
     pub fn visible_rows(&self) -> Vec<Vec<Option<TerminalCell>>> {
@@ -332,6 +454,47 @@ impl AlacrittyTermState {
             cursor.column.0,
         )
     }
+}
+
+fn hash_row(cells: &[Option<TerminalCell>]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    let mut hasher = DefaultHasher::new();
+    for cell in cells {
+        match cell {
+            None => 0u8.hash(&mut hasher),
+            Some(c) => {
+                1u8.hash(&mut hasher);
+                c.text.hash(&mut hasher);
+                color_hash(c.fg).hash(&mut hasher);
+                color_hash(c.bg).hash(&mut hasher);
+                c.flags.bits().hash(&mut hasher);
+                c.width.hash(&mut hasher);
+            }
+        }
+    }
+    hasher.finish()
+}
+
+fn color_hash(color: Color) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    let mut hasher = DefaultHasher::new();
+    match color {
+        Color::Named(named) => {
+            0u8.hash(&mut hasher);
+            format!("{named:?}").hash(&mut hasher);
+        }
+        Color::Indexed(i) => {
+            1u8.hash(&mut hasher);
+            i.hash(&mut hasher);
+        }
+        Color::Spec(rgb) => {
+            2u8.hash(&mut hasher);
+            rgb.r.hash(&mut hasher);
+            rgb.g.hash(&mut hasher);
+            rgb.b.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
 }
 
 fn is_erase_display_all(params: &[u8]) -> bool {
@@ -476,6 +639,24 @@ mod tests {
         term.set_scroll_on_erase_in_display(true);
         term.process(b"alpha\r\nbeta\r\ngamma\x1b[H\x1b[2Jprompt");
         assert!(term.scroll_on_erase_history());
+    }
+
+    #[test]
+    fn scroll_display_delta_moves_through_scrollback() {
+        let mut term = AlacrittyTermState::new(3, 20, 2000);
+        term.process(b"line-one\r\nline-two\r\nline-three\r\n");
+        assert_eq!(term.display_offset(), 0);
+        assert!(term.scroll_display_delta(1));
+        assert_eq!(term.display_offset(), 1);
+        assert!(term.scroll_display_delta(-1));
+        assert_eq!(term.display_offset(), 0);
+    }
+
+    #[test]
+    fn scroll_display_delta_is_noop_on_alternate_screen() {
+        let mut term = AlacrittyTermState::new(3, 20, 2000);
+        term.process(b"\x1b[?1049h");
+        assert!(!term.scroll_display_delta(1));
     }
 
     #[test]

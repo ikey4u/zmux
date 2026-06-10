@@ -17,7 +17,10 @@ use crossterm::{
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::Terminal;
+
+mod backend;
+use backend::TerminalBackend;
 use serde::{Deserialize, Serialize};
 
 mod render;
@@ -120,6 +123,7 @@ struct StoredTabMetadata {
 struct TabManager {
     tabs: Vec<ClientTab>,
     active: usize,
+    tab_bar_offset: usize,
     base_socket: String,
     start_dir: Option<String>,
     next_id: usize,
@@ -161,6 +165,7 @@ impl TabManager {
                 client,
             }],
             active: 0,
+            tab_bar_offset: 0,
             base_socket: base_socket.to_string(),
             start_dir,
             next_id: 1,
@@ -230,6 +235,7 @@ impl TabManager {
         }
         Ok(Self {
             active: 0,
+            tab_bar_offset: 0,
             base_socket: base_socket.to_string(),
             start_dir,
             next_id: tabs.len().max(1),
@@ -271,6 +277,9 @@ impl TabManager {
             return false;
         }
         self.active = index;
+        if index < self.tab_bar_offset {
+            self.tab_bar_offset = index;
+        }
         true
     }
 
@@ -364,19 +373,32 @@ impl TabManager {
     }
 
     fn ensure_active_visible(&mut self, width: u16) -> bool {
-        if self.tabs.len() <= 1 {
+        if self.tabs.is_empty() {
             return false;
         }
-        let Some(last_visible) =
-            last_visible_tab_index(&self.tab_views(), width)
-        else {
-            return false;
-        };
-        if self.active <= last_visible {
+        let views = self.tab_views();
+        let visible = tab_bar_visible_range(&views, width, self.tab_bar_offset);
+        if self.active >= visible.start && self.active < visible.end {
             return false;
         }
-        self.tabs.swap(self.active, last_visible);
-        self.active = last_visible;
+        for offset in 0..=self.active.min(self.tabs.len().saturating_sub(1)) {
+            let range = tab_bar_visible_range(&views, width, offset);
+            if self.active >= range.start && self.active < range.end {
+                if offset != self.tab_bar_offset {
+                    self.tab_bar_offset = offset;
+                    return true;
+                }
+                return false;
+            }
+        }
+        false
+    }
+
+    fn scroll_tab_bar_back(&mut self) -> bool {
+        if self.tab_bar_offset == 0 {
+            return false;
+        }
+        self.tab_bar_offset -= 1;
         true
     }
 
@@ -424,15 +446,14 @@ impl TabManager {
         size: Size,
         preferred_code: Option<&str>,
     ) -> io::Result<()> {
-        if self.tabs.iter().any(|tab| tab.socket_name == socket_name) {
-            if let Some(index) = self
-                .tabs
-                .iter()
-                .position(|tab| tab.socket_name == socket_name)
-            {
-                let tab = &self.tabs[index];
-                set_tab_visibility(socket_name, &tab.code, &tab.title, true)?;
-            }
+        if let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.socket_name == socket_name)
+        {
+            let tab = &self.tabs[index];
+            set_tab_visibility(socket_name, &tab.code, &tab.title, true)?;
+            self.active = index;
             return Ok(());
         }
         let metadata = load_tab_metadata();
@@ -462,6 +483,7 @@ impl TabManager {
             socket_name: socket_name.to_string(),
             client,
         });
+        self.active = self.tabs.len() - 1;
         Ok(())
     }
 
@@ -493,6 +515,9 @@ impl TabManager {
             self.active = self.tabs.len() - 1;
         } else if index < self.active {
             self.active -= 1;
+        }
+        if self.tab_bar_offset >= self.tabs.len() {
+            self.tab_bar_offset = self.tabs.len().saturating_sub(1);
         }
         Ok(())
     }
@@ -1019,6 +1044,26 @@ fn select_tab_by_code(
     Ok(())
 }
 
+fn floating_overlay_rect(
+    mode: &InputMode,
+    area: ratatui::layout::Rect,
+) -> Option<ratatui::layout::Rect> {
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+    match mode {
+        InputMode::TabChooser { .. } | InputMode::SessionChooser { .. } => {
+            Some(chooser_overlay_panel(area))
+        }
+        InputMode::RenameTab { .. } => Some(rename_tab_panel_rect(area)),
+        InputMode::OptionPanel { .. } => Some(options_panel_rect(area)),
+        InputMode::TabQuickSwitch { .. } => {
+            Some(tab_quick_switch_panel_rect(area))
+        }
+        _ => None,
+    }
+}
+
 fn rename_tab_mode_for_active(
     tabs: &TabManager,
     return_to_tab_chooser: bool,
@@ -1213,7 +1258,7 @@ impl ClientApp {
             Err(e) if e.kind() == io::ErrorKind::Unsupported => false,
             Err(e) => return Err(e),
         };
-        let backend = CrosstermBackend::new(stdout);
+        let backend = TerminalBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
         let mut mouse_select: Option<MouseSelection> = None;
 
@@ -1222,15 +1267,15 @@ impl ClientApp {
         let mut copy_mode_confirmed = false;
         let mut prefix_from_copy_mode = false;
         let mut copy_mode_sync_suppress_frame: Option<u64> = None;
+        let mut copy_mode_exit_pending = false;
+        let mut display_scrolled = false;
         let mut resize_deadline: Option<Instant> = None;
         let mut status_notice: Option<(String, Instant)> = None;
         let mut hide_borders = false;
         let mut applied_cursor_style: Option<SetCursorStyle> = None;
         let mut last_draw_time = Instant::now() - Duration::from_millis(16);
         let mut last_drawn_counter: u64 = 0;
-        let mut last_scroll_ratio: Option<f32> = None;
-        let mut scroll_repaint_stripe = false;
-
+        let mut last_overlay_rect: Option<ratatui::layout::Rect> = None;
         let run_result: io::Result<()> = (|| {
             loop {
                 let frame = tabs.active_client().latest_frame();
@@ -1276,13 +1321,8 @@ impl ClientApp {
                     if tabs.ensure_active_visible(cols) {
                         last_drawn_counter = 0;
                     }
-                    let scroll_ratio = active_scroll_ratio(fd);
-                    if scroll_ratio != last_scroll_ratio {
-                        if scroll_ratio.is_some() || last_scroll_ratio.is_some()
-                        {
-                            scroll_repaint_stripe = !scroll_repaint_stripe;
-                        }
-                        last_scroll_ratio = scroll_ratio;
+                    if !active_in_copy_mode(fd) {
+                        copy_mode_exit_pending = false;
                     }
                     if mode == InputMode::CopyMode {
                         if active_in_copy_mode(fd) {
@@ -1293,6 +1333,7 @@ impl ClientApp {
                         }
                     } else if mode == InputMode::Normal
                         && active_in_copy_mode(fd)
+                        && !copy_mode_exit_pending
                         && !matches!(
                             copy_mode_sync_suppress_frame,
                             Some(suppressed) if suppressed == current_counter
@@ -1349,14 +1390,47 @@ impl ClientApp {
                         | InputMode::RenameTab { .. }
                         | InputMode::TabQuickSwitch { .. }
                 );
+                let hide_status = has_prompt;
+
+                let (cols, rows) = terminal::size().unwrap_or((80, 24));
+                let terminal_area =
+                    ratatui::layout::Rect::new(0, 0, cols, rows);
+                let current_overlay_rect =
+                    floating_overlay_rect(&mode, terminal_area);
+                let stale_overlay_rect =
+                    if last_overlay_rect != current_overlay_rect {
+                        last_overlay_rect
+                    } else {
+                        None
+                    };
+                if stale_overlay_rect.is_some() {
+                    last_drawn_counter = 0;
+                }
 
                 let frame_new = current_counter != last_drawn_counter;
                 if frame_new
                     || last_draw_time.elapsed() >= Duration::from_millis(16)
                 {
+                    if frame_new {
+                        if let Some(ref fd) = frame {
+                            if let Some(ref ansi) = fd.ansi {
+                                if let Err(err) = write_server_ansi(
+                                    terminal.backend_mut(),
+                                    ansi,
+                                ) {
+                                    log_client(&format!(
+                                        "failed to write pane ansi: {err}"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    let draw_ansi_selection = mouse_select.is_some()
+                        && frame.as_ref().is_some_and(|fd| fd.ansi.is_some());
                     terminal.draw(|f| {
                         let in_prefix = mode == InputMode::Prefix;
                         if let Some(ref fd) = frame {
+                            skip_pane_area_for_ansi(f, fd, hide_borders);
                             let mut display_frame = fd.clone();
                             if let Some(ref message) = status_banner {
                                 if let Some(status) =
@@ -1370,14 +1444,18 @@ impl ClientApp {
                                 f,
                                 &display_frame,
                                 &tab_views,
+                                tabs.tab_bar_offset,
                                 in_prefix,
-                                has_prompt || has_overlay,
+                                hide_status,
                                 hide_borders,
-                                scroll_repaint_stripe,
                             );
                         } else {
                             let tab_views = tabs.tab_views();
-                            render_tabbed_loading(f, &tab_views);
+                            render_tabbed_loading(
+                                f,
+                                &tab_views,
+                                tabs.tab_bar_offset,
+                            );
                         }
                         match &mode {
                             InputMode::CopySearch { buf, forward, .. } => {
@@ -1466,17 +1544,61 @@ impl ClientApp {
                         }
                         if let Some(ref sel) = mouse_select {
                             if let Some(ref fd) = frame {
-                                render_mouse_selection(
-                                    f,
-                                    sel,
-                                    fd,
-                                    hide_borders,
-                                );
+                                if fd.ansi.is_none() {
+                                    render_mouse_selection(
+                                        f,
+                                        sel,
+                                        fd,
+                                        hide_borders,
+                                    );
+                                }
                             }
                         }
                     })?;
+                    if draw_ansi_selection {
+                        if let (Some(ref fd), Some(ref sel)) =
+                            (frame.as_ref(), mouse_select.as_ref())
+                        {
+                            let (cols, rows) =
+                                terminal::size().unwrap_or((80, 24));
+                            if let Err(err) = write_mouse_selection_ansi(
+                                terminal.backend_mut(),
+                                fd,
+                                sel,
+                                cols,
+                                rows,
+                                hide_borders,
+                            ) {
+                                log_client(&format!(
+                                    "failed to write selection ansi: {err}"
+                                ));
+                            }
+                        }
+                    }
+                    if let Some(ref fd) = frame {
+                        if fd.ansi.is_some() {
+                            if has_overlay || has_prompt {
+                                terminal.hide_cursor()?;
+                            } else {
+                                let (cols, rows) =
+                                    terminal::size().unwrap_or((80, 24));
+                                let frame_area = server_frame_area(cols, rows);
+                                if let Some(pos) = active_cursor_screen_position(
+                                    fd,
+                                    frame_area,
+                                    hide_borders,
+                                ) {
+                                    terminal.set_cursor_position(pos)?;
+                                    terminal.show_cursor()?;
+                                } else {
+                                    terminal.hide_cursor()?;
+                                }
+                            }
+                        }
+                    }
                     last_draw_time = Instant::now();
                     last_drawn_counter = current_counter;
+                    last_overlay_rect = current_overlay_rect;
                 }
 
                 if event::poll(Duration::from_millis(8))? {
@@ -1489,21 +1611,32 @@ impl ClientApp {
                                 InputMode::Normal => {
                                     if (key.code, key.modifiers) == prefix_key {
                                         mode = InputMode::Prefix;
-                                    } else if frame
-                                        .as_ref()
-                                        .map_or(false, active_in_copy_mode)
+                                    } else if matches!(
+                                        (key.code, key.modifiers),
+                                        (KeyCode::Esc, _)
+                                            | (
+                                                KeyCode::Char('q'),
+                                                KeyModifiers::NONE,
+                                            )
+                                    ) && display_scrolled
                                     {
-                                        // Server is in copy mode but client
-                                        // hasn't synced yet (e.g. scroll-entered
-                                        // copy mode, key arrived before next
-                                        // frame).  Switch to CopyMode and re-
-                                        // dispatch the key through that handler.
-                                        mode = InputMode::CopyMode;
-                                        copy_mode_confirmed = true;
-                                        // fall through on next iteration; for
-                                        // now just eat the key to avoid double
-                                        // output.
+                                        tabs.active_client()
+                                            .scroll_display_bottom();
+                                        display_scrolled = false;
+                                        last_drawn_counter = 0;
                                     } else {
+                                        if frame
+                                            .as_ref()
+                                            .is_some_and(active_in_copy_mode)
+                                        {
+                                            leave_copy_mode_client(
+                                                tabs.active_client(),
+                                                &mut mode,
+                                                &mut copy_mode_confirmed,
+                                                &mut copy_mode_exit_pending,
+                                                &mut display_scrolled,
+                                            );
+                                        }
                                         let bytes = key_to_bytes(key);
                                         if !bytes.is_empty() {
                                             tabs.active_client()
@@ -1544,6 +1677,7 @@ impl ClientApp {
                                         resize_command_for_key(key)
                                     {
                                         tabs.active_client().run_command(cmd);
+                                        last_drawn_counter = 0;
                                         mode = InputMode::Resize;
                                         resize_deadline = Some(
                                             Instant::now()
@@ -1563,8 +1697,18 @@ impl ClientApp {
                                             KeyCode::Char('t'),
                                             KeyModifiers::NONE,
                                         ) => {
+                                            if prefix_started_from_copy_mode
+                                                || frame.as_ref().is_some_and(
+                                                    active_in_copy_mode,
+                                                )
+                                            {
+                                                tabs.active_client()
+                                                    .exit_copy_mode();
+                                                copy_mode_confirmed = false;
+                                            }
                                             mode =
                                                 default_tab_chooser_mode(&tabs);
+                                            last_drawn_counter = 0;
                                         }
                                         (KeyCode::Char('/'), _) => {
                                             mode = tab_quick_switch_mode();
@@ -1667,6 +1811,8 @@ impl ClientApp {
                                             {
                                                 mode = InputMode::CopyMode;
                                                 copy_mode_confirmed = false;
+                                                copy_mode_exit_pending = false;
+                                                display_scrolled = false;
                                             } else {
                                                 status_notice = Some((
                                                     "copy mode unavailable"
@@ -1700,6 +1846,7 @@ impl ClientApp {
                                                 collapsed,
                                                 collapsed_windows,
                                             };
+                                            last_drawn_counter = 0;
                                         }
                                         (KeyCode::Char('('), _) => {
                                             tabs.active_client()
@@ -1764,6 +1911,7 @@ impl ClientApp {
                                         resize_command_for_key(key)
                                     {
                                         tabs.active_client().run_command(cmd);
+                                        last_drawn_counter = 0;
                                         resize_deadline = Some(
                                             Instant::now()
                                                 + RESIZE_IDLE_TIMEOUT,
@@ -1884,10 +2032,14 @@ impl ClientApp {
                                             KeyCode::Char('q'),
                                             KeyModifiers::NONE,
                                         ) => {
-                                            tabs.active_client()
-                                                .exit_copy_mode();
-                                            mode = InputMode::Normal;
-                                            copy_mode_confirmed = false;
+                                            leave_copy_mode_client(
+                                                tabs.active_client(),
+                                                &mut mode,
+                                                &mut copy_mode_confirmed,
+                                                &mut copy_mode_exit_pending,
+                                                &mut display_scrolled,
+                                            );
+                                            last_drawn_counter = 0;
                                         }
                                         (KeyCode::Char('/'), mods)
                                             if is_copy_plain_key(mods) =>
@@ -2085,10 +2237,13 @@ impl ClientApp {
                                                 ));
                                                 mode = InputMode::CopyMode;
                                             } else {
-                                                tabs.active_client()
-                                                    .exit_copy_mode();
-                                                mode = InputMode::Normal;
-                                                copy_mode_confirmed = false;
+                                                leave_copy_mode_client(
+                                                    tabs.active_client(),
+                                                    &mut mode,
+                                                    &mut copy_mode_confirmed,
+                                                    &mut copy_mode_exit_pending,
+                                                    &mut display_scrolled,
+                                                );
                                                 let copy_result =
                                                     copy_to_clipboard(&text);
                                                 status_notice = Some((
@@ -2153,6 +2308,19 @@ impl ClientApp {
                                         }
                                         KeyCode::Esc => {
                                             mode = InputMode::CopyMode;
+                                        }
+                                        KeyCode::Char('q')
+                                            if key.modifiers
+                                                == KeyModifiers::NONE =>
+                                        {
+                                            leave_copy_mode_client(
+                                                tabs.active_client(),
+                                                &mut mode,
+                                                &mut copy_mode_confirmed,
+                                                &mut copy_mode_exit_pending,
+                                                &mut display_scrolled,
+                                            );
+                                            last_drawn_counter = 0;
                                         }
                                         KeyCode::Backspace => {
                                             if cursor > 0 {
@@ -2224,6 +2392,7 @@ impl ClientApp {
                                 } => match key.code {
                                     KeyCode::Esc | KeyCode::Char('q') => {
                                         mode = InputMode::Normal;
+                                        last_drawn_counter = 0;
                                     }
                                     KeyCode::Enter | KeyCode::Char(' ') => {
                                         let enabled =
@@ -2259,6 +2428,7 @@ impl ClientApp {
                                     match key.code {
                                         KeyCode::Esc | KeyCode::Char('q') => {
                                             mode = InputMode::Normal;
+                                            last_drawn_counter = 0;
                                         }
                                         KeyCode::Up | KeyCode::Char('k') => {
                                             if selected > 0 {
@@ -2322,9 +2492,19 @@ impl ClientApp {
                                             } else {
                                                 selected
                                             };
+                                            let visible_len =
+                                                visible_entries_full(
+                                                    &entries,
+                                                    &collapsed,
+                                                    &collapsed_windows,
+                                                )
+                                                .len();
                                             mode = InputMode::SessionChooser {
                                                 entries,
-                                                selected: new_sel,
+                                                selected: clamp_session_chooser_selected(
+                                                    new_sel,
+                                                    visible_len,
+                                                ),
                                                 collapsed,
                                                 collapsed_windows,
                                             };
@@ -2364,14 +2544,26 @@ impl ClientApp {
                                                     }
                                                 }
                                             }
+                                            let visible_len =
+                                                visible_entries_full(
+                                                    &entries,
+                                                    &collapsed,
+                                                    &collapsed_windows,
+                                                )
+                                                .len();
                                             mode = InputMode::SessionChooser {
                                                 entries,
-                                                selected,
+                                                selected: clamp_session_chooser_selected(
+                                                    selected,
+                                                    visible_len,
+                                                ),
                                                 collapsed,
                                                 collapsed_windows,
                                             };
                                         }
-                                        KeyCode::Enter => {
+                                        KeyCode::Enter
+                                        | KeyCode::Char('\r')
+                                        | KeyCode::Char('\n') => {
                                             if let Some(entry) =
                                                 visible.get(selected)
                                             {
@@ -2387,6 +2579,7 @@ impl ClientApp {
                                                     .run_command(&cmd);
                                             }
                                             mode = InputMode::Normal;
+                                            last_drawn_counter = 0;
                                         }
                                         _ => {
                                             mode = InputMode::SessionChooser {
@@ -2405,6 +2598,7 @@ impl ClientApp {
                                 } => match (key.code, key.modifiers) {
                                     (KeyCode::Esc, _) => {
                                         mode = InputMode::Normal;
+                                        last_drawn_counter = 0;
                                     }
                                     (KeyCode::Backspace, _) => {
                                         code.pop();
@@ -2475,6 +2669,7 @@ impl ClientApp {
                                         KeyModifiers::NONE,
                                     ) => {
                                         mode = InputMode::Normal;
+                                        last_drawn_counter = 0;
                                     }
                                     (KeyCode::Char('/'), _)
                                     | (KeyCode::Char('?'), _) => {
@@ -2498,35 +2693,74 @@ impl ClientApp {
                                         if let Some(&tab_index) =
                                             matches.get(selected)
                                         {
-                                            let tab = &tab_views[tab_index];
-                                            if tab.visible
-                                                && tabs.select_socket(
+                                            let tab =
+                                                tab_views[tab_index].clone();
+                                            let (cols, rows) = terminal::size()
+                                                .unwrap_or((80, 24));
+                                            let size =
+                                                server_content_size(cols, rows);
+                                            let switch_result: Result<
+                                                (),
+                                                String,
+                                            > = if tab.visible {
+                                                if tabs.select_socket(
                                                     &tab.socket_name,
-                                                )
-                                            {
-                                                let (cols, rows) =
-                                                    terminal::size()
-                                                        .unwrap_or((80, 24));
-                                                tabs.active_client().resize(
-                                                    server_content_size(
-                                                        cols, rows,
-                                                    ),
-                                                );
-                                                mode = InputMode::Normal;
-                                                copy_mode_confirmed = false;
-                                                mouse_select = None;
-                                                last_drawn_counter = 0;
+                                                ) {
+                                                    Ok(())
+                                                } else {
+                                                    Err("failed to switch tab"
+                                                        .to_string())
+                                                }
                                             } else {
-                                                status_notice = Some((
-                                                    "tab is hidden; press Space to show it".to_string(),
-                                                    Instant::now() + Duration::from_secs(3),
-                                                ));
-                                                mode = InputMode::TabChooser {
-                                                    query,
-                                                    cursor,
-                                                    selected,
-                                                    search_active,
-                                                };
+                                                tabs.show_socket_with_code(
+                                                        &tab.socket_name,
+                                                        size,
+                                                        Some(&tab.code),
+                                                    )
+                                                    .map_err(|e| {
+                                                        format!(
+                                                            "show tab failed: {}",
+                                                            e
+                                                        )
+                                                    })
+                                                    .and_then(|()| {
+                                                        if tabs.select_socket(
+                                                            &tab.socket_name,
+                                                        ) {
+                                                            Ok(())
+                                                        } else {
+                                                            Err(
+                                                                "tab not found after show"
+                                                                    .to_string(),
+                                                            )
+                                                        }
+                                                    })
+                                            };
+                                            match switch_result {
+                                                Ok(()) => {
+                                                    tabs.active_client()
+                                                        .resize(size);
+                                                    mode = InputMode::Normal;
+                                                    copy_mode_confirmed = false;
+                                                    mouse_select = None;
+                                                    last_drawn_counter = 0;
+                                                }
+                                                Err(message) => {
+                                                    status_notice = Some((
+                                                        message,
+                                                        Instant::now()
+                                                            + Duration::from_secs(
+                                                                3,
+                                                            ),
+                                                    ));
+                                                    mode =
+                                                        InputMode::TabChooser {
+                                                            query,
+                                                            cursor,
+                                                            selected,
+                                                            search_active,
+                                                        };
+                                                }
                                             }
                                         } else {
                                             mode = InputMode::TabChooser {
@@ -2887,6 +3121,7 @@ impl ClientApp {
                                             } else {
                                                 InputMode::Normal
                                             };
+                                            last_drawn_counter = 0;
                                         }
                                         _ => {
                                             mode = InputMode::ConfirmKillTab {
@@ -3052,30 +3287,37 @@ impl ClientApp {
                                     mut editing_code,
                                     return_to_tab_chooser,
                                     ..
-                                } => match key.code {
-                                    KeyCode::Enter => {
-                                        if editing_code {
-                                            editing_code = false;
-                                            mode = InputMode::RenameTab {
-                                                code,
-                                                code_cursor,
-                                                title,
-                                                title_cursor,
-                                                editing_code,
-                                                error: None,
-                                                return_to_tab_chooser,
-                                            };
-                                        } else {
-                                            match tabs.set_active_metadata(
-                                                &code,
-                                                title.trim().to_string(),
-                                            ) {
-                                                Ok(()) => {
-                                                    mode = InputMode::Normal;
-                                                    last_drawn_counter = 0;
-                                                }
-                                                Err(error) => {
-                                                    mode =
+                                } => {
+                                    match key.code {
+                                        KeyCode::Enter => {
+                                            if editing_code {
+                                                editing_code = false;
+                                                mode = InputMode::RenameTab {
+                                                    code,
+                                                    code_cursor,
+                                                    title,
+                                                    title_cursor,
+                                                    editing_code,
+                                                    error: None,
+                                                    return_to_tab_chooser,
+                                                };
+                                            } else {
+                                                match tabs.set_active_metadata(
+                                                    &code,
+                                                    title.trim().to_string(),
+                                                ) {
+                                                    Ok(()) => {
+                                                        mode = if return_to_tab_chooser {
+                                                        default_tab_chooser_mode(
+                                                            &tabs,
+                                                        )
+                                                    } else {
+                                                        InputMode::Normal
+                                                    };
+                                                        last_drawn_counter = 0;
+                                                    }
+                                                    Err(error) => {
+                                                        mode =
                                                         InputMode::RenameTab {
                                                             code,
                                                             code_cursor,
@@ -3085,149 +3327,151 @@ impl ClientApp {
                                                             error: Some(error),
                                                             return_to_tab_chooser,
                                                         };
+                                                    }
                                                 }
                                             }
                                         }
-                                    }
-                                    KeyCode::Esc => {
-                                        mode = if return_to_tab_chooser {
-                                            default_tab_chooser_mode(&tabs)
-                                        } else {
-                                            InputMode::Normal
-                                        };
-                                    }
-                                    KeyCode::Tab | KeyCode::BackTab => {
-                                        editing_code = !editing_code;
-                                        mode = InputMode::RenameTab {
-                                            code,
-                                            code_cursor,
-                                            title,
-                                            title_cursor,
-                                            editing_code,
-                                            error: None,
-                                            return_to_tab_chooser,
-                                        };
-                                    }
-                                    KeyCode::Backspace => {
-                                        if editing_code {
-                                            if code_cursor > 0 {
+                                        KeyCode::Esc => {
+                                            mode = if return_to_tab_chooser {
+                                                default_tab_chooser_mode(&tabs)
+                                            } else {
+                                                InputMode::Normal
+                                            };
+                                            last_drawn_counter = 0;
+                                        }
+                                        KeyCode::Tab | KeyCode::BackTab => {
+                                            editing_code = !editing_code;
+                                            mode = InputMode::RenameTab {
+                                                code,
+                                                code_cursor,
+                                                title,
+                                                title_cursor,
+                                                editing_code,
+                                                error: None,
+                                                return_to_tab_chooser,
+                                            };
+                                        }
+                                        KeyCode::Backspace => {
+                                            if editing_code {
+                                                if code_cursor > 0 {
+                                                    let bp = char_byte_pos(
+                                                        &code,
+                                                        code_cursor - 1,
+                                                    );
+                                                    let ep = char_byte_pos(
+                                                        &code,
+                                                        code_cursor,
+                                                    );
+                                                    code.drain(bp..ep);
+                                                    code_cursor -= 1;
+                                                }
+                                            } else if title_cursor > 0 {
                                                 let bp = char_byte_pos(
-                                                    &code,
-                                                    code_cursor - 1,
+                                                    &title,
+                                                    title_cursor - 1,
                                                 );
                                                 let ep = char_byte_pos(
+                                                    &title,
+                                                    title_cursor,
+                                                );
+                                                title.drain(bp..ep);
+                                                title_cursor -= 1;
+                                            }
+                                            mode = InputMode::RenameTab {
+                                                code,
+                                                code_cursor,
+                                                title,
+                                                title_cursor,
+                                                editing_code,
+                                                error: None,
+                                                return_to_tab_chooser,
+                                            };
+                                        }
+                                        KeyCode::Left => {
+                                            if editing_code {
+                                                code_cursor = code_cursor
+                                                    .saturating_sub(1);
+                                            } else {
+                                                title_cursor = title_cursor
+                                                    .saturating_sub(1);
+                                            }
+                                            mode = InputMode::RenameTab {
+                                                code,
+                                                code_cursor,
+                                                title,
+                                                title_cursor,
+                                                editing_code,
+                                                error: None,
+                                                return_to_tab_chooser,
+                                            };
+                                        }
+                                        KeyCode::Right => {
+                                            if editing_code {
+                                                let m = code.chars().count();
+                                                if code_cursor < m {
+                                                    code_cursor += 1;
+                                                }
+                                            } else {
+                                                let m = title.chars().count();
+                                                if title_cursor < m {
+                                                    title_cursor += 1;
+                                                }
+                                            }
+                                            mode = InputMode::RenameTab {
+                                                code,
+                                                code_cursor,
+                                                title,
+                                                title_cursor,
+                                                editing_code,
+                                                error: None,
+                                                return_to_tab_chooser,
+                                            };
+                                        }
+                                        KeyCode::Char(c)
+                                            if key.modifiers
+                                                == KeyModifiers::NONE
+                                                || key.modifiers
+                                                    == KeyModifiers::SHIFT =>
+                                        {
+                                            if editing_code {
+                                                let c = c.to_ascii_uppercase();
+                                                let bp = char_byte_pos(
                                                     &code,
                                                     code_cursor,
                                                 );
-                                                code.drain(bp..ep);
-                                                code_cursor -= 1;
-                                            }
-                                        } else if title_cursor > 0 {
-                                            let bp = char_byte_pos(
-                                                &title,
-                                                title_cursor - 1,
-                                            );
-                                            let ep = char_byte_pos(
-                                                &title,
-                                                title_cursor,
-                                            );
-                                            title.drain(bp..ep);
-                                            title_cursor -= 1;
-                                        }
-                                        mode = InputMode::RenameTab {
-                                            code,
-                                            code_cursor,
-                                            title,
-                                            title_cursor,
-                                            editing_code,
-                                            error: None,
-                                            return_to_tab_chooser,
-                                        };
-                                    }
-                                    KeyCode::Left => {
-                                        if editing_code {
-                                            code_cursor =
-                                                code_cursor.saturating_sub(1);
-                                        } else {
-                                            title_cursor =
-                                                title_cursor.saturating_sub(1);
-                                        }
-                                        mode = InputMode::RenameTab {
-                                            code,
-                                            code_cursor,
-                                            title,
-                                            title_cursor,
-                                            editing_code,
-                                            error: None,
-                                            return_to_tab_chooser,
-                                        };
-                                    }
-                                    KeyCode::Right => {
-                                        if editing_code {
-                                            let m = code.chars().count();
-                                            if code_cursor < m {
+                                                code.insert(bp, c);
                                                 code_cursor += 1;
-                                            }
-                                        } else {
-                                            let m = title.chars().count();
-                                            if title_cursor < m {
+                                            } else {
+                                                let bp = char_byte_pos(
+                                                    &title,
+                                                    title_cursor,
+                                                );
+                                                title.insert(bp, c);
                                                 title_cursor += 1;
                                             }
-                                        }
-                                        mode = InputMode::RenameTab {
-                                            code,
-                                            code_cursor,
-                                            title,
-                                            title_cursor,
-                                            editing_code,
-                                            error: None,
-                                            return_to_tab_chooser,
-                                        };
-                                    }
-                                    KeyCode::Char(c)
-                                        if key.modifiers
-                                            == KeyModifiers::NONE
-                                            || key.modifiers
-                                                == KeyModifiers::SHIFT =>
-                                    {
-                                        if editing_code {
-                                            let c = c.to_ascii_uppercase();
-                                            let bp = char_byte_pos(
-                                                &code,
+                                            mode = InputMode::RenameTab {
+                                                code,
                                                 code_cursor,
-                                            );
-                                            code.insert(bp, c);
-                                            code_cursor += 1;
-                                        } else {
-                                            let bp = char_byte_pos(
-                                                &title,
+                                                title,
                                                 title_cursor,
-                                            );
-                                            title.insert(bp, c);
-                                            title_cursor += 1;
+                                                editing_code,
+                                                error: None,
+                                                return_to_tab_chooser,
+                                            };
                                         }
-                                        mode = InputMode::RenameTab {
-                                            code,
-                                            code_cursor,
-                                            title,
-                                            title_cursor,
-                                            editing_code,
-                                            error: None,
-                                            return_to_tab_chooser,
-                                        };
+                                        _ => {
+                                            mode = InputMode::RenameTab {
+                                                code,
+                                                code_cursor,
+                                                title,
+                                                title_cursor,
+                                                editing_code,
+                                                error: None,
+                                                return_to_tab_chooser,
+                                            };
+                                        }
                                     }
-                                    _ => {
-                                        mode = InputMode::RenameTab {
-                                            code,
-                                            code_cursor,
-                                            title,
-                                            title_cursor,
-                                            editing_code,
-                                            error: None,
-                                            return_to_tab_chooser,
-                                        };
-                                    }
-                                },
+                                }
                             }
                         }
                         Event::Mouse(mouse) => {
@@ -3236,8 +3480,9 @@ impl ClientApp {
                             }
                             let (cols, rows) =
                                 terminal::size().unwrap_or((80, 24));
-                            let hide_status = has_prompt || has_overlay;
-                            if mouse.row == 0 {
+                            if mouse.row == 0
+                                && !matches!(mode, InputMode::TabChooser { .. })
+                            {
                                 mouse_select = None;
                                 if matches!(
                                     mouse.kind,
@@ -3248,6 +3493,7 @@ impl ClientApp {
                                         &tab_views,
                                         cols,
                                         mouse.column,
+                                        tabs.tab_bar_offset,
                                     ) {
                                         Some(ClientTabBarHit::Tab(index)) => {
                                             if tabs.select(index) {
@@ -3261,7 +3507,14 @@ impl ClientApp {
                                                 last_drawn_counter = 0;
                                             }
                                         }
-                                        Some(ClientTabBarHit::Overflow) => {
+                                        Some(
+                                            ClientTabBarHit::OverflowStart,
+                                        ) => {
+                                            if tabs.scroll_tab_bar_back() {
+                                                last_drawn_counter = 0;
+                                            }
+                                        }
+                                        Some(ClientTabBarHit::OverflowEnd) => {
                                             mode = InputMode::TabChooser {
                                                 query: String::new(),
                                                 cursor: 0,
@@ -3409,11 +3662,19 @@ impl ClientApp {
                                         match mouse.kind {
                                             MouseEventKind::ScrollUp => {
                                                 tabs.active_client()
-                                                    .scroll_up(SCROLL_LINES);
+                                                    .scroll_display(
+                                                        SCROLL_LINES as i32,
+                                                    );
+                                                display_scrolled = true;
+                                                last_drawn_counter = 0;
                                             }
                                             MouseEventKind::ScrollDown => {
                                                 tabs.active_client()
-                                                    .scroll_down(SCROLL_LINES);
+                                                    .scroll_display(
+                                                        -(SCROLL_LINES as i32),
+                                                    );
+                                                display_scrolled = true;
+                                                last_drawn_counter = 0;
                                             }
                                             MouseEventKind::Down(
                                                 MouseButton::Left,
@@ -3550,6 +3811,7 @@ impl ClientApp {
                                                                     },
                                                                     Instant::now() + Duration::from_secs(3),
                                                                 ));
+                                                                last_drawn_counter = 0;
                                                             }
                                                         }
                                                     }
@@ -3563,10 +3825,12 @@ impl ClientApp {
                                     MouseEventKind::ScrollUp => {
                                         tabs.active_client()
                                             .scroll_up(SCROLL_LINES);
+                                        last_drawn_counter = 0;
                                     }
                                     MouseEventKind::ScrollDown => {
                                         tabs.active_client()
                                             .scroll_down(SCROLL_LINES);
+                                        last_drawn_counter = 0;
                                     }
                                     MouseEventKind::Down(MouseButton::Left) => {
                                         if let Some(ref fd) = frame {
@@ -3699,6 +3963,7 @@ impl ClientApp {
                                                             Instant::now()
                                                                 + Duration::from_secs(3),
                                                         ));
+                                                        last_drawn_counter = 0;
                                                     }
                                                 }
                                             }
@@ -3720,6 +3985,7 @@ impl ClientApp {
                             tabs.resize_all(server_content_size(
                                 new_cols, new_rows,
                             ));
+                            last_drawn_counter = 0;
                         }
                         _ => {}
                     }
@@ -3812,6 +4078,94 @@ struct MouseSelection {
 struct PaneContentRow {
     text: String,
     line: Option<usize>,
+}
+
+fn write_mouse_selection_ansi<W: Write>(
+    writer: &mut W,
+    fd: &FrameData,
+    sel: &MouseSelection,
+    cols: u16,
+    rows: u16,
+    hide_borders: bool,
+) -> io::Result<()> {
+    let (start_row, start_col, end_row, end_col) =
+        normalized_mouse_selection(sel);
+    if start_row == end_row && start_col == end_col {
+        return Ok(());
+    }
+    let layout_area = server_layout_area(cols, rows);
+    let (pane_rows, content_area) =
+        find_active_pane_content(&fd.layout, layout_area, hide_borders);
+    if pane_rows.is_empty() {
+        return Ok(());
+    }
+    let sr = start_row
+        .max(content_area.y)
+        .min(content_area.y + content_area.height.saturating_sub(1));
+    let sc = start_col
+        .max(content_area.x)
+        .min(content_area.x + content_area.width.saturating_sub(1));
+    let er = end_row
+        .max(content_area.y)
+        .min(content_area.y + content_area.height.saturating_sub(1));
+    let ec = end_col
+        .max(content_area.x)
+        .min(content_area.x + content_area.width);
+    if sr == er && sc == ec {
+        return Ok(());
+    }
+    for row in sr..=er {
+        let col_begin = if row == sr { sc } else { content_area.x };
+        let col_end = if row == er {
+            ec
+        } else {
+            content_area.x + content_area.width
+        };
+        let pane_row = (row - content_area.y) as usize;
+        let Some(row_data) = pane_rows.get(pane_row) else {
+            continue;
+        };
+        let mut col = col_begin;
+        while col < col_end {
+            let pane_col = (col - content_area.x) as usize;
+            let Some((ch, width)) =
+                glyph_at_display_col(&row_data.text, pane_col)
+            else {
+                col += 1;
+                continue;
+            };
+            write!(
+                writer,
+                "\x1b[{};{}H\x1b[30;46m{}\x1b[m",
+                row + 1,
+                col + 1,
+                ch
+            )?;
+            col = col.saturating_add(width.max(1));
+        }
+    }
+    writer.flush()
+}
+
+fn normalized_mouse_selection(sel: &MouseSelection) -> (u16, u16, u16, u16) {
+    if (sel.start_row, sel.start_col) <= (sel.end_row, sel.end_col) {
+        (sel.start_row, sel.start_col, sel.end_row, sel.end_col)
+    } else {
+        (sel.end_row, sel.end_col, sel.start_row, sel.start_col)
+    }
+}
+
+fn glyph_at_display_col(s: &str, target_col: usize) -> Option<(char, u16)> {
+    use unicode_width::UnicodeWidthChar;
+    let mut col = 0usize;
+    for ch in s.chars() {
+        let width = ch.width().unwrap_or(1) as u16;
+        if target_col >= col && target_col < col + width as usize {
+            return Some((ch, width));
+        }
+        col += width as usize;
+    }
+    None
 }
 
 fn render_mouse_selection(
@@ -4048,6 +4402,15 @@ fn find_active_pane_content(
                 children.len(),
                 hide_borders,
             );
+            for (child, chunk) in children.iter().zip(chunks.iter()) {
+                if matches!(child, LayoutJson::Leaf { active: true, .. }) {
+                    let (rows, content_area) =
+                        find_active_pane_content(child, *chunk, hide_borders);
+                    if !rows.is_empty() {
+                        return (rows, content_area);
+                    }
+                }
+            }
             for (child, chunk) in children.iter().zip(chunks.into_iter()) {
                 let (rows, content_area) =
                     find_active_pane_content(child, chunk, hide_borders);
@@ -4172,6 +4535,20 @@ fn cursor_style_for_shape(shape: Option<u8>) -> SetCursorStyle {
         6 => SetCursorStyle::SteadyBar,
         _ => SetCursorStyle::DefaultUserShape,
     }
+}
+
+fn leave_copy_mode_client(
+    client: &SocketClient,
+    mode: &mut InputMode,
+    copy_mode_confirmed: &mut bool,
+    copy_mode_exit_pending: &mut bool,
+    display_scrolled: &mut bool,
+) {
+    client.exit_copy_mode();
+    *mode = InputMode::Normal;
+    *copy_mode_confirmed = false;
+    *copy_mode_exit_pending = true;
+    *display_scrolled = false;
 }
 
 /// After prefix navigation from copy mode, keep server copy state on the
@@ -4632,6 +5009,8 @@ fn key_to_bytes(key: KeyEvent) -> Vec<u8> {
     let mods_no_shift = mods & !KeyModifiers::SHIFT;
 
     let mut bytes = match key.code {
+        KeyCode::Enter => b"\r".to_vec(),
+        KeyCode::Char(c) if c == '\r' || c == '\n' => b"\r".to_vec(),
         KeyCode::Char(c) => {
             if mods.contains(KeyModifiers::CONTROL) {
                 let lower = c.to_ascii_lowercase();
@@ -4663,7 +5042,6 @@ fn key_to_bytes(key: KeyEvent) -> Vec<u8> {
                 c.encode_utf8(&mut buf).as_bytes().to_vec()
             }
         }
-        KeyCode::Enter => b"\r".to_vec(),
         KeyCode::Backspace => b"\x7f".to_vec(),
         KeyCode::Esc => b"\x1b".to_vec(),
         KeyCode::Null => vec![0x00],
@@ -4937,6 +5315,17 @@ fn initial_session_chooser_selection(
         .unwrap_or(0)
 }
 
+fn clamp_session_chooser_selected(
+    selected: usize,
+    visible_len: usize,
+) -> usize {
+    if visible_len == 0 {
+        0
+    } else {
+        selected.min(visible_len - 1)
+    }
+}
+
 fn visible_entries_full<'a>(
     entries: &'a [SessionTreeEntry],
     collapsed: &std::collections::HashSet<String>,
@@ -5014,23 +5403,25 @@ fn cleanup_stale_socket(_socket_name: &str, _error: &io::Error) {}
 
 #[cfg(unix)]
 fn discover_all_socket_names(socket_name: &str) -> io::Result<Vec<String>> {
-    use std::{collections::BTreeSet, os::unix::fs::FileTypeExt};
+    use std::collections::BTreeSet;
 
     let socket_path = crate::ipc::socket_path(socket_name)?;
     let Some(dir) = socket_path.parent() else {
         return Ok(vec![socket_name.to_string()]);
     };
+    let tab_prefix = format!("{}.tab.", socket_name);
     let mut names = BTreeSet::new();
+    if socket_path.exists() {
+        names.insert(socket_name.to_string());
+    }
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
-            let Ok(file_type) = entry.file_type() else {
+            let Some(name) = entry.file_name().to_str().map(str::to_string)
+            else {
                 continue;
             };
-            if !file_type.is_socket() {
-                continue;
-            }
-            if let Some(name) = entry.file_name().to_str() {
-                names.insert(name.to_string());
+            if name.starts_with(&tab_prefix) {
+                names.insert(name);
             }
         }
     }
@@ -5038,16 +5429,21 @@ fn discover_all_socket_names(socket_name: &str) -> io::Result<Vec<String>> {
 }
 
 #[cfg(windows)]
-fn discover_all_socket_names(_socket_name: &str) -> io::Result<Vec<String>> {
+fn discover_all_socket_names(socket_name: &str) -> io::Result<Vec<String>> {
     use std::collections::BTreeSet;
 
     let pipe_prefix = "zmux-";
+    let tab_pipe_prefix = format!("{}{}.tab.", pipe_prefix, socket_name);
     let mut names = BTreeSet::new();
     if let Ok(entries) = std::fs::read_dir(r"\\.\pipe\") {
         for entry in entries.flatten() {
             let pipe_name = entry.file_name().to_string_lossy().to_string();
-            if let Some(socket) = pipe_name.strip_prefix(pipe_prefix) {
-                names.insert(socket.to_string());
+            if pipe_name == format!("{}{}", pipe_prefix, socket_name)
+                || pipe_name.starts_with(&tab_pipe_prefix)
+            {
+                if let Some(socket) = pipe_name.strip_prefix(pipe_prefix) {
+                    names.insert(socket.to_string());
+                }
             }
         }
     }
@@ -5278,6 +5674,25 @@ mod tests {
     }
 
     #[test]
+    fn mouse_copy_uses_screen_coordinates_below_tab_bar() {
+        let fd =
+            test_frame(vec![test_row("hello", None), test_row("world", None)]);
+        let layout_area = server_layout_area(80, 24);
+        let (_, content_area) =
+            find_active_pane_content(&fd.layout, layout_area, true);
+        let sel = MouseSelection {
+            start_col: content_area.x,
+            start_row: content_area.y,
+            end_col: content_area.x + 5,
+            end_row: content_area.y + 1,
+        };
+        assert_eq!(
+            extract_text_from_frame_in_area(&fd, &sel, layout_area, true),
+            "hello\nworld"
+        );
+    }
+
+    #[test]
     fn mouse_for_pane_maps_screen_coords_to_pane_local() {
         use crossterm::event::{
             KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -5443,6 +5858,12 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn session_chooser_selected_clamps_after_collapse() {
+        assert_eq!(clamp_session_chooser_selected(5, 3), 2);
+        assert_eq!(clamp_session_chooser_selected(0, 0), 0);
+    }
+
     fn test_frame(rows_v2: Vec<RowRunsJson>) -> FrameData {
         FrameData {
             frame_type: "frame".to_string(),
@@ -5463,6 +5884,7 @@ mod tests {
                 title: None,
             },
             status: None,
+            ansi: None,
             exit: false,
             yank_text: None,
         }

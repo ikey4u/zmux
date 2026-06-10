@@ -1,5 +1,9 @@
+use std::io::{self, Write};
+
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    buffer::CellDiffOption,
+    layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Clear, Paragraph},
@@ -14,6 +18,9 @@ pub struct FrameData {
     pub layout: LayoutJson,
     #[serde(default)]
     pub status: Option<StatusJson>,
+    /// Base64-encoded server-rendered pane ANSI (Zellij-style direct output).
+    #[serde(default)]
+    pub ansi: Option<String>,
     #[serde(default)]
     pub exit: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -108,7 +115,8 @@ pub struct ClientTabView {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientTabBarHit {
     Tab(usize),
-    Overflow,
+    OverflowStart,
+    OverflowEnd,
 }
 
 pub fn render_frame(f: &mut Frame, fd: &FrameData, in_prefix: bool) {
@@ -129,6 +137,239 @@ pub fn active_in_copy_mode(fd: &FrameData) -> bool {
 
 pub fn active_scroll_ratio(fd: &FrameData) -> Option<f32> {
     active_scroll_ratio_in_layout(&fd.layout)
+}
+
+/// Write server-rendered pane ANSI directly to the terminal.
+/// Mark the pane layout region as skipped in ratatui's diff so stale buffer
+/// cells (e.g. after mouse selection) are not written over server ANSI output.
+pub fn skip_pane_area_for_ansi(
+    f: &mut Frame,
+    fd: &FrameData,
+    hide_borders: bool,
+) {
+    if fd.ansi.is_none() {
+        return;
+    }
+    let area = f.area();
+    if area.height <= 1 {
+        return;
+    }
+    let frame_area = Rect {
+        x: area.x,
+        y: area.y + 1,
+        width: area.width,
+        height: area.height - 1,
+    };
+    if frame_area.height < 2 {
+        return;
+    }
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(frame_area);
+    mark_layout_area_skip(f, &fd.layout, chunks[0], hide_borders);
+}
+
+fn mark_layout_area_skip(
+    f: &mut Frame,
+    layout: &LayoutJson,
+    area: Rect,
+    hide_borders: bool,
+) {
+    match layout {
+        LayoutJson::Split {
+            direction,
+            sizes,
+            children,
+        } => {
+            let chunks = split_layout_rects(
+                area,
+                direction,
+                sizes,
+                children.len(),
+                hide_borders,
+            );
+            for (child, chunk) in children.iter().zip(chunks.iter()) {
+                mark_layout_area_skip(f, child, *chunk, hide_borders);
+            }
+            if !hide_borders {
+                mark_split_gaps_skip(f, direction, &chunks);
+            }
+        }
+        LayoutJson::Leaf { .. } => {
+            mark_rect_skip(f, area);
+        }
+    }
+}
+
+fn mark_split_gaps_skip(f: &mut Frame, direction: &str, chunks: &[Rect]) {
+    if chunks.len() < 2 {
+        return;
+    }
+    let horizontal = direction == "horizontal";
+    for pair in chunks.windows(2) {
+        let gap = if horizontal {
+            Rect {
+                x: pair[0].x.saturating_add(pair[0].width),
+                y: pair[0].y,
+                width: pair[1]
+                    .x
+                    .saturating_sub(pair[0].x.saturating_add(pair[0].width)),
+                height: pair[0].height,
+            }
+        } else {
+            Rect {
+                x: pair[0].x,
+                y: pair[0].y.saturating_add(pair[0].height),
+                width: pair[0].width,
+                height: pair[1]
+                    .y
+                    .saturating_sub(pair[0].y.saturating_add(pair[0].height)),
+            }
+        };
+        mark_rect_skip(f, gap);
+    }
+}
+
+fn mark_rect_skip(f: &mut Frame, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let buf = f.buffer_mut();
+    for y in area.y..area.y.saturating_add(area.height) {
+        for x in area.x..area.x.saturating_add(area.width) {
+            buf[(x, y)].set_diff_option(CellDiffOption::Skip);
+        }
+    }
+}
+
+pub fn write_server_ansi<W: Write>(
+    writer: &mut W,
+    ansi_b64: &str,
+) -> io::Result<()> {
+    let bytes = STANDARD
+        .decode(ansi_b64.trim())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    writer.write_all(&bytes)?;
+    writer.flush()
+}
+
+pub fn active_cursor_screen_position(
+    fd: &FrameData,
+    frame_area: Rect,
+    hide_borders: bool,
+) -> Option<Position> {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(frame_area);
+    let layout_area = if fd.status.is_some() {
+        chunks[0]
+    } else {
+        frame_area
+    };
+    cursor_position_in_layout(&fd.layout, layout_area, hide_borders)
+}
+
+fn cursor_position_in_layout(
+    layout: &LayoutJson,
+    area: Rect,
+    hide_borders: bool,
+) -> Option<Position> {
+    match layout {
+        LayoutJson::Split {
+            direction,
+            sizes,
+            children,
+        } => {
+            let chunks = split_layout_rects(
+                area,
+                direction,
+                sizes,
+                children.len(),
+                hide_borders,
+            );
+            children
+                .iter()
+                .zip(chunks.iter())
+                .find_map(|(child, chunk)| {
+                    cursor_position_in_layout(child, *chunk, hide_borders)
+                })
+        }
+        LayoutJson::Leaf {
+            active: true,
+            cursor_row,
+            cursor_col,
+            hide_cursor,
+            in_copy_mode,
+            scroll_ratio,
+            ..
+        } => {
+            if *hide_cursor {
+                return None;
+            }
+            if !*in_copy_mode && scroll_ratio.is_some() {
+                return None;
+            }
+            let content = pane_content_rect(area, hide_borders);
+            Some(Position {
+                x: content
+                    .x
+                    .saturating_add(*cursor_col)
+                    .min(content.x + content.width.saturating_sub(1)),
+                y: content
+                    .y
+                    .saturating_add(*cursor_row)
+                    .min(content.y + content.height.saturating_sub(1)),
+            })
+        }
+        LayoutJson::Leaf { .. } => None,
+    }
+}
+
+fn pane_content_rect(area: Rect, hide_borders: bool) -> Rect {
+    if !hide_borders && area.width > 2 && area.height > 2 {
+        Rect {
+            x: area.x + 1,
+            y: area.y + 1,
+            width: area.width - 2,
+            height: area.height - 2,
+        }
+    } else {
+        area
+    }
+}
+
+pub fn active_window_index(fd: &FrameData) -> Option<usize> {
+    fd.status.as_ref().and_then(|status| {
+        status.windows.iter().find(|w| w.active).map(|w| w.index)
+    })
+}
+
+/// Geometry fingerprint for every pane in the layout.
+pub fn layout_geometry_fingerprint(
+    layout: &LayoutJson,
+) -> Vec<(usize, u16, u16)> {
+    let mut panes = Vec::new();
+    collect_pane_geometry(layout, &mut panes);
+    panes.sort_by_key(|(id, _, _)| *id);
+    panes
+}
+
+fn collect_pane_geometry(
+    layout: &LayoutJson,
+    out: &mut Vec<(usize, u16, u16)>,
+) {
+    match layout {
+        LayoutJson::Split { children, .. } => {
+            for child in children {
+                collect_pane_geometry(child, out);
+            }
+        }
+        LayoutJson::Leaf { id, rows, cols, .. } => {
+            out.push((*id, *rows, *cols));
+        }
+    }
 }
 
 fn active_scroll_ratio_in_layout(layout: &LayoutJson) -> Option<f32> {
@@ -195,25 +436,17 @@ pub fn render_frame_ex(
     hide_status: bool,
     hide_borders: bool,
 ) {
-    render_frame_area_ex(
-        f,
-        fd,
-        in_prefix,
-        hide_status,
-        hide_borders,
-        false,
-        f.area(),
-    );
+    render_frame_area_ex(f, fd, in_prefix, hide_status, hide_borders, f.area());
 }
 
 pub fn render_tabbed_frame(
     f: &mut Frame,
     fd: &FrameData,
     tabs: &[ClientTabView],
+    tab_bar_offset: usize,
     in_prefix: bool,
     hide_status: bool,
     hide_borders: bool,
-    scroll_repaint_stripe: bool,
 ) {
     let area = f.area();
     if area.height == 0 {
@@ -225,7 +458,8 @@ pub fn render_tabbed_frame(
         width: area.width,
         height: 1,
     };
-    render_tab_bar(f, tabs, tab_area);
+    f.render_widget(Clear, tab_area);
+    render_tab_bar(f, tabs, tab_area, tab_bar_offset);
     if area.height <= 1 {
         return;
     }
@@ -241,7 +475,6 @@ pub fn render_tabbed_frame(
         in_prefix,
         hide_status,
         hide_borders,
-        scroll_repaint_stripe,
         frame_area,
     );
 }
@@ -252,7 +485,6 @@ fn render_frame_area_ex(
     in_prefix: bool,
     hide_status: bool,
     hide_borders: bool,
-    scroll_repaint_stripe: bool,
     area: Rect,
 ) {
     if area.height < 2 {
@@ -263,15 +495,12 @@ fn render_frame_area_ex(
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(area);
 
-    f.render_widget(Clear, chunks[0]);
-    render_layout_node(
-        f,
-        &fd.layout,
-        chunks[0],
-        hide_borders,
-        scroll_repaint_stripe,
-    );
+    if fd.ansi.is_none() {
+        fill_area_terminal_bg(f, chunks[0], " ");
+        render_layout_node(f, &fd.layout, chunks[0], hide_borders);
+    }
     if !hide_status {
+        fill_area_terminal_bg(f, chunks[1], " ");
         render_status_bar(f, &fd.status, chunks[1], in_prefix);
     }
 }
@@ -281,7 +510,6 @@ fn render_layout_node(
     layout: &LayoutJson,
     area: Rect,
     hide_borders: bool,
-    scroll_repaint_stripe: bool,
 ) {
     match layout {
         LayoutJson::Split {
@@ -299,14 +527,11 @@ fn render_layout_node(
                 children.len(),
                 hide_borders,
             );
-            for (child, chunk) in children.iter().zip(chunks.into_iter()) {
-                render_layout_node(
-                    f,
-                    child,
-                    chunk,
-                    hide_borders,
-                    scroll_repaint_stripe,
-                );
+            for (child, chunk) in children.iter().zip(chunks.iter()) {
+                render_layout_node(f, child, *chunk, hide_borders);
+            }
+            if !hide_borders {
+                fill_split_gaps(f, direction, &chunks, " ");
             }
         }
         LayoutJson::Leaf {
@@ -330,7 +555,6 @@ fn render_layout_node(
                 *scroll_ratio,
                 area,
                 hide_borders,
-                scroll_repaint_stripe,
             );
         }
     }
@@ -391,7 +615,6 @@ fn render_pane_content(
     scroll_ratio: Option<f32>,
     area: Rect,
     hide_borders: bool,
-    scroll_repaint_stripe: bool,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -416,10 +639,9 @@ fn render_pane_content(
             (area, false)
         };
 
-    // Clear content before drawing borders so ratatui's Block widget does not
-    // paint the full pane rect (which can leave green border-color artifacts on
-    // some terminals when combined with partial row updates).
-    f.render_widget(Clear, content_area);
+    // Scrub stale SGR backgrounds before drawing, using the terminal's own
+    // default background (Color::Reset / \x1b[49m).
+    fill_area_terminal_bg(f, content_area, " ");
     if has_border {
         draw_border(f, area, border_color);
     }
@@ -427,8 +649,6 @@ fn render_pane_content(
     let max_rows = content_area.height as usize;
     let max_cols = content_area.width as usize;
 
-    let pad_fill =
-        pane_pad_fill(scroll_ratio.is_some() && scroll_repaint_stripe);
     let pad_style = Style::default();
     for row_idx in 0..max_rows {
         let y = content_area.y + row_idx as u16;
@@ -455,7 +675,7 @@ fn render_pane_content(
                 let actual_width = unicode_display_width(&text);
 
                 let fg = parse_color_str(&run.fg);
-                let bg = parse_color_str(&run.bg);
+                let bg = parse_bg_color_str(&run.bg);
                 let mut style = Style::default().fg(fg).bg(bg);
                 if run.flags & 2 != 0 {
                     style = style.add_modifier(Modifier::BOLD);
@@ -479,13 +699,11 @@ fn render_pane_content(
         }
 
         if col_used < max_cols {
-            spans.push(Span::styled(
-                pad_fill.repeat(max_cols - col_used),
-                pad_style,
-            ));
+            spans
+                .push(Span::styled(" ".repeat(max_cols - col_used), pad_style));
         }
         let line = if spans.is_empty() {
-            Line::from(Span::styled(pad_fill.repeat(max_cols), pad_style))
+            Line::from(Span::styled(" ".repeat(max_cols), pad_style))
         } else {
             Line::from(spans)
         };
@@ -584,7 +802,11 @@ fn draw_border(f: &mut Frame, area: Rect, color: Color) {
     }
 }
 
-pub fn render_tabbed_loading(f: &mut Frame, tabs: &[ClientTabView]) {
+pub fn render_tabbed_loading(
+    f: &mut Frame,
+    tabs: &[ClientTabView],
+    tab_bar_offset: usize,
+) {
     let area = f.area();
     if area.height == 0 {
         return;
@@ -595,7 +817,7 @@ pub fn render_tabbed_loading(f: &mut Frame, tabs: &[ClientTabView]) {
         width: area.width,
         height: 1,
     };
-    render_tab_bar(f, tabs, tab_area);
+    render_tab_bar(f, tabs, tab_area, tab_bar_offset);
     if area.height <= 1 {
         return;
     }
@@ -647,68 +869,98 @@ pub fn status_window_tab_hit(
     None
 }
 
+const TAB_BAR_ELLIPSIS: &str = " ... ";
+
+pub fn tab_bar_visible_range(
+    tabs: &[ClientTabView],
+    width: u16,
+    offset: usize,
+) -> std::ops::Range<usize> {
+    if tabs.is_empty() || offset >= tabs.len() {
+        return 0..0;
+    }
+    let max_width = width as usize;
+    let ellipsis_width = unicode_display_width(TAB_BAR_ELLIPSIS);
+    let mut used = if offset > 0 { ellipsis_width } else { 0 };
+    let mut end = offset;
+    while end < tabs.len() {
+        let last = end + 1 == tabs.len();
+        let segment_width = tab_segment_width(&tabs[end]);
+        if last {
+            if used + segment_width <= max_width {
+                return offset..tabs.len();
+            }
+            break;
+        }
+        if used + segment_width + ellipsis_width > max_width {
+            break;
+        }
+        used += segment_width;
+        end += 1;
+    }
+    if end == offset && offset < tabs.len() {
+        return offset..(offset + 1).min(tabs.len());
+    }
+    offset..end
+}
+
 pub fn tab_bar_hit(
     tabs: &[ClientTabView],
     width: u16,
     col: u16,
+    offset: usize,
 ) -> Option<ClientTabBarHit> {
+    if tabs.is_empty() {
+        return None;
+    }
     let mut used = 0usize;
     let max_width = width as usize;
     let col = col as usize;
-    let ellipsis_width = unicode_display_width(" ... ");
+    let ellipsis_width = unicode_display_width(TAB_BAR_ELLIPSIS);
+    let visible = tab_bar_visible_range(tabs, width, offset);
+    let has_trailing = visible.end < tabs.len();
 
-    for (index, tab) in tabs.iter().enumerate() {
-        let last = index + 1 == tabs.len();
-        let segment_width = tab_segment_width(tab);
-        if last {
-            if used + segment_width <= max_width {
-                return (col >= used && col < used + segment_width)
-                    .then_some(ClientTabBarHit::Tab(index));
-            }
-            if used + ellipsis_width <= max_width {
-                return (col >= used && col < used + ellipsis_width)
-                    .then_some(ClientTabBarHit::Overflow);
-            }
+    if offset > 0 {
+        if used + ellipsis_width > max_width {
             return None;
         }
-        if used + segment_width + ellipsis_width > max_width {
-            if used + ellipsis_width <= max_width {
-                return (col >= used && col < used + ellipsis_width)
-                    .then_some(ClientTabBarHit::Overflow);
-            }
-            return None;
+        if col < used + ellipsis_width {
+            return Some(ClientTabBarHit::OverflowStart);
         }
+        used += ellipsis_width;
+    }
+
+    for index in visible.start..visible.end {
+        let segment_width = tab_segment_width(&tabs[index]);
         if col >= used && col < used + segment_width {
             return Some(ClientTabBarHit::Tab(index));
         }
         used += segment_width;
     }
-    None
+
+    if has_trailing && used + ellipsis_width <= max_width {
+        (col >= used && col < used + ellipsis_width)
+            .then_some(ClientTabBarHit::OverflowEnd)
+    } else {
+        None
+    }
 }
 
 pub fn last_visible_tab_index(
     tabs: &[ClientTabView],
     width: u16,
+    offset: usize,
 ) -> Option<usize> {
-    let mut used = 0usize;
-    let max_width = width as usize;
-    let ellipsis_width = unicode_display_width(" ... ");
-
-    for (index, tab) in tabs.iter().enumerate() {
-        let last = index + 1 == tabs.len();
-        let segment_width = tab_segment_width(tab);
-        if last {
-            return (used + segment_width <= max_width).then_some(index);
-        }
-        if used + segment_width + ellipsis_width > max_width {
-            return index.checked_sub(1);
-        }
-        used += segment_width;
-    }
-    None
+    let range = tab_bar_visible_range(tabs, width, offset);
+    range.end.checked_sub(1)
 }
 
-fn render_tab_bar(f: &mut Frame, tabs: &[ClientTabView], area: Rect) {
+fn render_tab_bar(
+    f: &mut Frame,
+    tabs: &[ClientTabView],
+    area: Rect,
+    offset: usize,
+) {
     if area.height == 0 {
         return;
     }
@@ -717,34 +969,190 @@ fn render_tab_bar(f: &mut Frame, tabs: &[ClientTabView], area: Rect) {
         Paragraph::new(" ".repeat(area.width as usize)).style(bg),
         area,
     );
+    if tabs.is_empty() {
+        return;
+    }
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut used = 0usize;
     let max_width = area.width as usize;
-    let ellipsis = " ... ";
-    let ellipsis_width = unicode_display_width(ellipsis);
+    let ellipsis_width = unicode_display_width(TAB_BAR_ELLIPSIS);
+    let visible = tab_bar_visible_range(tabs, area.width, offset);
+    let has_trailing = visible.end < tabs.len();
 
-    for (index, tab) in tabs.iter().enumerate() {
-        let last = index + 1 == tabs.len();
-        let segment_width = tab_segment_width(tab);
-        if last {
-            if used + segment_width <= max_width {
-                push_tab_spans(&mut spans, tab);
-            } else if used + ellipsis_width <= max_width {
-                spans.push(Span::styled(ellipsis.to_string(), bg));
-            }
-            break;
-        }
-        if used + segment_width + ellipsis_width > max_width {
-            if used + ellipsis_width <= max_width {
-                spans.push(Span::styled(ellipsis.to_string(), bg));
-            }
-            break;
-        }
-        push_tab_spans(&mut spans, tab);
-        used += segment_width;
+    if offset > 0 && used + ellipsis_width <= max_width {
+        spans.push(Span::styled(TAB_BAR_ELLIPSIS.to_string(), bg));
+        used += ellipsis_width;
+    }
+
+    for index in visible.start..visible.end {
+        push_tab_spans(&mut spans, &tabs[index]);
+        used += tab_segment_width(&tabs[index]);
+    }
+
+    if has_trailing && used + ellipsis_width <= max_width {
+        spans.push(Span::styled(TAB_BAR_ELLIPSIS.to_string(), bg));
     }
 
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+const PANEL_BG: Color = Color::Rgb(40, 40, 40);
+
+/// Server ANSI marks pane cells as Skip; overlays must opt back into drawing.
+fn prepare_overlay_draw(f: &mut Frame, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let buf = f.buffer_mut();
+    for y in area.y..area.y.saturating_add(area.height) {
+        for x in area.x..area.x.saturating_add(area.width) {
+            buf[(x, y)].set_diff_option(CellDiffOption::AlwaysUpdate);
+        }
+    }
+}
+
+fn fill_rect_background(f: &mut Frame, area: Rect, bg: Color) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let style = Style::default().fg(bg).bg(bg);
+    let line = " ".repeat(area.width as usize);
+    for row in 0..area.height {
+        f.render_widget(
+            Paragraph::new(line.clone()).style(style),
+            Rect {
+                x: area.x,
+                y: area.y + row,
+                width: area.width,
+                height: 1,
+            },
+        );
+    }
+}
+
+fn begin_floating_panel(f: &mut Frame, panel: Rect) {
+    prepare_overlay_draw(f, panel);
+    fill_rect_background(f, panel, PANEL_BG);
+}
+
+/// Erase a ratatui-drawn floating overlay region.
+///
+/// Do not call this after `write_server_ansi` in the same frame: it paints spaces
+/// over pane borders/split gaps. Overlay transitions should rely on
+/// `last_drawn_counter = 0` to refresh server ANSI instead.
+#[allow(dead_code)]
+pub fn clear_floating_overlay_rect(f: &mut Frame, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    prepare_overlay_draw(f, area);
+    let line = " ".repeat(area.width as usize);
+    let style = Style::default();
+    for row in 0..area.height {
+        f.render_widget(
+            Paragraph::new(line.clone()).style(style),
+            Rect {
+                x: area.x,
+                y: area.y + row,
+                width: area.width,
+                height: 1,
+            },
+        );
+    }
+}
+
+/// Centered overlay rect with stable dimensions so expand/collapse does not move
+/// the panel (moving leaves stale ratatui cells on ANSI-backed panes).
+pub fn centered_floating_panel(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.max(1).min(area.width);
+    let height = height.max(1).min(area.height);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    Rect {
+        x,
+        y,
+        width,
+        height,
+    }
+}
+
+/// Shared overlay size for tab/session choosers: ~75% width, capped height, stable
+/// while open (must not depend on list length or tree expand state).
+pub fn chooser_overlay_panel(area: Rect) -> Rect {
+    if area.width == 0 || area.height == 0 {
+        return area;
+    }
+    let width = area
+        .width
+        .saturating_mul(3)
+        .saturating_div(4)
+        .max(36)
+        .min(area.width);
+    let height = area
+        .height
+        .saturating_sub(2)
+        .max(8)
+        .min(24)
+        .min(area.height);
+    centered_floating_panel(area, width, height)
+}
+
+pub fn rename_tab_panel_rect(area: Rect) -> Rect {
+    if area.width == 0 || area.height == 0 {
+        return area;
+    }
+    let width = area
+        .width
+        .saturating_mul(2)
+        .saturating_div(3)
+        .max(44)
+        .min(area.width);
+    let height = 9.min(area.height).max(1);
+    centered_floating_panel(area, width, height)
+}
+
+pub fn tab_quick_switch_panel_rect(area: Rect) -> Rect {
+    if area.width == 0 || area.height == 0 {
+        return area;
+    }
+    let width = area
+        .width
+        .saturating_mul(2)
+        .saturating_div(5)
+        .max(36)
+        .min(area.width);
+    let height = 7.min(area.height).max(1);
+    centered_floating_panel(area, width, height)
+}
+
+pub fn options_panel_rect(area: Rect) -> Rect {
+    if area.width == 0 || area.height == 0 {
+        return area;
+    }
+    let width = area
+        .width
+        .saturating_mul(2)
+        .saturating_div(3)
+        .max(64)
+        .min(area.width);
+    let height = 7.min(area.height).max(1);
+    centered_floating_panel(area, width, height)
+}
+
+fn fill_panel_row(f: &mut Frame, x: u16, y: u16, width: u16) {
+    if width == 0 {
+        return;
+    }
+    let padded = " ".repeat(width as usize);
+    f.render_widget(
+        Paragraph::new(padded).style(Style::default().bg(PANEL_BG)),
+        Rect {
+            x,
+            y,
+            width,
+            height: 1,
+        },
+    );
 }
 
 fn tab_segment_width(tab: &ClientTabView) -> usize {
@@ -811,31 +1219,13 @@ pub fn render_tab_chooser(
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let width = area
-        .width
-        .saturating_mul(3)
-        .saturating_div(4)
-        .max(36)
-        .min(area.width);
-    let height = area
-        .height
-        .saturating_sub(4)
-        .max(6)
-        .min(18)
-        .min(area.height);
-    let x = area.x + area.width.saturating_sub(width) / 2;
-    let y = area.y + area.height.saturating_sub(height) / 2;
-    let panel = Rect {
-        x,
-        y,
-        width,
-        height,
-    };
-    f.render_widget(Clear, panel);
+    let panel = chooser_overlay_panel(area);
+    begin_floating_panel(f, panel);
     let block = Block::default()
         .title(" Tabs  Space=show/hide  K=kill  R=rename  Enter=switch  /=search  Esc/q=close ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(PANEL_BG));
     let inner = block.inner(panel);
     f.render_widget(block, panel);
     if inner.height == 0 {
@@ -852,9 +1242,10 @@ pub fn render_tab_chooser(
     let search_style = if search_active {
         Style::default()
             .fg(Color::Yellow)
+            .bg(PANEL_BG)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(Color::DarkGray).bg(PANEL_BG)
     };
     f.render_widget(
         Paragraph::new(truncate_to_width(&search, inner.width as usize))
@@ -878,7 +1269,7 @@ pub fn render_tab_chooser(
     if matches.is_empty() {
         f.render_widget(
             Paragraph::new(" no matching tabs")
-                .style(Style::default().fg(Color::DarkGray)),
+                .style(Style::default().fg(Color::DarkGray).bg(PANEL_BG)),
             Rect {
                 x: inner.x,
                 y: inner.y + 1,
@@ -915,7 +1306,7 @@ pub fn render_tab_chooser(
                 .bg(Color::Cyan)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(Color::White).bg(PANEL_BG)
         };
         let text = format!(
             "{:<width$}",
@@ -955,26 +1346,13 @@ pub fn render_rename_tab_panel(
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let width = area
-        .width
-        .saturating_mul(2)
-        .saturating_div(3)
-        .max(44)
-        .min(area.width);
-    let height = 9.min(area.height).max(1);
-    let x = area.x + area.width.saturating_sub(width) / 2;
-    let y = area.y + area.height.saturating_sub(height) / 2;
-    let panel = Rect {
-        x,
-        y,
-        width,
-        height,
-    };
-    f.render_widget(Clear, panel);
+    let panel = rename_tab_panel_rect(area);
+    begin_floating_panel(f, panel);
     let block = Block::default()
         .title(" Rename Tab  (Tab=switch field  Enter=next/save  Esc=cancel) ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(PANEL_BG));
     let inner = block.inner(panel);
     f.render_widget(block, panel);
     if inner.height == 0 {
@@ -1025,26 +1403,13 @@ pub fn render_tab_quick_switch_panel(
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let width = area
-        .width
-        .saturating_mul(2)
-        .saturating_div(5)
-        .max(36)
-        .min(area.width);
-    let height = 7.min(area.height).max(1);
-    let x = area.x + area.width.saturating_sub(width) / 2;
-    let y = area.y + area.height.saturating_sub(height) / 2;
-    let panel = Rect {
-        x,
-        y,
-        width,
-        height,
-    };
-    f.render_widget(Clear, panel);
+    let panel = tab_quick_switch_panel_rect(area);
+    begin_floating_panel(f, panel);
     let block = Block::default()
         .title(" Switch Tab  (Enter=switch  Esc=cancel) ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(PANEL_BG));
     let inner = block.inner(panel);
     f.render_widget(block, panel);
     if inner.width == 0 || inner.height == 0 {
@@ -1315,14 +1680,79 @@ fn unicode_char_width(c: char) -> usize {
     c.width().unwrap_or(1)
 }
 
-/// Padding fill for scrollback rows.  Alternates two visually identical spaces
-/// on each scroll step so ratatui re-emits default backgrounds and clears
-/// colored cells left on the physical terminal.
-fn pane_pad_fill(scrollback_stripe: bool) -> &'static str {
-    if scrollback_stripe {
-        "\u{00a0}"
-    } else {
-        " "
+fn fill_area_terminal_bg(f: &mut Frame, area: Rect, pad_fill: &str) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let style = Style::default();
+    let line_text = pad_fill.repeat(area.width as usize);
+    for row in 0..area.height {
+        let row_rect = Rect {
+            x: area.x,
+            y: area.y + row,
+            width: area.width,
+            height: 1,
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(line_text.clone(), style))),
+            row_rect,
+        );
+    }
+}
+
+fn fill_split_gaps(
+    f: &mut Frame,
+    direction: &str,
+    chunks: &[Rect],
+    pad_fill: &str,
+) {
+    if chunks.len() < 2 {
+        return;
+    }
+    let horizontal = direction == "horizontal";
+    for pair in chunks.windows(2) {
+        let gap = if horizontal {
+            Rect {
+                x: pair[0].x.saturating_add(pair[0].width),
+                y: pair[0].y,
+                width: pair[1]
+                    .x
+                    .saturating_sub(pair[0].x.saturating_add(pair[0].width)),
+                height: pair[0].height,
+            }
+        } else {
+            Rect {
+                x: pair[0].x,
+                y: pair[0].y.saturating_add(pair[0].height),
+                width: pair[0].width,
+                height: pair[1]
+                    .y
+                    .saturating_sub(pair[0].y.saturating_add(pair[0].height)),
+            }
+        };
+        fill_area_terminal_bg(f, gap, pad_fill);
+    }
+}
+
+fn parse_bg_color_str(s: &str) -> Color {
+    match s {
+        "default" | "" => Color::Reset,
+        s if s.starts_with("idx:") => s[4..]
+            .parse::<u8>()
+            .map(Color::Indexed)
+            .unwrap_or(Color::Reset),
+        s if s.starts_with("rgb:") => {
+            let parts: Vec<u8> = s[4..]
+                .splitn(3, ',')
+                .filter_map(|x| x.parse().ok())
+                .collect();
+            if parts.len() == 3 {
+                Color::Rgb(parts[0], parts[1], parts[2])
+            } else {
+                Color::Reset
+            }
+        }
+        s => crate::style::parse_color(s),
     }
 }
 
@@ -1384,28 +1814,20 @@ pub fn render_options_panel(
     selected: usize,
     scroll_on_erase_in_display: bool,
 ) {
-    use ratatui::widgets::{Block, Borders, Clear};
+    use ratatui::widgets::{Block, Borders};
 
     let area = f.area();
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let w = (area.width * 2 / 3).max(64).min(area.width);
-    let h = 7.min(area.height).max(1);
-    let x = (area.width.saturating_sub(w)) / 2;
-    let y = (area.height.saturating_sub(h)) / 2;
-    let panel_area = Rect {
-        x,
-        y,
-        width: w,
-        height: h,
-    };
+    let panel_area = options_panel_rect(area);
 
-    f.render_widget(Clear, panel_area);
+    begin_floating_panel(f, panel_area);
     let block = Block::default()
         .title(" Options  (Space/Enter=toggle  q/Esc=close) ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(PANEL_BG));
     let inner = block.inner(panel_area);
     f.render_widget(block, panel_area);
 
@@ -1464,7 +1886,7 @@ pub fn render_session_chooser(
     collapsed: &std::collections::HashSet<String>,
     collapsed_windows: &std::collections::HashSet<(String, usize)>,
 ) {
-    use ratatui::widgets::{Block, Borders, Clear};
+    use ratatui::widgets::{Block, Borders};
 
     use crate::server::SessionTreeEntry;
 
@@ -1488,24 +1910,17 @@ pub fn render_session_chooser(
         .collect();
 
     let area = f.area();
-    let w = (area.width * 2 / 3).max(50).min(area.width);
-    let h = ((visible.len() + 4) as u16)
-        .min(area.height.saturating_sub(2))
-        .max(5);
-    let x = (area.width.saturating_sub(w)) / 2;
-    let y = (area.height.saturating_sub(h)) / 2;
-    let chooser_area = Rect {
-        x,
-        y,
-        width: w,
-        height: h,
-    };
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let chooser_area = chooser_overlay_panel(area);
 
-    f.render_widget(Clear, chooser_area);
+    begin_floating_panel(f, chooser_area);
     let block = Block::default()
         .title(" Sessions  (Enter=select  q/Esc=close  j/k=nav  l=expand  h=collapse) ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(PANEL_BG));
     let inner = block.inner(chooser_area);
     f.render_widget(block, chooser_area);
 
@@ -1519,11 +1934,13 @@ pub fn render_session_chooser(
     }
     .min(visible.len().saturating_sub(view_height));
 
+    let mut drawn_rows = 0usize;
     for row in 0..view_height {
         let i = scroll + row;
         let Some(entry) = visible.get(i) else {
             break;
         };
+        drawn_rows = row + 1;
         let row_y = inner.y + row as u16;
         let is_sel = i == selected;
 
@@ -1551,9 +1968,10 @@ pub fn render_session_chooser(
                 } else if *is_active {
                     Style::default()
                         .fg(Color::Green)
+                        .bg(PANEL_BG)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::White)
+                    Style::default().fg(Color::White).bg(PANEL_BG)
                 };
                 (text, s)
             }
@@ -1578,9 +1996,9 @@ pub fn render_session_chooser(
                 let s = if is_sel {
                     Style::default().fg(Color::Black).bg(Color::Cyan)
                 } else if *is_active {
-                    Style::default().fg(Color::Blue)
+                    Style::default().fg(Color::Blue).bg(PANEL_BG)
                 } else {
-                    Style::default().fg(Color::White)
+                    Style::default().fg(Color::White).bg(PANEL_BG)
                 };
                 (text, s)
             }
@@ -1592,9 +2010,9 @@ pub fn render_session_chooser(
                 let s = if is_sel {
                     Style::default().fg(Color::Black).bg(Color::Cyan)
                 } else if *is_active {
-                    Style::default().fg(Color::Yellow)
+                    Style::default().fg(Color::Yellow).bg(PANEL_BG)
                 } else {
-                    Style::default().fg(Color::DarkGray)
+                    Style::default().fg(Color::DarkGray).bg(PANEL_BG)
                 };
                 (text, s)
             }
@@ -1612,11 +2030,34 @@ pub fn render_session_chooser(
             },
         );
     }
+    for row in drawn_rows..view_height {
+        fill_panel_row(f, inner.x, inner.y + row as u16, inner.width);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chooser_overlay_panel_is_stable_for_same_terminal_size() {
+        let area = Rect::new(0, 1, 120, 20);
+        let first = chooser_overlay_panel(area);
+        let second = chooser_overlay_panel(area);
+        assert_eq!(first, second);
+        assert_eq!(first.width, 90);
+        assert_eq!(first.height, 18);
+    }
+
+    #[test]
+    fn rename_panel_is_smaller_than_tab_chooser_panel() {
+        let area = Rect::new(0, 0, 120, 24);
+        let chooser = chooser_overlay_panel(area);
+        let rename = rename_tab_panel_rect(area);
+        assert!(rename.width <= chooser.width);
+        assert!(rename.height < chooser.height);
+        assert_ne!(chooser, rename);
+    }
 
     #[test]
     fn status_window_tab_hit_matches_rendered_labels() {
@@ -1728,11 +2169,109 @@ mod tests {
                 ],
             },
             status: None,
+            ansi: None,
             exit: false,
             yank_text: None,
         };
 
         assert_eq!(active_cursor_shape(&fd), Some(4));
+    }
+
+    #[test]
+    fn layout_geometry_fingerprint_tracks_all_panes() {
+        let layout = LayoutJson::Split {
+            direction: "horizontal".to_string(),
+            sizes: vec![50, 50],
+            children: vec![
+                LayoutJson::Leaf {
+                    id: 1,
+                    rows: 20,
+                    cols: 40,
+                    cursor_row: 0,
+                    cursor_col: 0,
+                    hide_cursor: false,
+                    alternate_screen: false,
+                    mouse_mode: 0,
+                    in_copy_mode: false,
+                    scroll_ratio: None,
+                    cursor_shape: 0,
+                    active: true,
+                    rows_v2: Vec::new(),
+                    title: None,
+                },
+                LayoutJson::Leaf {
+                    id: 2,
+                    rows: 20,
+                    cols: 39,
+                    cursor_row: 0,
+                    cursor_col: 0,
+                    hide_cursor: false,
+                    alternate_screen: false,
+                    mouse_mode: 0,
+                    in_copy_mode: false,
+                    scroll_ratio: None,
+                    cursor_shape: 0,
+                    active: false,
+                    rows_v2: Vec::new(),
+                    title: None,
+                },
+            ],
+        };
+        assert_eq!(
+            layout_geometry_fingerprint(&layout),
+            vec![(1, 20, 40), (2, 20, 39)]
+        );
+    }
+
+    #[test]
+    fn parse_bg_color_str_maps_default_to_terminal_reset() {
+        assert_eq!(parse_bg_color_str("default"), Color::Reset);
+        assert_eq!(parse_bg_color_str(""), Color::Reset);
+        assert_eq!(parse_bg_color_str("green"), Color::Green);
+    }
+
+    #[test]
+    fn active_window_index_returns_active_tab() {
+        let fd = FrameData {
+            frame_type: "frame".to_string(),
+            layout: LayoutJson::Leaf {
+                id: 1,
+                rows: 10,
+                cols: 10,
+                cursor_row: 0,
+                cursor_col: 0,
+                hide_cursor: false,
+                alternate_screen: false,
+                mouse_mode: 0,
+                in_copy_mode: false,
+                scroll_ratio: None,
+                cursor_shape: 0,
+                active: true,
+                rows_v2: Vec::new(),
+                title: None,
+            },
+            status: Some(StatusJson {
+                left: "[main]".to_string(),
+                right: String::new(),
+                windows: vec![
+                    WindowTabJson {
+                        index: 0,
+                        name: "zsh".to_string(),
+                        active: false,
+                    },
+                    WindowTabJson {
+                        index: 1,
+                        name: "shell".to_string(),
+                        active: true,
+                    },
+                ],
+            }),
+            ansi: None,
+            exit: false,
+            yank_text: None,
+        };
+
+        assert_eq!(active_window_index(&fd), Some(1));
     }
 
     #[test]
@@ -1756,6 +2295,7 @@ mod tests {
                 title: None,
             },
             status: None,
+            ansi: None,
             exit: false,
             yank_text: None,
         };

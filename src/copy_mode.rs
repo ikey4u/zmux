@@ -450,39 +450,56 @@ pub fn page_down(pane: &mut Pane) {
     });
 }
 
-pub fn scroll_up(pane: &mut Pane, lines: usize) -> bool {
-    if pane.copy_state.is_none() {
-        if !enter(pane) {
-            return false;
-        }
+pub fn scroll_up(pane: &mut Pane, lines: usize) -> CopyScrollResult {
+    let entering = pane.copy_state.is_none();
+    if entering && !enter(pane) {
+        return CopyScrollResult::Unavailable;
     }
     let width = pane.last_cols.max(1) as usize;
     let height = pane.last_rows.max(1) as usize;
     let Some(state) = pane.copy_state.as_mut() else {
-        return false;
+        return CopyScrollResult::Unavailable;
     };
     rebuild_wrapped(state, width, height);
     state.scroll_top = state.scroll_top.saturating_sub(lines);
-    true
+    if entering {
+        CopyScrollResult::Entered
+    } else {
+        CopyScrollResult::Scrolled
+    }
 }
 
-pub fn scroll_down(pane: &mut Pane, lines: usize) -> bool {
+pub fn scroll_down(pane: &mut Pane, lines: usize) -> CopyScrollResult {
     if pane.copy_state.is_none() {
-        return false;
+        return CopyScrollResult::Unavailable;
     }
     let width = pane.last_cols.max(1) as usize;
     let height = pane.last_rows.max(1) as usize;
     let Some(state) = pane.copy_state.as_mut() else {
-        return false;
+        return CopyScrollResult::Unavailable;
     };
     rebuild_wrapped(state, width, height);
     let max_scroll = state.wrapped.rows.len().saturating_sub(height);
     state.scroll_top = (state.scroll_top + lines).min(max_scroll);
     if state.scroll_top >= max_scroll {
         exit(pane);
-        return false;
+        return CopyScrollResult::Exited;
     }
-    true
+    CopyScrollResult::Scrolled
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyScrollResult {
+    Scrolled,
+    Entered,
+    Exited,
+    Unavailable,
+}
+
+impl CopyScrollResult {
+    pub fn needs_full_clear(self) -> bool {
+        matches!(self, Self::Entered | Self::Exited)
+    }
 }
 
 pub fn scroll_ratio(pane: &Pane) -> Option<f32> {

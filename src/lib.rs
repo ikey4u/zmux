@@ -4,6 +4,7 @@ pub mod config;
 pub mod copy_mode;
 pub mod ipc;
 pub mod layout;
+pub mod output;
 pub mod platform;
 pub mod pty;
 pub mod server;

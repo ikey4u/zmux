@@ -1,0 +1,847 @@
+//! Server-side ANSI rendering for pane content (Zellij-style direct terminal output).
+
+mod styles;
+
+use std::{
+    fmt::Write as FmtWrite,
+    hash::{Hash, Hasher},
+};
+
+use alacritty_terminal::vte::ansi::{Color, NamedColor};
+pub use styles::{
+    adjust_styles_for_custom_bg_fg, color_to_ansi, color_to_ansi_or_reset,
+    pane_default_ansi, row_trailing_bg, vte_goto, write_style_diff, AnsiCode,
+    CharacterStyles, DEFAULT_STYLES, RESET_STYLES,
+};
+
+pub use crate::terminal::OutputBuffer;
+use crate::{
+    copy_mode::CopyRenderRow,
+    layout::BORDER_SIZE,
+    terminal::{color_is_default, TerminalCell},
+    types::{LayoutNode, Pane, Rect, SplitDirection, Window},
+};
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FrameAnsiOptions {
+    /// Prepend `\x1b[2J` before painting pane content.
+    pub clear_display: bool,
+}
+
+fn border_styles(active: bool) -> CharacterStyles {
+    CharacterStyles {
+        foreground: Some(if active {
+            AnsiCode::Named(NamedColor::Green)
+        } else {
+            AnsiCode::Named(NamedColor::BrightBlack)
+        }),
+        background: Some(AnsiCode::Reset),
+        ..DEFAULT_STYLES
+    }
+}
+
+fn write_border(area: Rect, active: bool, out: &mut String) {
+    if area.width < 2 || area.height < 2 {
+        return;
+    }
+    let left = area.x;
+    let top = area.y;
+    let right = area.x + area.width - 1;
+    let bottom = area.y + area.height - 1;
+    let style = border_styles(active);
+    let corners = [
+        (left, top, '┌'),
+        (right, top, '┐'),
+        (left, bottom, '└'),
+        (right, bottom, '┘'),
+    ];
+    for (x, y, ch) in corners {
+        vte_goto(x, y, out);
+        let _ = write!(out, "{style}{ch}");
+    }
+    for x in (left + 1)..right {
+        vte_goto(x, top, out);
+        let _ = write!(out, "{style}─");
+        vte_goto(x, bottom, out);
+        let _ = write!(out, "{style}─");
+    }
+    for y in (top + 1)..bottom {
+        vte_goto(left, y, out);
+        let _ = write!(out, "{style}│");
+        vte_goto(right, y, out);
+        let _ = write!(out, "{style}│");
+    }
+}
+
+fn content_area(area: Rect, has_border: bool) -> Rect {
+    if has_border && area.width > 2 && area.height > 2 {
+        Rect::new(area.x + 1, area.y + 1, area.width - 2, area.height - 2)
+    } else {
+        area
+    }
+}
+
+/// Erase one pane's content rectangle (not borders/gaps) before repainting a row.
+/// Must not use `\x1b[K` — that clears to the physical line end and wipes pane
+/// right borders and split gaps on the same row.
+fn write_erase_rect(area: Rect, out: &mut String) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let pad = adjust_styles_for_custom_bg_fg(DEFAULT_STYLES, None, None);
+    for row in 0..area.height {
+        vte_goto(area.x, area.y + row, out);
+        let mut current = DEFAULT_STYLES;
+        write_style_diff(&mut current, pad, out);
+        for _ in 0..area.width {
+            out.push(' ');
+        }
+    }
+}
+
+fn pane_default_codes(
+    pane_default_fg: Option<(u8, u8, u8)>,
+    pane_default_bg: Option<(u8, u8, u8)>,
+) -> (Option<AnsiCode>, Option<AnsiCode>) {
+    (
+        pane_default_fg.map(pane_default_ansi),
+        pane_default_bg.map(pane_default_ansi),
+    )
+}
+
+/// Last column with drawable content: non-space text or styled cells (e.g. EL `\x1b[K`
+/// green fill). Mirrors Zellij `dump_screen_with_ansi` drawable extent.
+fn row_styled_end(cells: &[Option<TerminalCell>], cols: u16) -> Option<u16> {
+    for col in (0..cols.min(cells.len() as u16)).rev() {
+        let Some(cell) = cells.get(col as usize).and_then(|c| c.as_ref())
+        else {
+            continue;
+        };
+        let is_space = cell.text.chars().all(|c| c == ' ');
+        let styled = !color_is_default(cell.bg)
+            || !color_is_default(cell.fg)
+            || !cell.flags.is_empty();
+        if !is_space || styled {
+            return Some(col.saturating_add(cell.width.saturating_sub(1)));
+        }
+    }
+    None
+}
+
+fn row_has_non_space_content(
+    cells: &[Option<TerminalCell>],
+    cols: u16,
+) -> bool {
+    cells.iter().take(cols as usize).any(|cell| {
+        cell.as_ref()
+            .is_some_and(|c| !c.text.chars().all(|ch| ch == ' '))
+    })
+}
+
+/// How far across the row to paint. Diff/highlight lines extend colored backgrounds to
+/// EOL; blank rows do not (Zellij `extract_characters_from_row` + compact storage).
+fn row_paint_end(cells: &[Option<TerminalCell>], cols: u16) -> Option<u16> {
+    let styled_end = row_styled_end(cells, cols)?;
+    let trailing_bg = row_trailing_bg(cells);
+    if row_has_non_space_content(cells, cols) && trailing_bg != AnsiCode::Reset
+    {
+        Some(cols.saturating_sub(1))
+    } else {
+        Some(styled_end)
+    }
+}
+
+fn reset_pad_styles() -> CharacterStyles {
+    CharacterStyles {
+        foreground: Some(AnsiCode::Reset),
+        background: Some(AnsiCode::Reset),
+        bold: Some(AnsiCode::Reset),
+        dim: Some(AnsiCode::Reset),
+        italic: Some(AnsiCode::Reset),
+        underline: Some(AnsiCode::Reset),
+        reverse: Some(AnsiCode::Reset),
+    }
+}
+
+fn pad_styles_for_active_bg(active_bg: AnsiCode) -> CharacterStyles {
+    CharacterStyles {
+        foreground: Some(AnsiCode::Reset),
+        background: Some(active_bg),
+        bold: Some(AnsiCode::Reset),
+        dim: Some(AnsiCode::Reset),
+        italic: Some(AnsiCode::Reset),
+        underline: Some(AnsiCode::Reset),
+        reverse: Some(AnsiCode::Reset),
+    }
+}
+
+fn write_terminal_row(
+    cells: &[Option<TerminalCell>],
+    cols: u16,
+    x: u16,
+    y: u16,
+    pane_default_fg: Option<AnsiCode>,
+    pane_default_bg: Option<AnsiCode>,
+    out: &mut String,
+) {
+    vte_goto(x, y, out);
+    let mut current_styles = DEFAULT_STYLES;
+    let paint_end = row_paint_end(cells, cols);
+    let reset_pad = adjust_styles_for_custom_bg_fg(
+        reset_pad_styles(),
+        pane_default_fg,
+        pane_default_bg,
+    );
+    let mut active_bg = AnsiCode::Reset;
+    let mut col = 0u16;
+    while col < cols {
+        if paint_end.is_none_or(|end| col > end) {
+            write_style_diff(&mut current_styles, reset_pad, out);
+            out.push(' ');
+            col += 1;
+            continue;
+        }
+        if let Some(cell) = cells.get(col as usize).and_then(|c| c.as_ref()) {
+            active_bg = color_to_ansi_or_reset(cell.bg);
+            let new_styles = adjust_styles_for_custom_bg_fg(
+                CharacterStyles::from_cell(cell),
+                pane_default_fg,
+                pane_default_bg,
+            );
+            write_style_diff(&mut current_styles, new_styles, out);
+            let ch = cell.text.chars().next().unwrap_or(' ');
+            out.push(ch);
+            col = col.saturating_add(cell.width.max(1));
+        } else {
+            let new_styles = adjust_styles_for_custom_bg_fg(
+                pad_styles_for_active_bg(active_bg),
+                pane_default_fg,
+                pane_default_bg,
+            );
+            write_style_diff(&mut current_styles, new_styles, out);
+            out.push(' ');
+            col += 1;
+        }
+    }
+}
+
+fn write_copy_row(
+    row: &CopyRenderRow,
+    cols: u16,
+    x: u16,
+    y: u16,
+    pane_default_fg: Option<AnsiCode>,
+    pane_default_bg: Option<AnsiCode>,
+    out: &mut String,
+) {
+    vte_goto(x, y, out);
+    let mut current_styles = DEFAULT_STYLES;
+    let mut col = 0u16;
+    for run in &row.runs {
+        let fg = parse_run_color(&run.fg, true);
+        let bg = parse_run_color(&run.bg, false);
+        let run_styles = adjust_styles_for_custom_bg_fg(
+            CharacterStyles::from_copy_run(fg, bg, run.flags),
+            pane_default_fg,
+            pane_default_bg,
+        );
+        for ch in run.text.chars() {
+            if col >= cols {
+                return;
+            }
+            write_style_diff(&mut current_styles, run_styles, out);
+            out.push(ch);
+            col += 1;
+        }
+    }
+    while col < cols {
+        let pad = adjust_styles_for_custom_bg_fg(
+            reset_pad_styles(),
+            pane_default_fg,
+            pane_default_bg,
+        );
+        write_style_diff(&mut current_styles, pad, out);
+        out.push(' ');
+        col += 1;
+    }
+}
+
+fn parse_run_color(name: &str, fg: bool) -> Color {
+    use ratatui::style::Color as RtColor;
+
+    use crate::style::parse_color;
+    match parse_color(name) {
+        RtColor::Reset => {
+            if fg {
+                Color::Named(NamedColor::Foreground)
+            } else {
+                Color::Named(NamedColor::Background)
+            }
+        }
+        RtColor::Black => Color::Named(NamedColor::Black),
+        RtColor::Red => Color::Named(NamedColor::Red),
+        RtColor::Green => Color::Named(NamedColor::Green),
+        RtColor::Yellow => Color::Named(NamedColor::Yellow),
+        RtColor::Blue => Color::Named(NamedColor::Blue),
+        RtColor::Magenta => Color::Named(NamedColor::Magenta),
+        RtColor::Cyan => Color::Named(NamedColor::Cyan),
+        RtColor::White | RtColor::Gray => Color::Named(NamedColor::White),
+        RtColor::DarkGray => Color::Named(NamedColor::BrightBlack),
+        RtColor::LightRed => Color::Named(NamedColor::BrightRed),
+        RtColor::LightGreen => Color::Named(NamedColor::BrightGreen),
+        RtColor::LightYellow => Color::Named(NamedColor::BrightYellow),
+        RtColor::LightBlue => Color::Named(NamedColor::BrightBlue),
+        RtColor::LightMagenta => Color::Named(NamedColor::BrightMagenta),
+        RtColor::LightCyan => Color::Named(NamedColor::BrightCyan),
+        RtColor::Indexed(i) => Color::Indexed(i),
+        RtColor::Rgb(r, g, b) => {
+            Color::Spec(alacritty_terminal::vte::ansi::Rgb { r, g, b })
+        }
+    }
+}
+
+fn write_scrollbar(content: Rect, ratio: f32, out: &mut String) {
+    let height = content.height as usize;
+    if height < 3 {
+        return;
+    }
+    let thumb_height = (height / 4).max(1);
+    let track_range = height.saturating_sub(thumb_height);
+    let thumb_top = (ratio.clamp(0.0, 1.0) * track_range as f32) as usize;
+    let col = content.x + content.width.saturating_sub(1);
+    for row in 0..height {
+        let y = content.y + row as u16;
+        let in_thumb = row >= thumb_top && row < thumb_top + thumb_height;
+        vte_goto(col, y, out);
+        if in_thumb {
+            out.push_str("\x1b[37;49m┃");
+        } else {
+            out.push_str("\x1b[38;2;60;60;60;49m│");
+        }
+    }
+}
+
+fn write_pane(
+    pane: &Pane,
+    is_active: bool,
+    area: Rect,
+    hide_borders: bool,
+    out: &mut String,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let has_border = !hide_borders && area.width > 2 && area.height > 2;
+    let inner = content_area(area, has_border);
+    write_erase_rect(inner, out);
+    let Ok(parser) = pane.parser.lock() else {
+        if has_border {
+            write_border(area, is_active, out);
+        }
+        return;
+    };
+    let (pane_fg, pane_bg) =
+        pane_default_codes(parser.pane_default_fg(), parser.pane_default_bg());
+    if pane.copy_state.is_some() {
+        if let Some(copy_view) = crate::copy_mode::render_view(pane) {
+            for (row_idx, row) in copy_view.rows.iter().enumerate() {
+                if row_idx >= inner.height as usize {
+                    break;
+                }
+                write_copy_row(
+                    row,
+                    inner.width,
+                    inner.x,
+                    inner.y + row_idx as u16,
+                    pane_fg,
+                    pane_bg,
+                    out,
+                );
+            }
+            if let Some(ratio) = copy_view.scroll_ratio {
+                write_scrollbar(inner, ratio, out);
+            }
+            if has_border {
+                write_border(area, is_active, out);
+            }
+            return;
+        }
+        if has_border {
+            write_border(area, is_active, out);
+        }
+        return;
+    }
+    let rows = parser.visible_rows();
+    for row_idx in 0..inner.height as usize {
+        let cells = rows.get(row_idx).cloned().unwrap_or_default();
+        write_terminal_row(
+            &cells,
+            inner.width,
+            inner.x,
+            inner.y + row_idx as u16,
+            pane_fg,
+            pane_bg,
+            out,
+        );
+    }
+    if has_border {
+        write_border(area, is_active, out);
+    }
+}
+
+fn fill_gap(gap: Rect, out: &mut String) {
+    if gap.width == 0 || gap.height == 0 {
+        return;
+    }
+    let pad = adjust_styles_for_custom_bg_fg(DEFAULT_STYLES, None, None);
+    for row in 0..gap.height {
+        vte_goto(gap.x, gap.y + row, out);
+        let mut current = DEFAULT_STYLES;
+        write_style_diff(&mut current, pad, out);
+        for _ in 0..gap.width {
+            out.push(' ');
+        }
+    }
+}
+
+fn write_split_gaps(
+    direction: &SplitDirection,
+    chunks: &[Rect],
+    out: &mut String,
+) {
+    if chunks.len() < 2 {
+        return;
+    }
+    for pair in chunks.windows(2) {
+        let gap = match direction {
+            SplitDirection::Horizontal => Rect::new(
+                pair[0].x + pair[0].width,
+                pair[0].y,
+                pair[1].x.saturating_sub(pair[0].x + pair[0].width),
+                pair[0].height,
+            ),
+            SplitDirection::Vertical => Rect::new(
+                pair[0].x,
+                pair[0].y + pair[0].height,
+                pair[0].width,
+                pair[1].y.saturating_sub(pair[0].y + pair[0].height),
+            ),
+        };
+        fill_gap(gap, out);
+    }
+}
+
+fn split_rects(
+    area: Rect,
+    direction: &SplitDirection,
+    sizes: &[u16],
+    count: usize,
+    hide_borders: bool,
+) -> Vec<Rect> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let gap = if hide_borders { 0 } else { BORDER_SIZE };
+    let horizontal = matches!(direction, SplitDirection::Horizontal);
+    let total_dim = if horizontal { area.width } else { area.height };
+    let borders = count.saturating_sub(1) as u16 * gap;
+    let available = total_dim.saturating_sub(borders);
+    let total_pct = sizes.iter().copied().sum::<u16>().max(1);
+    let mut rects = Vec::with_capacity(count);
+    let mut offset = 0u16;
+    for (index, &pct) in sizes.iter().enumerate().take(count) {
+        let dim = if index + 1 == count {
+            available.saturating_sub(offset)
+        } else {
+            (available as u32 * pct as u32 / total_pct as u32) as u16
+        };
+        rects.push(if horizontal {
+            Rect::new(area.x + offset, area.y, dim, area.height)
+        } else {
+            Rect::new(area.x, area.y + offset, area.width, dim)
+        });
+        offset += dim + gap;
+    }
+    rects
+}
+
+fn write_node(
+    node: &LayoutNode,
+    active_path: &[usize],
+    area: Rect,
+    hide_borders: bool,
+    out: &mut String,
+) {
+    match node {
+        LayoutNode::Split {
+            direction,
+            sizes,
+            children,
+        } => {
+            let chunks = split_rects(
+                area,
+                direction,
+                sizes,
+                children.len(),
+                hide_borders,
+            );
+            for (i, child) in children.iter().enumerate() {
+                let child_active = active_path.first() == Some(&i);
+                let child_path = if active_path.first() == Some(&i) {
+                    &active_path[1..]
+                } else {
+                    &[]
+                };
+                write_child_node(
+                    child,
+                    child_path,
+                    child_active,
+                    chunks[i],
+                    hide_borders,
+                    out,
+                );
+            }
+            if !hide_borders {
+                write_split_gaps(direction, &chunks, out);
+            }
+        }
+        LayoutNode::Leaf(pane) => {
+            write_pane(pane, true, area, hide_borders, out);
+        }
+    }
+}
+
+fn write_child_node(
+    node: &LayoutNode,
+    relative_path: &[usize],
+    is_active_branch: bool,
+    area: Rect,
+    hide_borders: bool,
+    out: &mut String,
+) {
+    match node {
+        LayoutNode::Split {
+            direction,
+            sizes,
+            children,
+        } => {
+            let chunks = split_rects(
+                area,
+                direction,
+                sizes,
+                children.len(),
+                hide_borders,
+            );
+            for (i, child) in children.iter().enumerate() {
+                let child_active =
+                    is_active_branch && relative_path.first() == Some(&i);
+                let child_rel = if relative_path.first() == Some(&i) {
+                    &relative_path[1..]
+                } else {
+                    &[]
+                };
+                write_child_node(
+                    child,
+                    child_rel,
+                    child_active,
+                    chunks[i],
+                    hide_borders,
+                    out,
+                );
+            }
+            if !hide_borders {
+                write_split_gaps(direction, &chunks, out);
+            }
+        }
+        LayoutNode::Leaf(pane) => {
+            let is_active = is_active_branch && relative_path.is_empty();
+            write_pane(pane, is_active, area, hide_borders, out);
+        }
+    }
+}
+
+pub fn layout_fingerprint(win: &Window, area: Rect, hide_borders: bool) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    let mut hasher = DefaultHasher::new();
+    area.width.hash(&mut hasher);
+    area.height.hash(&mut hasher);
+    hide_borders.hash(&mut hasher);
+    win.active_pane_path.hash(&mut hasher);
+    if let Some(zoom) = &win.zoom_state {
+        zoom.zoomed_pane_id.hash(&mut hasher);
+    }
+    hash_layout_node(&win.root, area, hide_borders, &mut hasher);
+    hasher.finish()
+}
+
+fn hash_layout_node(
+    node: &LayoutNode,
+    area: Rect,
+    hide_borders: bool,
+    hasher: &mut impl Hasher,
+) {
+    match node {
+        LayoutNode::Split {
+            direction,
+            sizes,
+            children,
+        } => {
+            match direction {
+                SplitDirection::Horizontal => 0u8.hash(hasher),
+                SplitDirection::Vertical => 1u8.hash(hasher),
+            }
+            for size in sizes {
+                size.hash(hasher);
+            }
+            let chunks = split_rects(
+                area,
+                direction,
+                sizes,
+                children.len(),
+                hide_borders,
+            );
+            for (child, rect) in children.iter().zip(chunks.iter()) {
+                hash_layout_node(child, *rect, hide_borders, hasher);
+            }
+        }
+        LayoutNode::Leaf(pane) => {
+            pane.id.hash(hasher);
+            area.x.hash(hasher);
+            area.y.hash(hasher);
+            area.width.hash(hasher);
+            area.height.hash(hasher);
+        }
+    }
+}
+
+/// Clear only the pane region, preserving the client tab bar (row 0) and status bar.
+pub fn write_clear_pane_area(out: &mut String, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let first_row_1based = area.y.saturating_add(1);
+    let last_row_1based =
+        first_row_1based.saturating_add(area.height.saturating_sub(1));
+    for row in first_row_1based..=last_row_1based {
+        let _ = write!(out, "\x1b[{};1H\x1b[K", row);
+    }
+}
+
+/// Serialize pane layout to ANSI. Coordinates are absolute screen positions.
+pub fn serialize_frame_ansi(
+    win: &Window,
+    area: Rect,
+    hide_borders: bool,
+    opts: FrameAnsiOptions,
+) -> String {
+    let mut out = String::with_capacity(65536);
+    if opts.clear_display {
+        write_clear_pane_area(&mut out, area);
+    }
+    if let Some(zoom) = &win.zoom_state {
+        if let Some(pane) =
+            crate::layout::find_pane_by_id(&win.root, zoom.zoomed_pane_id)
+        {
+            write_pane(pane, true, area, hide_borders, &mut out);
+            return out;
+        }
+    }
+    write_node(
+        &win.root,
+        &win.active_pane_path,
+        area,
+        hide_borders,
+        &mut out,
+    );
+    out
+}
+
+/// Pane-only ANSI area on the client screen (below tab bar, above status bar).
+pub fn frame_ansi_area(size: crate::types::session::Size) -> Rect {
+    Rect::new(0, 1, size.cols.max(1), size.rows.saturating_sub(1).max(1))
+}
+
+pub fn encode_ansi_base64(ansi: &str) -> String {
+    base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        ansi.as_bytes(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use alacritty_terminal::{
+        term::cell::Flags,
+        vte::ansi::{Color, NamedColor},
+    };
+
+    use super::*;
+    use crate::terminal::AlacrittyTermState;
+
+    #[test]
+    fn default_background_after_colored_emits_reset() {
+        let mut term = AlacrittyTermState::new(1, 4, 100);
+        term.process(b"\x1b[42mABC\x1b[49m   ");
+        let mut out = String::new();
+        let cells = term.visible_rows().into_iter().next().unwrap_or_default();
+        write_terminal_row(&cells, 4, 0, 0, None, None, &mut out);
+        assert!(
+            out.starts_with("\x1b[1;1H\x1b[m"),
+            "line should reset SGR at start, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn goto_resets_sgr_at_line_start() {
+        let mut out = String::new();
+        vte_goto(5, 3, &mut out);
+        assert!(out.starts_with("\x1b[4;6H\x1b[m"));
+    }
+
+    #[test]
+    fn write_erase_rect_does_not_clear_to_line_end() {
+        let mut out = String::new();
+        write_erase_rect(Rect::new(10, 5, 20, 2), &mut out);
+        assert!(
+            !out.contains("\x1b[K"),
+            "must not EL to line end (erases pane borders and split gaps), got {out:?}"
+        );
+    }
+
+    #[test]
+    fn clear_display_preserves_chrome_rows() {
+        let pane = Rect::new(0, 1, 80, 22);
+        let mut out = String::new();
+        write_clear_pane_area(&mut out, pane);
+        assert!(
+            !out.contains("\x1b[2J"),
+            "must not full-screen clear, got {out:?}"
+        );
+        assert!(
+            !out.contains("\x1b[0J"),
+            "must not clear to end of screen (status bar would be erased), got {out:?}"
+        );
+        assert!(
+            out.contains("\x1b[2;1H\x1b[K"),
+            "must clear pane lines individually, got {out:?}"
+        );
+        assert!(
+            !out.contains("\x1b[24;"),
+            "status bar row must be preserved, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn colored_diff_line_extends_background_to_eol() {
+        let mut out = String::new();
+        let cells = vec![
+            Some(TerminalCell {
+                text: "+".to_string(),
+                fg: Color::Named(NamedColor::Foreground),
+                bg: Color::Named(NamedColor::Green),
+                flags: Flags::empty(),
+                width: 1,
+            }),
+            Some(TerminalCell {
+                text: "x".to_string(),
+                fg: Color::Named(NamedColor::Foreground),
+                bg: Color::Named(NamedColor::Green),
+                flags: Flags::empty(),
+                width: 1,
+            }),
+            None,
+        ];
+        write_terminal_row(&cells, 3, 0, 0, None, None, &mut out);
+        assert_eq!(row_paint_end(&cells, 3), Some(2));
+        assert!(
+            out.contains("\x1b[42m"),
+            "diff line should extend green background through EOL, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn diff_style_line_extends_colored_background_to_eol() {
+        let mut term = AlacrittyTermState::new(5, 40, 1000);
+        term.process(b"\x1b[48;5;22m+ # Teamspace title\n");
+        term.process(b"\x1b[48;5;22m+ > **Status:** open\n");
+        let rows = term.visible_rows();
+        let mut out = String::new();
+        for (idx, cells) in rows.iter().take(2).enumerate() {
+            write_terminal_row(cells, 40, 0, idx as u16, None, None, &mut out);
+        }
+        assert_eq!(row_paint_end(&rows[0], 40), Some(39));
+        let green_count = out.matches("\x1b[48;5;22m").count();
+        assert!(
+            green_count >= 2,
+            "colored diff lines should paint green through EOL, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn erase_in_line_green_fill_paints_to_eol() {
+        let mut term = AlacrittyTermState::new(2, 20, 1000);
+        term.process(b"\x1b[48;5;22m+ title\x1b[K");
+        let cells = term.visible_rows().into_iter().next().unwrap_or_default();
+        let text: String = cells
+            .iter()
+            .filter_map(|c| c.as_ref())
+            .map(|c| c.text.as_str())
+            .collect();
+        assert!(
+            text.contains('+'),
+            "expected diff prefix in row, got cells: {text:?}"
+        );
+        assert_eq!(row_paint_end(&cells, 20), Some(19));
+        let mut out = String::new();
+        write_terminal_row(&cells, 20, 0, 0, None, None, &mut out);
+        assert!(
+            out.contains("\x1b[48;5;22m"),
+            "EL fill should paint green through EOL, got: {out:?}"
+        );
+        assert!(
+            out.ends_with(' '),
+            "row should be padded to pane width, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn blank_line_after_colored_line_is_not_green() {
+        let mut term = AlacrittyTermState::new(3, 30, 1000);
+        term.process(b"\x1b[48;5;22m+ line one\x1b[m\n\n");
+        let rows = term.visible_rows();
+        let mut out = String::new();
+        write_terminal_row(&rows[1], 30, 0, 1, None, None, &mut out);
+        assert!(
+            !out.contains("\x1b[48;5;22m"),
+            "blank line should not inherit diff green, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn row_gap_inherits_active_background() {
+        let mut out = String::new();
+        let cells = vec![
+            Some(TerminalCell {
+                text: "+".to_string(),
+                fg: Color::Named(NamedColor::Foreground),
+                bg: Color::Named(NamedColor::Green),
+                flags: Flags::empty(),
+                width: 1,
+            }),
+            None,
+            Some(TerminalCell {
+                text: "X".to_string(),
+                fg: Color::Named(NamedColor::Foreground),
+                bg: Color::Named(NamedColor::Green),
+                flags: Flags::empty(),
+                width: 1,
+            }),
+        ];
+        write_terminal_row(&cells, 3, 0, 0, None, None, &mut out);
+        let green_start = out.find("\x1b[42m").expect("green bg");
+        let x_pos = out.find('X').expect("X");
+        let gap_pos = out.find("+ ").expect("gap space");
+        assert!(gap_pos > green_start);
+        assert!(x_pos > gap_pos);
+    }
+}

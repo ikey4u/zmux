@@ -21,6 +21,9 @@ use crate::{
 };
 
 mod osc7;
+mod term_queries;
+
+pub use term_queries::PtyWriter;
 
 pub const CURSOR_SHAPE_UNSET: u8 = 255;
 
@@ -88,15 +91,18 @@ pub fn spawn_pane(opts: SpawnOptions<'_>) -> io::Result<Pane> {
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     let child_pid = child.process_id();
 
-    let writer = pair
-        .master
-        .take_writer()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let writer = Arc::new(Mutex::new(
+        pair.master
+            .take_writer()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?,
+    ));
 
     #[cfg(windows)]
-    let mut writer = writer;
-    #[cfg(windows)]
-    send_dsr_response(&mut *writer);
+    {
+        if let Ok(mut w) = writer.lock() {
+            send_dsr_response(&mut **w);
+        }
+    }
 
     let mut term_state = AlacrittyTermState::new(opts.rows, opts.cols, 2000);
     term_state.set_scroll_on_erase_in_display(opts.scroll_on_erase_in_display);
@@ -122,6 +128,7 @@ pub fn spawn_pane(opts: SpawnOptions<'_>) -> io::Result<Pane> {
         Arc::clone(&output_ring),
         Arc::clone(&dead),
         Arc::clone(&reported_cwd),
+        Arc::clone(&writer),
     );
 
     Ok(Pane {
@@ -356,11 +363,15 @@ fn start_reader_thread(
     output_ring: Arc<Mutex<VecDeque<u8>>>,
     dead_flag: Arc<AtomicBool>,
     reported_cwd: Arc<Mutex<Option<String>>>,
+    pty_writer: PtyWriter,
 ) {
     thread::spawn(move || {
         let mut buf = [0u8; 65536];
         let mut cursor_tracker = CursorShapeTracker::default();
         let mut cwd_tracker = osc7::CwdTracker::default();
+        let mut color_tracker =
+            crate::terminal::osc_colors::OscColorTracker::default();
+        let mut query_tracker = term_queries::TermQueryTracker::default();
         let render_debounce_seq = Arc::new(AtomicU64::new(0));
         let mut burst_window_start = Instant::now();
         let mut burst_bytes = 0usize;
@@ -394,6 +405,8 @@ fn start_reader_thread(
                     }
                     cursor_tracker.process(data, &cursor_shape);
                     cwd_tracker.process(data, &reported_cwd);
+                    color_tracker.process(data, &parser);
+                    query_tracker.process(data, &parser, &pty_writer);
                     data_version.fetch_add(1, Ordering::Relaxed);
                     let now = Instant::now();
                     if now.duration_since(burst_window_start)

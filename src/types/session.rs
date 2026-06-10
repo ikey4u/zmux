@@ -37,7 +37,7 @@ impl Size {
 pub struct Pane {
     pub id: PaneId,
     pub master: Box<dyn MasterPty>,
-    pub writer: Box<dyn std::io::Write + Send>,
+    pub writer: crate::pty::PtyWriter,
     pub child: Box<dyn portable_pty::Child>,
     pub parser: Arc<Mutex<AlacrittyTermState>>,
     pub last_rows: u16,
@@ -176,6 +176,8 @@ pub struct Server {
     pub next_session_id: SessionId,
     pub next_client_id: ClientId,
     pub hide_borders: bool,
+    /// Next render should clear the pane area before painting (set on resize/layout churn).
+    pub force_clear_display: bool,
 }
 
 impl Server {
@@ -190,6 +192,7 @@ impl Server {
             next_session_id: 0,
             next_client_id: 1,
             hide_borders: false,
+            force_clear_display: false,
         }
     }
 

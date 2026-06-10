@@ -61,6 +61,7 @@ fn exit_frame() -> FrameData {
             title: None,
         },
         status: None,
+        ansi: None,
         exit: true,
         yank_text: None,
     }
@@ -442,6 +443,14 @@ impl SocketClient {
 
     pub fn scroll_down(&self, lines: usize) {
         self.send_line(&format!("SCROLL down {}", lines));
+    }
+
+    pub fn scroll_display(&self, delta: i32) {
+        self.send_line(&format!("SCROLL_DISPLAY {}", delta));
+    }
+
+    pub fn scroll_display_bottom(&self) {
+        self.send_line("SCROLL_DISPLAY bottom");
     }
 
     pub fn enter_copy_mode(&self) -> bool {

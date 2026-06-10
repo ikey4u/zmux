@@ -13,6 +13,10 @@ use crate::{
         compute_rects, first_leaf_path, kill_pane_at_path, serialize_frame,
         split_node, BORDER_SIZE,
     },
+    output::{
+        encode_ansi_base64, frame_ansi_area, layout_fingerprint,
+        serialize_frame_ansi, FrameAnsiOptions,
+    },
     pty::{resize_pane, spawn_pane, SpawnOptions},
     types::{
         events::{mark_data_ready, PTY_DATA_READY},
@@ -112,8 +116,10 @@ impl InProcessServer {
         if let Some(pane) =
             crate::layout::active_pane_mut(&mut win.root, &win.active_pane_path)
         {
-            if let Err(e) = write_pty_input(&mut *pane.writer, bytes) {
+            if let Err(e) = write_pane_input(pane, bytes) {
                 log_server(&format!("input write failed: {}", e));
+            } else {
+                mark_data_ready();
             }
         }
     }
@@ -297,6 +303,7 @@ impl InProcessServer {
             })
             .unwrap_or(false);
             if changed {
+                state.force_clear_display = true;
                 mark_data_ready();
             }
         }
@@ -650,8 +657,10 @@ where
                     &mut win.root,
                     &win.active_pane_path,
                 ) {
-                    if let Err(e) = write_pty_input(&mut *pane.writer, &bytes) {
+                    if let Err(e) = write_pane_input(pane, &bytes) {
                         log_server(&format!("input write failed: {}", e));
+                    } else {
+                        mark_data_ready();
                     }
                 }
             }
@@ -689,6 +698,13 @@ where
         } else if line.starts_with("SCROLL ") {
             let rest = &line["SCROLL ".len()..];
             handle_scroll_line(&state, rest);
+        } else if line.starts_with("SCROLL_DISPLAY ") {
+            let rest = &line["SCROLL_DISPLAY ".len()..];
+            if rest.trim() == "bottom" {
+                handle_scroll_display_bottom(&state);
+            } else if let Ok(delta) = rest.trim().parse::<i32>() {
+                handle_scroll_display(&state, delta);
+            }
         } else if line.starts_with("RESIZE ") {
             let rest = &line["RESIZE ".len()..];
             if let Some((rows, cols)) = parse_size_line(rest) {
@@ -759,6 +775,7 @@ where
                             frame_layout_area(sz),
                             None,
                             s.hide_borders,
+                            sz,
                         )
                     })
                 } else {
@@ -778,6 +795,7 @@ where
                         area,
                         yank_ref.as_deref(),
                         s.hide_borders,
+                        sz,
                     )
                 }
             };
@@ -814,7 +832,16 @@ fn handle_copy_key_line(state: &Arc<Mutex<Server>>, key: &str) {
     };
     if let Some(f) = pane_fn {
         if let Ok(mut s) = state.lock() {
-            with_active_pane_mut(&mut s, f);
+            let force_clear = key == "exit" || key == "enter";
+            let changed = with_active_pane_mut(&mut s, |pane| {
+                let had_copy = pane.copy_state.is_some();
+                f(pane);
+                had_copy && pane.copy_state.is_none()
+            })
+            .unwrap_or(false);
+            if changed && force_clear {
+                s.force_clear_display = true;
+            }
             mark_data_ready();
         }
     }
@@ -851,15 +878,67 @@ fn handle_scroll_line(state: &Arc<Mutex<Server>>, rest: &str) {
         return;
     };
     if let Ok(mut s) = state.lock() {
-        with_active_pane_mut(&mut s, |pane| match direction {
-            "up" => {
-                crate::copy_mode::scroll_up(pane, lines);
+        let result = with_active_pane_mut(&mut s, |pane| match direction {
+            "up" => crate::copy_mode::scroll_up(pane, lines),
+            "down" => crate::copy_mode::scroll_down(pane, lines),
+            _ => crate::copy_mode::CopyScrollResult::Unavailable,
+        })
+        .unwrap_or(crate::copy_mode::CopyScrollResult::Unavailable);
+        if result.needs_full_clear() {
+            s.force_clear_display = true;
+        }
+        mark_data_ready();
+    }
+}
+
+fn handle_scroll_display_bottom(state: &Arc<Mutex<Server>>) {
+    if let Ok(mut s) = state.lock() {
+        let scrolled = with_active_pane_mut(&mut s, |pane| {
+            if let Ok(mut parser) = pane.parser.lock() {
+                if parser.display_offset() > 0 {
+                    parser.scrollback_bottom();
+                    return true;
+                }
             }
-            "down" => {
-                crate::copy_mode::scroll_down(pane, lines);
+            false
+        })
+        .unwrap_or(false);
+        if scrolled {
+            s.force_clear_display = true;
+            mark_data_ready();
+        }
+    }
+}
+
+fn handle_scroll_display(state: &Arc<Mutex<Server>>, delta: i32) {
+    if delta == 0 {
+        return;
+    }
+    if let Ok(mut s) = state.lock() {
+        let scrolled = with_active_pane_mut(&mut s, |pane| {
+            if let Ok(mut parser) = pane.parser.lock() {
+                if parser.scroll_display_delta(delta) {
+                    return true;
+                }
             }
-            _ => {}
-        });
+            false
+        })
+        .unwrap_or(false);
+        if scrolled {
+            s.force_clear_display = true;
+        } else {
+            let fallback = with_active_pane_mut(&mut s, |pane| {
+                if delta > 0 {
+                    crate::copy_mode::scroll_up(pane, delta as usize)
+                } else {
+                    crate::copy_mode::scroll_down(pane, (-delta) as usize)
+                }
+            })
+            .unwrap_or(crate::copy_mode::CopyScrollResult::Unavailable);
+            if fallback.needs_full_clear() {
+                s.force_clear_display = true;
+            }
+        }
         mark_data_ready();
     }
 }
@@ -931,6 +1010,7 @@ fn refresh_latest_frame(
         frame_layout_area(size),
         None,
         state.hide_borders,
+        size,
     );
     if let Ok(fd) = serde_json::from_str::<FrameData>(&json) {
         if let Ok(mut frame) = latest_frame.lock() {
@@ -945,6 +1025,7 @@ fn build_frame_json(
     area: Rect,
     yank_text: Option<&str>,
     hide_borders: bool,
+    size: Size,
 ) -> String {
     use crate::layout::serialize_frame;
     let layout_json = serialize_frame(win, area, hide_borders);
@@ -952,6 +1033,15 @@ fn build_frame_json(
         .strip_prefix("{\"type\":\"frame\",\"layout\":")
         .and_then(|s| s.strip_suffix('}'))
         .unwrap_or("{}");
+    let ansi = serialize_frame_ansi(
+        win,
+        frame_ansi_area(size),
+        hide_borders,
+        FrameAnsiOptions {
+            clear_display: true,
+        },
+    );
+    let ansi_b64 = encode_ansi_base64(&ansi);
     let session_name = &session.name;
     let active_idx = session.active_window_idx;
     let mut status = String::new();
@@ -975,13 +1065,13 @@ fn build_frame_json(
     if let Some(text) = yank_text {
         let escaped = serde_json::to_string(text).unwrap_or_default();
         format!(
-            "{{\"type\":\"frame\",\"layout\":{},\"status\":{},\"yank_text\":{}}}",
-            layout_part, status, escaped
+            "{{\"type\":\"frame\",\"layout\":{},\"status\":{},\"ansi\":\"{}\",\"yank_text\":{}}}",
+            layout_part, status, ansi_b64, escaped
         )
     } else {
         format!(
-            "{{\"type\":\"frame\",\"layout\":{},\"status\":{}}}",
-            layout_part, status
+            "{{\"type\":\"frame\",\"layout\":{},\"status\":{},\"ansi\":\"{}\"}}",
+            layout_part, status, ansi_b64
         )
     }
 }
@@ -1038,6 +1128,13 @@ fn build_session_tree_json(state: &Arc<Mutex<Server>>) -> String {
     }
     out.push(']');
     out
+}
+
+fn write_pane_input(pane: &crate::types::Pane, bytes: &[u8]) -> io::Result<()> {
+    let mut writer = pane.writer.lock().map_err(|_| {
+        io::Error::new(io::ErrorKind::Other, "pty writer poisoned")
+    })?;
+    write_pty_input(&mut **writer, bytes)
 }
 
 fn write_pty_input(writer: &mut dyn Write, bytes: &[u8]) -> io::Result<()> {
@@ -1111,6 +1208,7 @@ fn render_loop(
     socket_name: Option<String>,
 ) {
     let mut first = true;
+    let mut last_layout_fp = 0u64;
     let mut last_reap = Instant::now() - Duration::from_millis(250);
     loop {
         crate::types::events::wait_render(Duration::from_millis(16));
@@ -1146,10 +1244,14 @@ fn render_loop(
         }
 
         let frame_json = {
-            let s = match state.lock() {
+            let mut s = match state.lock() {
                 Ok(s) => s,
                 Err(_) => continue,
             };
+            let force_clear = s.force_clear_display;
+            if force_clear {
+                s.force_clear_display = false;
+            }
             let sz = size.lock().map(|s| *s).unwrap_or(Size::new(24, 80));
             let session = match s.active_session() {
                 Some(s) => s,
@@ -1187,9 +1289,21 @@ fn render_loop(
             }
             status.push_str("]}");
 
+            let ansi_area = frame_ansi_area(sz);
+            let layout_fp = layout_fingerprint(win, ansi_area, s.hide_borders);
+            let clear_display =
+                first || layout_fp != last_layout_fp || force_clear;
+            last_layout_fp = layout_fp;
+            let ansi = serialize_frame_ansi(
+                win,
+                ansi_area,
+                s.hide_borders,
+                FrameAnsiOptions { clear_display },
+            );
+            let ansi_b64 = encode_ansi_base64(&ansi);
             format!(
-                "{{\"type\":\"frame\",\"layout\":{},\"status\":{}}}",
-                layout_part, status
+                "{{\"type\":\"frame\",\"layout\":{},\"status\":{},\"ansi\":\"{}\"}}",
+                layout_part, status, ansi_b64
             )
         };
 
@@ -1363,6 +1477,7 @@ fn create_initial_session(
 }
 
 fn resize_all_panes(state: &mut Server, size: Size) {
+    state.force_clear_display = true;
     let hide_borders = state.hide_borders;
     let border_size: u16 = if hide_borders { 0 } else { BORDER_SIZE };
     for session in &mut state.sessions {
@@ -1549,6 +1664,7 @@ fn dispatch_command_output(
             with_active_pane_mut(state, |pane| {
                 crate::copy_mode::enter(pane);
             });
+            state.force_clear_display = true;
             mark_data_ready();
             String::new()
         }
@@ -2041,6 +2157,7 @@ fn cmd_resize_pane(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
 
     if changed {
         resize_all_panes(state, sz);
+        mark_data_ready();
     }
 }
 
@@ -2329,8 +2446,10 @@ fn cmd_clear_pane(state: &mut Server) {
                 parser.suppress_next_scroll_on_erase_in_display();
             }
         }
-        let _ = pane.writer.write_all(b"\x0c");
-        let _ = pane.writer.flush();
+        if let Ok(mut writer) = pane.writer.lock() {
+            let _ = writer.write_all(b"\x0c");
+            let _ = writer.flush();
+        }
     });
 }
 
@@ -2369,6 +2488,37 @@ mod tests {
                 children.iter().find_map(active_frame_size)
             }
         }
+    }
+
+    #[test]
+    fn resize_all_panes_sets_force_clear_display() -> io::Result<()> {
+        let sz = Size::new(24, 80);
+        let mut state = Server::new();
+        make_session(&mut state, "0", sz)?;
+        resize_all_panes(&mut state, sz);
+        assert!(state.force_clear_display);
+        Ok(())
+    }
+
+    #[test]
+    fn resize_pane_changes_layout_fingerprint() -> io::Result<()> {
+        let sz = Size::new(24, 80);
+        let mut state = Server::new();
+        make_session(&mut state, "0", sz)?;
+        let mut split_cmd = ParsedCommand::parse("split-window -h");
+        cmd_split_window(&mut state, &split_cmd.remove(0), sz);
+
+        let win = &state.sessions[0].windows[0];
+        let area = frame_ansi_area(sz);
+        let before = layout_fingerprint(win, area, false);
+
+        let mut resize_cmd = ParsedCommand::parse("resize-pane -L 5");
+        cmd_resize_pane(&mut state, &resize_cmd.remove(0), sz);
+
+        let win = &state.sessions[0].windows[0];
+        let after = layout_fingerprint(win, area, false);
+        assert_ne!(before, after);
+        Ok(())
     }
 
     #[test]
