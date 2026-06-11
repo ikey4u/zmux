@@ -1,0 +1,20 @@
+min_version = "2024.11.1"
+
+[tools]
+rust = { version = "stable", components = "rustfmt,clippy" }
+
+[tasks."install:nightly-rustfmt"]
+hide = true
+description = "Ensure nightly rustfmt is available for unstable rustfmt options"
+run = '''
+if cargo +nightly fmt --version >/dev/null 2>&1; then
+  exit 0
+fi
+rustup toolchain install nightly --component rustfmt --profile minimal --no-self-update \
+  || rustup component add rustfmt --toolchain nightly
+'''
+
+[tasks.format]
+description = "Format Rust code with nightly rustfmt"
+depends = ["install:nightly-rustfmt"]
+run = "cargo +nightly fmt"

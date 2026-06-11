@@ -4,6 +4,7 @@ version = "0.6.0"
 edition = "2021"
 description = "Cross-platform terminal multiplexer"
 license = "MIT"
+build = "build.rs"
 
 [[bin]]
 name = "zmux"

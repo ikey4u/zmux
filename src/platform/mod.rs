@@ -12,6 +12,8 @@ pub fn default_socket_name() -> &'static str {
     "default"
 }
 
+pub const ZMUX_VERSION: &str = env!("ZMUX_VERSION");
+
 pub fn zmux_version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+    ZMUX_VERSION
 }

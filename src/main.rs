@@ -1,12 +1,15 @@
 use std::io::{self, Write};
 
 use clap::{Parser, Subcommand};
-use zmux::{client::ClientApp, platform::setup_signals};
+use zmux::{
+    client::ClientApp,
+    platform::{setup_signals, ZMUX_VERSION},
+};
 
 #[derive(Parser)]
 #[command(
     name = "zmux",
-    version,
+    version = ZMUX_VERSION,
     about = "Cross-platform terminal multiplexer",
     after_help = "Examples:\n  Start or attach to the default zmux server:\n    zmux\n\n  Start an isolated test instance without touching your current session:\n    zmux --clean -L test-scroll\n\n  Attach to all running servers as tabs:\n    zmux a\n\n  Attach only to the selected socket:\n    zmux -L test-scroll a --single\n\n  List sessions for that isolated test instance:\n    zmux -L test-scroll ls\n\n  Start in a specific working directory:\n    zmux -c /path/to/project\n\n  Open the runtime options panel inside zmux:\n    Prefix + O"
 )]
