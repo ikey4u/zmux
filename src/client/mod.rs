@@ -1561,6 +1561,17 @@ impl ClientApp {
                         {
                             let (cols, rows) =
                                 terminal::size().unwrap_or((80, 24));
+                            let layout_area = server_layout_area(cols, rows);
+                            if let Err(err) = write_active_pane_layout_ansi(
+                                terminal.backend_mut(),
+                                fd,
+                                layout_area,
+                                hide_borders,
+                            ) {
+                                log_client(&format!(
+                                    "failed to restore active pane for selection: {err}"
+                                ));
+                            }
                             if let Err(err) = write_mouse_selection_ansi(
                                 terminal.backend_mut(),
                                 fd,
@@ -3706,7 +3717,10 @@ impl ClientApp {
                                                                 start_row:
                                                                     mouse.row,
                                                                 end_col: mouse
-                                                                    .column,
+                                                                    .column
+                                                                    .saturating_add(
+                                                                        1,
+                                                                    ),
                                                                 end_row: mouse
                                                                     .row,
                                                             },
@@ -3748,9 +3762,13 @@ impl ClientApp {
                                                                 cols, rows,
                                                             );
                                                         let pa = active_pane_content_rect(fd, fa, hide_borders);
-                                                        sel.end_col = mouse.column
+                                                        sel.end_col = mouse
+                                                            .column
+                                                            .saturating_add(1)
                                                             .max(pa.x)
-                                                            .min(pa.x + pa.width.saturating_sub(1));
+                                                            .min(
+                                                                pa.x + pa.width,
+                                                            );
                                                         sel.end_row = mouse.row
                                                             .max(pa.y)
                                                             .min(pa.y + pa.height.saturating_sub(1));
@@ -3769,11 +3787,10 @@ impl ClientApp {
                                                 {
                                                     if let Some(ref fd) = frame
                                                     {
-                                                        let is_click = sel
-                                                            .start_row
-                                                            == sel.end_row
-                                                            && sel.start_col
-                                                                == sel.end_col;
+                                                        let is_click =
+                                                            selection_is_click(
+                                                                &sel,
+                                                            );
                                                         if is_click {
                                                             if let Some(url) = detect_url_at_click(fd, sel.start_row, sel.start_col, hide_borders) {
                                                                 open_url(&url);
@@ -3854,7 +3871,9 @@ impl ClientApp {
                                                     Some(MouseSelection {
                                                         start_col: mouse.column,
                                                         start_row: mouse.row,
-                                                        end_col: mouse.column,
+                                                        end_col: mouse
+                                                            .column
+                                                            .saturating_add(1),
                                                         end_row: mouse.row,
                                                     });
                                             } else if let Some(pane_id) =
@@ -3901,12 +3920,11 @@ impl ClientApp {
                                                         fa,
                                                         hide_borders,
                                                     );
-                                                sel.end_col =
-                                                    mouse.column.max(pa.x).min(
-                                                        pa.x + pa
-                                                            .width
-                                                            .saturating_sub(1),
-                                                    );
+                                                sel.end_col = mouse
+                                                    .column
+                                                    .saturating_add(1)
+                                                    .max(pa.x)
+                                                    .min(pa.x + pa.width);
                                                 sel.end_row =
                                                     mouse.row.max(pa.y).min(
                                                         pa.y + pa
@@ -3922,10 +3940,8 @@ impl ClientApp {
                                     MouseEventKind::Up(MouseButton::Left) => {
                                         if let Some(sel) = mouse_select.take() {
                                             if let Some(ref fd) = frame {
-                                                let is_click = sel.start_row
-                                                    == sel.end_row
-                                                    && sel.start_col
-                                                        == sel.end_col;
+                                                let is_click =
+                                                    selection_is_click(&sel);
                                                 if !is_click {
                                                     let (cols, rows) =
                                                         terminal::size()
@@ -4070,8 +4086,20 @@ fn mouse_for_pane(
 struct MouseSelection {
     start_col: u16,
     start_row: u16,
+    /// Exclusive screen column (one past the last selected column).
     end_col: u16,
     end_row: u16,
+}
+
+fn selection_is_empty(sel: &MouseSelection) -> bool {
+    let (start_row, start_col, end_row, end_col) =
+        normalized_mouse_selection(sel);
+    start_row == end_row && start_col >= end_col
+}
+
+fn selection_is_click(sel: &MouseSelection) -> bool {
+    sel.start_row == sel.end_row
+        && sel.end_col <= sel.start_col.saturating_add(1)
 }
 
 struct PaneContentRow {
@@ -4089,7 +4117,7 @@ fn write_mouse_selection_ansi<W: Write>(
 ) -> io::Result<()> {
     let (start_row, start_col, end_row, end_col) =
         normalized_mouse_selection(sel);
-    if start_row == end_row && start_col == end_col {
+    if selection_is_empty(sel) {
         return Ok(());
     }
     let layout_area = server_layout_area(cols, rows);
@@ -4110,7 +4138,7 @@ fn write_mouse_selection_ansi<W: Write>(
     let ec = end_col
         .max(content_area.x)
         .min(content_area.x + content_area.width);
-    if sr == er && sc == ec {
+    if sr == er && sc >= ec {
         return Ok(());
     }
     for row in sr..=er {
@@ -4147,10 +4175,16 @@ fn write_mouse_selection_ansi<W: Write>(
 }
 
 fn normalized_mouse_selection(sel: &MouseSelection) -> (u16, u16, u16, u16) {
-    if (sel.start_row, sel.start_col) <= (sel.end_row, sel.end_col) {
+    let end_inclusive_col = sel.end_col.saturating_sub(1);
+    if (sel.start_row, sel.start_col) <= (sel.end_row, end_inclusive_col) {
         (sel.start_row, sel.start_col, sel.end_row, sel.end_col)
     } else {
-        (sel.end_row, sel.end_col, sel.start_row, sel.start_col)
+        (
+            sel.end_row,
+            end_inclusive_col,
+            sel.start_row,
+            sel.start_col.saturating_add(1),
+        )
     }
 }
 
@@ -4176,12 +4210,8 @@ fn render_mouse_selection(
     use ratatui::style::{Color, Modifier, Style};
 
     let (start_row, start_col, end_row, end_col) =
-        if (sel.start_row, sel.start_col) <= (sel.end_row, sel.end_col) {
-            (sel.start_row, sel.start_col, sel.end_row, sel.end_col)
-        } else {
-            (sel.end_row, sel.end_col, sel.start_row, sel.start_col)
-        };
-    if start_row == end_row && start_col == end_col {
+        normalized_mouse_selection(sel);
+    if selection_is_empty(sel) {
         return;
     }
 
@@ -4201,7 +4231,7 @@ fn render_mouse_selection(
     let er = clamp_row(end_row);
     let ec = clamp_col(end_col);
 
-    if sr == er && sc == ec {
+    if sr == er && sc >= ec {
         return;
     }
 
@@ -4247,12 +4277,8 @@ fn extract_text_from_frame_in_area(
     hide_borders: bool,
 ) -> String {
     let (start_row, start_col, end_row, end_col) =
-        if (sel.start_row, sel.start_col) <= (sel.end_row, sel.end_col) {
-            (sel.start_row, sel.start_col, sel.end_row, sel.end_col)
-        } else {
-            (sel.end_row, sel.end_col, sel.start_row, sel.start_col)
-        };
-    if start_row == end_row && start_col == end_col {
+        normalized_mouse_selection(sel);
+    if selection_is_empty(sel) {
         return String::new();
     }
     let (rows, content_area) =
@@ -4272,7 +4298,7 @@ fn extract_text_from_frame_in_area(
     let start_col = clamp_col(start_col);
     let end_row = clamp_row(end_row);
     let end_col = clamp_col(end_col);
-    if start_row == end_row && start_col == end_col {
+    if start_row == end_row && start_col >= end_col {
         return String::new();
     }
     let pane_start_row = (start_row - content_area.y) as usize;
@@ -5641,6 +5667,30 @@ mod tests {
 
         assert_eq!(find_pane_id_at(&layout, area, 10, 5, false), Some(1));
         assert_eq!(find_pane_id_at(&layout, area, 75, 5, false), Some(2));
+    }
+
+    #[test]
+    fn mouse_copy_supports_reverse_drag_with_exclusive_end() {
+        let fd = test_frame(vec![test_row("abcdef", None)]);
+        let sel = MouseSelection {
+            start_col: 4,
+            start_row: 0,
+            end_col: 2,
+            end_row: 0,
+        };
+        assert_eq!(extract_text_from_frame(&fd, &sel, true), "bcde");
+    }
+
+    #[test]
+    fn mouse_copy_uses_exclusive_end_column() {
+        let fd = test_frame(vec![test_row("apps", None)]);
+        let sel = MouseSelection {
+            start_col: 0,
+            start_row: 0,
+            end_col: 4,
+            end_row: 0,
+        };
+        assert_eq!(extract_text_from_frame(&fd, &sel, true), "apps");
     }
 
     #[test]

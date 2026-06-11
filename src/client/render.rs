@@ -170,6 +170,117 @@ pub fn skip_pane_area_for_ansi(
     mark_layout_area_skip(f, &fd.layout, chunks[0], hide_borders);
 }
 
+/// Repaint the active pane from layout JSON before drawing a mouse selection overlay.
+/// Server-side ANSI skips unchanged panes, so the client must restore the active pane
+/// when only the selection bounds change.
+pub fn write_active_pane_layout_ansi<W: io::Write>(
+    writer: &mut W,
+    fd: &FrameData,
+    layout_area: Rect,
+    hide_borders: bool,
+) -> io::Result<()> {
+    let Some((rows_v2, content_area)) =
+        active_pane_rows_v2(&fd.layout, layout_area, hide_borders)
+    else {
+        return Ok(());
+    };
+    let mut buf = String::new();
+    let area = crate::types::Rect::new(
+        content_area.x,
+        content_area.y,
+        content_area.width,
+        content_area.height,
+    );
+    use crate::output::{
+        vte_goto, write_erase_rect, write_style_diff, CharacterStyles,
+        DEFAULT_STYLES,
+    };
+    write_erase_rect(area, &mut buf);
+    let mut current = DEFAULT_STYLES;
+    let max_rows = content_area.height as usize;
+    let max_cols = content_area.width as usize;
+    for (row_idx, row_data) in rows_v2.iter().enumerate().take(max_rows) {
+        let y = content_area.y + row_idx as u16;
+        let mut col = 0usize;
+        for run in &row_data.runs {
+            if col >= max_cols {
+                break;
+            }
+            vte_goto(content_area.x + col as u16, y, &mut buf);
+            let style =
+                CharacterStyles::from_layout_run(&run.fg, &run.bg, run.flags);
+            write_style_diff(&mut current, style, &mut buf);
+            let available = max_cols - col;
+            let text = truncate_to_width(&run.text, available);
+            if text.is_empty() {
+                break;
+            }
+            buf.push_str(&text);
+            col += unicode_display_width(&text);
+        }
+    }
+    writer.write_all(buf.as_bytes())?;
+    writer.flush()
+}
+
+fn active_pane_rows_v2<'a>(
+    layout: &'a LayoutJson,
+    area: Rect,
+    hide_borders: bool,
+) -> Option<(&'a [RowRunsJson], Rect)> {
+    match layout {
+        LayoutJson::Leaf {
+            active: true,
+            rows_v2,
+            ..
+        } => {
+            let content_area =
+                if !hide_borders && area.width > 2 && area.height > 2 {
+                    Rect {
+                        x: area.x + 1,
+                        y: area.y + 1,
+                        width: area.width - 2,
+                        height: area.height - 2,
+                    }
+                } else {
+                    area
+                };
+            Some((rows_v2.as_slice(), content_area))
+        }
+        LayoutJson::Split {
+            direction,
+            sizes,
+            children,
+        } => {
+            let chunks = split_layout_rects(
+                area,
+                direction,
+                sizes,
+                children.len(),
+                hide_borders,
+            );
+            for (child, chunk) in children.iter().zip(chunks.iter()) {
+                if matches!(child, LayoutJson::Leaf { active: true, .. }) {
+                    if let Some(found) =
+                        active_pane_rows_v2(child, *chunk, hide_borders)
+                    {
+                        return Some(found);
+                    }
+                }
+            }
+            for (child, chunk) in children.iter().zip(chunks.into_iter()) {
+                if let Some(found) =
+                    active_pane_rows_v2(child, chunk, hide_borders)
+                {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        LayoutJson::Leaf { .. } => None,
+    }
+}
+
 fn mark_layout_area_skip(
     f: &mut Frame,
     layout: &LayoutJson,

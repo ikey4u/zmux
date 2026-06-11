@@ -76,6 +76,14 @@ impl CharacterStyles {
         }
     }
 
+    pub fn from_layout_run(fg: &str, bg: &str, flags: u8) -> Self {
+        Self::from_copy_run(
+            layout_color_str(fg, true),
+            layout_color_str(bg, false),
+            flags,
+        )
+    }
+
     pub fn with_background(mut self, bg: AnsiCode) -> Self {
         self.background = Some(bg);
         self
@@ -223,6 +231,40 @@ pub fn color_to_ansi_or_reset(color: Color) -> AnsiCode {
 
 fn flag_to_ansi(on: bool) -> Option<AnsiCode> {
     Some(if on { AnsiCode::On } else { AnsiCode::Reset })
+}
+
+fn layout_color_str(name: &str, fg: bool) -> Color {
+    use ratatui::style::Color as RtColor;
+
+    use crate::style::parse_color;
+    match parse_color(name) {
+        RtColor::Reset => {
+            if fg {
+                Color::Named(NamedColor::Foreground)
+            } else {
+                Color::Named(NamedColor::Background)
+            }
+        }
+        RtColor::Black => Color::Named(NamedColor::Black),
+        RtColor::Red => Color::Named(NamedColor::Red),
+        RtColor::Green => Color::Named(NamedColor::Green),
+        RtColor::Yellow => Color::Named(NamedColor::Yellow),
+        RtColor::Blue => Color::Named(NamedColor::Blue),
+        RtColor::Magenta => Color::Named(NamedColor::Magenta),
+        RtColor::Cyan => Color::Named(NamedColor::Cyan),
+        RtColor::White | RtColor::Gray => Color::Named(NamedColor::White),
+        RtColor::DarkGray => Color::Named(NamedColor::BrightBlack),
+        RtColor::LightRed => Color::Named(NamedColor::BrightRed),
+        RtColor::LightGreen => Color::Named(NamedColor::BrightGreen),
+        RtColor::LightYellow => Color::Named(NamedColor::BrightYellow),
+        RtColor::LightBlue => Color::Named(NamedColor::BrightBlue),
+        RtColor::LightMagenta => Color::Named(NamedColor::BrightMagenta),
+        RtColor::LightCyan => Color::Named(NamedColor::BrightCyan),
+        RtColor::Indexed(i) => Color::Indexed(i),
+        RtColor::Rgb(r, g, b) => {
+            Color::Spec(alacritty_terminal::vte::ansi::Rgb { r, g, b })
+        }
+    }
 }
 
 /// Last non-default background on the row (from the rightmost styled cell).

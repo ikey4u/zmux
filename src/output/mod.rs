@@ -5,6 +5,7 @@ mod styles;
 use std::{
     fmt::Write as FmtWrite,
     hash::{Hash, Hasher},
+    sync::atomic::Ordering,
 };
 
 use alacritty_terminal::vte::ansi::{Color, NamedColor};
@@ -84,7 +85,7 @@ fn content_area(area: Rect, has_border: bool) -> Rect {
 /// Erase one pane's content rectangle (not borders/gaps) before repainting a row.
 /// Must not use `\x1b[K` — that clears to the physical line end and wipes pane
 /// right borders and split gaps on the same row.
-fn write_erase_rect(area: Rect, out: &mut String) {
+pub fn write_erase_rect(area: Rect, out: &mut String) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -267,6 +268,10 @@ fn write_copy_row(
 }
 
 fn parse_run_color(name: &str, fg: bool) -> Color {
+    layout_color_str(name, fg)
+}
+
+fn layout_color_str(name: &str, fg: bool) -> Color {
     use ratatui::style::Color as RtColor;
 
     use crate::style::parse_color;
@@ -300,6 +305,14 @@ fn parse_run_color(name: &str, fg: bool) -> Color {
     }
 }
 
+fn pane_paint_pending(pane: &Pane, opts: &FrameAnsiOptions) -> bool {
+    opts.clear_display || pane.render_dirty.load(Ordering::Relaxed)
+}
+
+fn finish_pane_paint(pane: &Pane) {
+    pane.render_dirty.store(false, Ordering::Relaxed);
+}
+
 fn write_scrollbar(content: Rect, ratio: f32, out: &mut String) {
     let height = content.height as usize;
     if height < 3 {
@@ -327,22 +340,29 @@ fn write_pane(
     area: Rect,
     hide_borders: bool,
     out: &mut String,
+    opts: &FrameAnsiOptions,
 ) {
+    if !pane_paint_pending(pane, opts) {
+        return;
+    }
     if area.width == 0 || area.height == 0 {
         return;
     }
     let has_border = !hide_borders && area.width > 2 && area.height > 2;
     let inner = content_area(area, has_border);
     write_erase_rect(inner, out);
-    let Ok(parser) = pane.parser.lock() else {
-        if has_border {
-            write_border(area, is_active, out);
-        }
-        return;
-    };
-    let (pane_fg, pane_bg) =
-        pane_default_codes(parser.pane_default_fg(), parser.pane_default_bg());
     if pane.copy_state.is_some() {
+        let pane_defaults = pane
+            .parser
+            .lock()
+            .ok()
+            .map(|parser| {
+                pane_default_codes(
+                    parser.pane_default_fg(),
+                    parser.pane_default_bg(),
+                )
+            })
+            .unwrap_or((None, None));
         if let Some(copy_view) = crate::copy_mode::render_view(pane) {
             for (row_idx, row) in copy_view.rows.iter().enumerate() {
                 if row_idx >= inner.height as usize {
@@ -353,8 +373,8 @@ fn write_pane(
                     inner.width,
                     inner.x,
                     inner.y + row_idx as u16,
-                    pane_fg,
-                    pane_bg,
+                    pane_defaults.0,
+                    pane_defaults.1,
                     out,
                 );
             }
@@ -364,14 +384,31 @@ fn write_pane(
             if has_border {
                 write_border(area, is_active, out);
             }
+            finish_pane_paint(pane);
             return;
         }
         if has_border {
             write_border(area, is_active, out);
         }
+        finish_pane_paint(pane);
         return;
     }
-    let rows = parser.visible_rows();
+    let snapshot = match pane.parser.lock() {
+        Ok(parser) => Some((
+            pane_default_codes(
+                parser.pane_default_fg(),
+                parser.pane_default_bg(),
+            ),
+            parser.visible_rows(),
+        )),
+        Err(_) => None,
+    };
+    let Some(((pane_fg, pane_bg), rows)) = snapshot else {
+        if has_border {
+            write_border(area, is_active, out);
+        }
+        return;
+    };
     for row_idx in 0..inner.height as usize {
         let cells = rows.get(row_idx).cloned().unwrap_or_default();
         write_terminal_row(
@@ -387,6 +424,7 @@ fn write_pane(
     if has_border {
         write_border(area, is_active, out);
     }
+    finish_pane_paint(pane);
 }
 
 fn fill_gap(gap: Rect, out: &mut String) {
@@ -471,6 +509,7 @@ fn write_node(
     area: Rect,
     hide_borders: bool,
     out: &mut String,
+    opts: &FrameAnsiOptions,
 ) {
     match node {
         LayoutNode::Split {
@@ -499,6 +538,7 @@ fn write_node(
                     chunks[i],
                     hide_borders,
                     out,
+                    opts,
                 );
             }
             if !hide_borders {
@@ -506,7 +546,7 @@ fn write_node(
             }
         }
         LayoutNode::Leaf(pane) => {
-            write_pane(pane, true, area, hide_borders, out);
+            write_pane(pane, true, area, hide_borders, out, opts);
         }
     }
 }
@@ -518,6 +558,7 @@ fn write_child_node(
     area: Rect,
     hide_borders: bool,
     out: &mut String,
+    opts: &FrameAnsiOptions,
 ) {
     match node {
         LayoutNode::Split {
@@ -547,6 +588,7 @@ fn write_child_node(
                     chunks[i],
                     hide_borders,
                     out,
+                    opts,
                 );
             }
             if !hide_borders {
@@ -555,7 +597,7 @@ fn write_child_node(
         }
         LayoutNode::Leaf(pane) => {
             let is_active = is_active_branch && relative_path.is_empty();
-            write_pane(pane, is_active, area, hide_borders, out);
+            write_pane(pane, is_active, area, hide_borders, out, opts);
         }
     }
 }
@@ -642,7 +684,7 @@ pub fn serialize_frame_ansi(
         if let Some(pane) =
             crate::layout::find_pane_by_id(&win.root, zoom.zoomed_pane_id)
         {
-            write_pane(pane, true, area, hide_borders, &mut out);
+            write_pane(pane, true, area, hide_borders, &mut out, &opts);
             return out;
         }
     }
@@ -652,6 +694,7 @@ pub fn serialize_frame_ansi(
         area,
         hide_borders,
         &mut out,
+        &opts,
     );
     out
 }
@@ -670,6 +713,11 @@ pub fn encode_ansi_base64(ansi: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
     use alacritty_terminal::{
         term::cell::Flags,
         vte::ansi::{Color, NamedColor},
@@ -843,5 +891,25 @@ mod tests {
         let gap_pos = out.find("+ ").expect("gap space");
         assert!(gap_pos > green_start);
         assert!(x_pos > gap_pos);
+    }
+
+    #[test]
+    fn clear_display_paints_even_when_render_dirty_is_false() {
+        let dirty = Arc::new(AtomicBool::new(false));
+        let opts = FrameAnsiOptions {
+            clear_display: true,
+        };
+        assert!(opts.clear_display || dirty.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn render_dirty_gates_incremental_repaint() {
+        let dirty = Arc::new(AtomicBool::new(false));
+        let opts = FrameAnsiOptions::default();
+        assert!(!opts.clear_display && !dirty.load(Ordering::Relaxed));
+        dirty.store(true, Ordering::Relaxed);
+        assert!(opts.clear_display || dirty.load(Ordering::Relaxed));
+        dirty.store(false, Ordering::Relaxed);
+        assert!(!opts.clear_display && !dirty.load(Ordering::Relaxed));
     }
 }

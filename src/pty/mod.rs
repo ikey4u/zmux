@@ -114,6 +114,7 @@ pub fn spawn_pane(opts: SpawnOptions<'_>) -> io::Result<Pane> {
     let output_ring: Arc<Mutex<VecDeque<u8>>> =
         Arc::new(Mutex::new(VecDeque::new()));
     let dead: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    let render_dirty: Arc<AtomicBool> = Arc::new(AtomicBool::new(true));
     let reported_cwd: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     start_reader_thread(
@@ -127,6 +128,7 @@ pub fn spawn_pane(opts: SpawnOptions<'_>) -> io::Result<Pane> {
         Arc::clone(&bell_pending),
         Arc::clone(&output_ring),
         Arc::clone(&dead),
+        Arc::clone(&render_dirty),
         Arc::clone(&reported_cwd),
         Arc::clone(&writer),
     );
@@ -151,6 +153,7 @@ pub fn spawn_pane(opts: SpawnOptions<'_>) -> io::Result<Pane> {
         output_ring,
         reported_cwd,
         start_dir: opts.start_dir.map(|s| s.to_string()),
+        render_dirty,
     })
 }
 
@@ -382,6 +385,7 @@ fn start_reader_thread(
     bell_pending: Arc<AtomicBool>,
     output_ring: Arc<Mutex<VecDeque<u8>>>,
     dead_flag: Arc<AtomicBool>,
+    render_dirty: Arc<AtomicBool>,
     reported_cwd: Arc<Mutex<Option<String>>>,
     pty_writer: PtyWriter,
 ) {
@@ -401,6 +405,7 @@ fn start_reader_thread(
                 Ok(0) | Err(_) => {
                     dead_flag.store(true, Ordering::Relaxed);
                     data_version.fetch_add(1, Ordering::Relaxed);
+                    render_dirty.store(true, Ordering::Relaxed);
                     crate::types::events::mark_data_ready();
                     break;
                 }
@@ -428,6 +433,7 @@ fn start_reader_thread(
                     color_tracker.process(data, &parser);
                     query_tracker.process(data, &parser, &pty_writer);
                     data_version.fetch_add(1, Ordering::Relaxed);
+                    render_dirty.store(true, Ordering::Relaxed);
                     let now = Instant::now();
                     if now.duration_since(burst_window_start)
                         > Duration::from_millis(50)
@@ -453,11 +459,17 @@ fn start_reader_thread(
     });
 }
 
+static RENDER_DEBOUNCE_ARMED: AtomicBool = AtomicBool::new(false);
+
 fn schedule_debounced_render(seq: &Arc<AtomicU64>) {
     let generation = seq.fetch_add(1, Ordering::Relaxed) + 1;
+    if RENDER_DEBOUNCE_ARMED.swap(true, Ordering::AcqRel) {
+        return;
+    }
     let seq = Arc::clone(seq);
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(120));
+        RENDER_DEBOUNCE_ARMED.store(false, Ordering::Relaxed);
         if seq.load(Ordering::Relaxed) == generation {
             crate::types::events::mark_data_ready();
         }

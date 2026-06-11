@@ -659,8 +659,6 @@ where
                 ) {
                     if let Err(e) = write_pane_input(pane, &bytes) {
                         log_server(&format!("input write failed: {}", e));
-                    } else {
-                        mark_data_ready();
                     }
                 }
             }
@@ -836,6 +834,7 @@ fn handle_copy_key_line(state: &Arc<Mutex<Server>>, key: &str) {
             let changed = with_active_pane_mut(&mut s, |pane| {
                 let had_copy = pane.copy_state.is_some();
                 f(pane);
+                pane.mark_render_dirty();
                 had_copy && pane.copy_state.is_none()
             })
             .unwrap_or(false);
@@ -855,7 +854,8 @@ fn handle_copy_key_line(state: &Arc<Mutex<Server>>, key: &str) {
         if let Some(m) = mode {
             if let Ok(mut s) = state.lock() {
                 with_active_pane_mut(&mut s, |pane| {
-                    crate::copy_mode::start_selection(pane, m)
+                    crate::copy_mode::start_selection(pane, m);
+                    pane.mark_render_dirty();
                 });
                 mark_data_ready();
             }
@@ -863,7 +863,10 @@ fn handle_copy_key_line(state: &Arc<Mutex<Server>>, key: &str) {
     }
     if key == "clear_sel" {
         if let Ok(mut s) = state.lock() {
-            with_active_pane_mut(&mut s, crate::copy_mode::clear_selection);
+            with_active_pane_mut(&mut s, |pane| {
+                crate::copy_mode::clear_selection(pane);
+                pane.mark_render_dirty();
+            });
             mark_data_ready();
         }
     }
@@ -878,10 +881,19 @@ fn handle_scroll_line(state: &Arc<Mutex<Server>>, rest: &str) {
         return;
     };
     if let Ok(mut s) = state.lock() {
-        let result = with_active_pane_mut(&mut s, |pane| match direction {
-            "up" => crate::copy_mode::scroll_up(pane, lines),
-            "down" => crate::copy_mode::scroll_down(pane, lines),
-            _ => crate::copy_mode::CopyScrollResult::Unavailable,
+        let result = with_active_pane_mut(&mut s, |pane| {
+            let result = match direction {
+                "up" => crate::copy_mode::scroll_up(pane, lines),
+                "down" => crate::copy_mode::scroll_down(pane, lines),
+                _ => crate::copy_mode::CopyScrollResult::Unavailable,
+            };
+            if !matches!(
+                result,
+                crate::copy_mode::CopyScrollResult::Unavailable
+            ) {
+                pane.mark_render_dirty();
+            }
+            result
         })
         .unwrap_or(crate::copy_mode::CopyScrollResult::Unavailable);
         if result.needs_full_clear() {
@@ -897,6 +909,7 @@ fn handle_scroll_display_bottom(state: &Arc<Mutex<Server>>) {
             if let Ok(mut parser) = pane.parser.lock() {
                 if parser.display_offset() > 0 {
                     parser.scrollback_bottom();
+                    pane.mark_render_dirty();
                     return true;
                 }
             }
@@ -918,6 +931,7 @@ fn handle_scroll_display(state: &Arc<Mutex<Server>>, delta: i32) {
         let scrolled = with_active_pane_mut(&mut s, |pane| {
             if let Ok(mut parser) = pane.parser.lock() {
                 if parser.scroll_display_delta(delta) {
+                    pane.mark_render_dirty();
                     return true;
                 }
             }
@@ -928,11 +942,18 @@ fn handle_scroll_display(state: &Arc<Mutex<Server>>, delta: i32) {
             s.force_clear_display = true;
         } else {
             let fallback = with_active_pane_mut(&mut s, |pane| {
-                if delta > 0 {
+                let result = if delta > 0 {
                     crate::copy_mode::scroll_up(pane, delta as usize)
                 } else {
                     crate::copy_mode::scroll_down(pane, (-delta) as usize)
+                };
+                if !matches!(
+                    result,
+                    crate::copy_mode::CopyScrollResult::Unavailable
+                ) {
+                    pane.mark_render_dirty();
                 }
+                result
             })
             .unwrap_or(crate::copy_mode::CopyScrollResult::Unavailable);
             if fallback.needs_full_clear() {
@@ -953,7 +974,8 @@ fn handle_copy_search_line(state: &Arc<Mutex<Server>>, rest: &str) {
     };
     if let Ok(mut s) = state.lock() {
         with_active_pane_mut(&mut s, |pane| {
-            crate::copy_mode::search(pane, query.clone(), forward)
+            crate::copy_mode::search(pane, query.clone(), forward);
+            pane.mark_render_dirty();
         });
         mark_data_ready();
     }
@@ -967,6 +989,7 @@ fn handle_copy_nav(state: &Arc<Mutex<Server>>, dir: &str) {
     if let Ok(mut s) = state.lock() {
         with_active_pane_mut(&mut s, |pane| {
             f(pane);
+            pane.mark_render_dirty();
         });
         mark_data_ready();
     }

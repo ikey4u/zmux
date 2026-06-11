@@ -54,6 +54,15 @@ pub struct Pane {
     pub output_ring: Arc<Mutex<VecDeque<u8>>>,
     pub reported_cwd: Arc<Mutex<Option<String>>>,
     pub start_dir: Option<String>,
+    /// Set when PTY output arrives; cleared when server ANSI repaints this pane.
+    pub render_dirty: Arc<AtomicBool>,
+}
+
+impl Pane {
+    pub fn mark_render_dirty(&self) {
+        self.render_dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 pub struct Window {
