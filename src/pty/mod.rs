@@ -304,8 +304,28 @@ fn is_windows_powershell_shell(shell: &str) -> bool {
 }
 
 #[cfg(windows)]
+const WINDOWS_POWERSHELL_EMACS_SCRIPT: &str = concat!(
+    "function global:__zmux_emit_cwd { try { $p = (Get-Location).Path -replace '\\\\','/'; ",
+    "$e = [char]27; [Console]::Write([string]::Concat($e, ']7;file:///', $p, $e, '\\')) } catch {} }; ",
+    "function global:__zmux_wrap_prompt { if (Test-Path Function:\\__zmux_prompt_wrapped) { return }; ",
+    "$global:__zmux_user_prompt = Get-Command prompt; ",
+    "function global:prompt { __zmux_emit_cwd; if ($null -ne $global:__zmux_user_prompt) { return (& $global:__zmux_user_prompt) }; ",
+    "return ('PS ' + $executionContext.SessionState.Path.CurrentLocation + '> ') }; ",
+    "function global:__zmux_prompt_wrapped { } }; ",
+    "__zmux_wrap_prompt; __zmux_emit_cwd; ",
+    "try { Import-Module PSReadLine -ErrorAction Stop; Set-PSReadLineOption -EditMode Emacs -ErrorAction Stop; ",
+    "function global:__zmux_bind($c,$f) { try { Set-PSReadLineKeyHandler -Chord $c -Function $f -ErrorAction Stop } catch {} }; ",
+    "__zmux_bind 'Ctrl+a' BeginningOfLine; __zmux_bind 'Ctrl+b' BackwardChar; __zmux_bind 'Ctrl+d' DeleteCharOrExit; ",
+    "__zmux_bind 'Ctrl+e' EndOfLine; __zmux_bind 'Ctrl+f' ForwardChar; __zmux_bind 'Ctrl+k' KillLine; ",
+    "__zmux_bind 'Ctrl+l' ClearScreen; __zmux_bind 'Ctrl+n' NextHistory; __zmux_bind 'Ctrl+p' PreviousHistory; ",
+    "__zmux_bind 'Ctrl+r' ReverseSearchHistory; __zmux_bind 'Ctrl+s' ForwardSearchHistory; ",
+    "__zmux_bind 'Ctrl+t' SwapCharacters; __zmux_bind 'Ctrl+u' BackwardKillInput; ",
+    "Remove-Item Function:\\__zmux_bind -ErrorAction SilentlyContinue } catch {}",
+);
+
+#[cfg(windows)]
 fn windows_powershell_emacs_script() -> &'static str {
-    r"function global:__zmux_emit_cwd { try { $p = (Get-Location).Path -replace '\\','/'; $e = [char]27; [Console]::Write([string]::Concat($e, ']7;file:///', $p, $e, '\')) } catch {} }; function global:prompt { __zmux_emit_cwd; 'PS ' + $executionContext.SessionState.Path.CurrentLocation + '> ' }; __zmux_emit_cwd; try { Import-Module PSReadLine -ErrorAction Stop; Set-PSReadLineOption -EditMode Emacs -ErrorAction Stop; function global:__zmux_bind($c,$f) { try { Set-PSReadLineKeyHandler -Chord $c -Function $f -ErrorAction Stop } catch {} }; __zmux_bind 'Ctrl+a' BeginningOfLine; __zmux_bind 'Ctrl+b' BackwardChar; __zmux_bind 'Ctrl+d' DeleteCharOrExit; __zmux_bind 'Ctrl+e' EndOfLine; __zmux_bind 'Ctrl+f' ForwardChar; __zmux_bind 'Ctrl+k' KillLine; __zmux_bind 'Ctrl+l' ClearScreen; __zmux_bind 'Ctrl+n' NextHistory; __zmux_bind 'Ctrl+p' PreviousHistory; __zmux_bind 'Ctrl+r' ReverseSearchHistory; __zmux_bind 'Ctrl+s' ForwardSearchHistory; __zmux_bind 'Ctrl+t' SwapCharacters; __zmux_bind 'Ctrl+u' BackwardKillInput; Remove-Item Function:\__zmux_bind -ErrorAction SilentlyContinue } catch {}"
+    WINDOWS_POWERSHELL_EMACS_SCRIPT
 }
 
 #[cfg(windows)]
@@ -646,6 +666,23 @@ mod tests {
         tracker.process(b"\x1b[?1049", &cursor_shape);
         tracker.process(b"l", &cursor_shape);
         assert_eq!(cursor_shape.load(Ordering::Relaxed), 5);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_powershell_script_wraps_existing_prompt() {
+        let script = windows_powershell_emacs_script();
+        assert!(script.contains("__zmux_wrap_prompt"));
+        assert!(script.contains("__zmux_user_prompt"));
+        assert!(script.contains("__zmux_emit_cwd"));
+        assert!(
+            script.contains("$global:__zmux_user_prompt = Get-Command prompt")
+        );
+        assert!(script.contains("return (& $global:__zmux_user_prompt)"));
+        assert!(script.contains(
+            "return ('PS ' + $executionContext.SessionState.Path.CurrentLocation + '> ')"
+        ));
+        assert!(!script.contains(".ScriptBlock"));
     }
 
     #[cfg(unix)]
