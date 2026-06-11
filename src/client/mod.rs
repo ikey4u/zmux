@@ -1628,6 +1628,7 @@ impl ClientApp {
                                         if frame
                                             .as_ref()
                                             .is_some_and(active_in_copy_mode)
+                                            && copy_mode_exit_pending
                                         {
                                             leave_copy_mode_client(
                                                 tabs.active_client(),
@@ -3662,18 +3663,16 @@ impl ClientApp {
                                         match mouse.kind {
                                             MouseEventKind::ScrollUp => {
                                                 tabs.active_client()
-                                                    .scroll_display(
-                                                        SCROLL_LINES as i32,
-                                                    );
-                                                display_scrolled = true;
+                                                    .scroll_up(SCROLL_LINES);
+                                                mode = InputMode::CopyMode;
+                                                copy_mode_confirmed = false;
+                                                copy_mode_exit_pending = false;
+                                                display_scrolled = false;
                                                 last_drawn_counter = 0;
                                             }
                                             MouseEventKind::ScrollDown => {
                                                 tabs.active_client()
-                                                    .scroll_display(
-                                                        -(SCROLL_LINES as i32),
-                                                    );
-                                                display_scrolled = true;
+                                                    .scroll_down(SCROLL_LINES);
                                                 last_drawn_counter = 0;
                                             }
                                             MouseEventKind::Down(

@@ -462,6 +462,7 @@ pub fn scroll_up(pane: &mut Pane, lines: usize) -> CopyScrollResult {
     };
     rebuild_wrapped(state, width, height);
     state.scroll_top = state.scroll_top.saturating_sub(lines);
+    sync_cursor_to_visible_viewport(state, height);
     if entering {
         CopyScrollResult::Entered
     } else {
@@ -485,6 +486,7 @@ pub fn scroll_down(pane: &mut Pane, lines: usize) -> CopyScrollResult {
         exit(pane);
         return CopyScrollResult::Exited;
     }
+    sync_cursor_to_visible_viewport(state, height);
     CopyScrollResult::Scrolled
 }
 
@@ -728,8 +730,12 @@ fn refresh_snapshot(
     width: usize,
     height: usize,
 ) {
+    rebuild_wrapped(state, width, height);
+    let max_scroll_top = state.wrapped.rows.len().saturating_sub(height.max(1));
+    let viewport_at_bottom = state.scroll_top >= max_scroll_top;
     let follow_bottom = state.anchor.is_none()
-        && state.cursor == last_cursor_point(&state.snapshot);
+        && state.cursor == last_cursor_point(&state.snapshot)
+        && viewport_at_bottom;
     let preserved_cursor = state.cursor;
     let preserved_anchor = state.anchor;
     let preserved_scroll_top = state.scroll_top;
@@ -759,12 +765,23 @@ fn refresh_snapshot(
         };
     }
     rebuild_wrapped(state, width, height);
+    let max_scroll_top = state.wrapped.rows.len().saturating_sub(height.max(1));
     if follow_bottom {
-        state.scroll_top =
-            state.wrapped.rows.len().saturating_sub(height.max(1));
+        state.scroll_top = max_scroll_top;
+        state.preferred_column = current_display_position(state).1;
+        ensure_cursor_visible(state, height);
+    } else {
+        state.scroll_top = preserved_scroll_top.min(max_scroll_top);
+        let (row, _) = current_display_position(state);
+        let cursor_outside_viewport =
+            row < state.scroll_top || row >= state.scroll_top + height.max(1);
+        if state.anchor.is_none() && cursor_outside_viewport {
+            sync_cursor_to_visible_viewport(state, height);
+        } else {
+            state.preferred_column = current_display_position(state).1;
+            ensure_cursor_visible(state, height);
+        }
     }
-    state.preferred_column = current_display_position(state).1;
-    ensure_cursor_visible(state, height);
 }
 
 fn rebuild_wrapped(state: &mut CopyModeState, width: usize, height: usize) {
@@ -870,6 +887,20 @@ fn ensure_cursor_visible(state: &mut CopyModeState, height: usize) {
     } else if row >= state.scroll_top + height.max(1) {
         state.scroll_top = row + 1 - height.max(1);
     }
+}
+
+/// Keep the cursor inside the scrolled viewport after wheel scrolling.
+fn sync_cursor_to_visible_viewport(state: &mut CopyModeState, height: usize) {
+    let height = height.max(1);
+    let max_row = state.wrapped.rows.len().saturating_sub(1);
+    let visible_bottom_row =
+        (state.scroll_top + height.saturating_sub(1)).min(max_row);
+    state.cursor = point_from_display_position(
+        state,
+        visible_bottom_row,
+        state.preferred_column,
+    );
+    state.preferred_column = current_display_position(state).1;
 }
 
 fn current_display_position(state: &CopyModeState) -> (usize, usize) {
@@ -1720,5 +1751,44 @@ mod tests {
         );
         assert_eq!(state.cursor, CopyPoint { line: 1, col: 0 });
         assert_eq!(state.scroll_top, 1);
+    }
+
+    #[test]
+    fn refresh_snapshot_preserves_scroll_when_view_not_at_bottom() {
+        let mut state = CopyModeState::new(snapshot(&[
+            "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+        ]));
+        rebuild_wrapped(&mut state, 10, 3);
+        state.scroll_top = 2;
+        refresh_snapshot(
+            &mut state,
+            snapshot(&["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]),
+            10,
+            3,
+        );
+        assert_eq!(state.scroll_top, 2);
+    }
+
+    #[test]
+    fn scroll_up_cursor_stays_in_viewport_for_vim_moves() {
+        let mut state = CopyModeState::new(snapshot(&[
+            "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11",
+        ]));
+        rebuild_wrapped(&mut state, 10, 4);
+        state.scroll_top = state.wrapped.rows.len().saturating_sub(4);
+        state.scroll_top = state.scroll_top.saturating_sub(3);
+        sync_cursor_to_visible_viewport(&mut state, 4);
+
+        let scroll_top = state.scroll_top;
+        if state.cursor.col > 0 {
+            state.cursor.col -= 1;
+        }
+        rebuild_wrapped(&mut state, 10, 4);
+        ensure_cursor_visible(&mut state, 4);
+
+        assert_eq!(state.scroll_top, scroll_top);
+        let (row, _) = current_display_position(&state);
+        assert!(row >= state.scroll_top);
+        assert!(row < state.scroll_top + 4);
     }
 }
