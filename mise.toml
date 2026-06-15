@@ -18,3 +18,11 @@ rustup toolchain install nightly --component rustfmt --profile minimal --no-self
 description = "Format Rust code with nightly rustfmt"
 depends = ["install:nightly-rustfmt"]
 run = "cargo +nightly fmt"
+
+[tasks.test]
+description = "Run the Rust test suite"
+run = "cargo test"
+
+[tasks."test:copy"]
+description = "Run mouse-copy integration tests (server frame → client extract)"
+run = "cargo test frame_copy_pipeline -- --nocapture"
