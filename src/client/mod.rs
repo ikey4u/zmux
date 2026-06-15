@@ -105,6 +105,15 @@ enum InputMode {
 
 const RESIZE_IDLE_TIMEOUT: Duration = Duration::from_millis(500);
 const SCROLL_LINES: usize = 3;
+const SINGLE_CLICK_DELAY: Duration = Duration::from_millis(400);
+
+struct PendingSingleClick {
+    row: u16,
+    col: u16,
+    deadline: Instant,
+    /// When true (Ctrl held), open a URL at the click instead of copying.
+    open_url: bool,
+}
 
 struct ClientTab {
     code: String,
@@ -1261,6 +1270,7 @@ impl ClientApp {
         let backend = TerminalBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
         let mut mouse_select: Option<MouseSelection> = None;
+        let mut pending_single_click: Option<PendingSingleClick> = None;
 
         let prefix_key = (KeyCode::Char('a'), KeyModifiers::CONTROL);
         let mut mode = InputMode::Normal;
@@ -1280,6 +1290,19 @@ impl ClientApp {
             loop {
                 let frame = tabs.active_client().latest_frame();
                 let current_counter = tabs.active_client().frame_counter();
+                if let (Some(pending), Some(ref fd)) =
+                    (pending_single_click.as_ref(), frame.as_ref())
+                {
+                    if Instant::now() >= pending.deadline {
+                        flush_pending_single_click(
+                            &mut pending_single_click,
+                            fd,
+                            hide_borders,
+                            &mut status_notice,
+                            &mut last_drawn_counter,
+                        );
+                    }
+                }
                 if matches!(
                     copy_mode_sync_suppress_frame,
                     Some(counter) if counter != current_counter
@@ -3496,6 +3519,7 @@ impl ClientApp {
                                 && !matches!(mode, InputMode::TabChooser { .. })
                             {
                                 mouse_select = None;
+                                pending_single_click = None;
                                 if matches!(
                                     mouse.kind,
                                     MouseEventKind::Down(MouseButton::Left)
@@ -3711,19 +3735,15 @@ impl ClientApp {
                                                             < pa.y + pa.height
                                                     {
                                                         mouse_select = Some(
-                                                            MouseSelection {
-                                                                start_col:
-                                                                    mouse.column,
-                                                                start_row:
-                                                                    mouse.row,
-                                                                end_col: mouse
-                                                                    .column
-                                                                    .saturating_add(
-                                                                        1,
-                                                                    ),
-                                                                end_row: mouse
-                                                                    .row,
-                                                            },
+                                                            begin_mouse_down_selection(
+                                                                &mut pending_single_click,
+                                                                fd,
+                                                                mouse.row,
+                                                                mouse.column,
+                                                                hide_borders,
+                                                                &mut status_notice,
+                                                                &mut last_drawn_counter,
+                                                            ),
                                                         );
                                                     } else if let Some(
                                                         pane_id,
@@ -3792,43 +3812,24 @@ impl ClientApp {
                                                                 &sel,
                                                             );
                                                         if is_click {
-                                                            if let Some(url) = detect_url_at_click(fd, sel.start_row, sel.start_col, hide_borders) {
-                                                                open_url(&url);
-                                                                status_notice = Some((
-                                                                    format!("opening {}", truncate_status_url(&url)),
-                                                                    Instant::now() + Duration::from_secs(3),
-                                                                ));
-                                                            }
+                                                            schedule_single_click(
+                                                                &mut pending_single_click,
+                                                                sel.start_row,
+                                                                sel.start_col,
+                                                                mouse.modifiers
+                                                                    .contains(
+                                                                        KeyModifiers::CONTROL,
+                                                                    ),
+                                                            );
                                                         } else {
-                                                            let (cols, rows) =
-                                                                terminal::size(
-                                                                )
-                                                                .unwrap_or((
-                                                                    80, 24,
-                                                                ));
-                                                            let text = extract_text_from_frame_in_area(fd, &sel, server_layout_area(cols, rows), hide_borders);
-                                                            if !text.is_empty()
-                                                            {
-                                                                let result = copy_to_clipboard(&text);
-                                                                status_notice = Some((
-                                                                    match result {
-                                                                        ClipboardCopyResult::System => format!(
-                                                                            "copied {} chars",
-                                                                            text.chars().count()
-                                                                        ),
-                                                                        ClipboardCopyResult::Osc52 => format!(
-                                                                            "copied {} chars via OSC 52",
-                                                                            text.chars().count()
-                                                                        ),
-                                                                        ClipboardCopyResult::Unavailable => format!(
-                                                                            "yanked {} chars (clipboard unavailable)",
-                                                                            text.chars().count()
-                                                                        ),
-                                                                    },
-                                                                    Instant::now() + Duration::from_secs(3),
-                                                                ));
-                                                                last_drawn_counter = 0;
-                                                            }
+                                                            pending_single_click = None;
+                                                            copy_drag_selection(
+                                                                fd,
+                                                                &sel,
+                                                                hide_borders,
+                                                                &mut status_notice,
+                                                                &mut last_drawn_counter,
+                                                            );
                                                         }
                                                     }
                                                 }
@@ -3867,15 +3868,17 @@ impl ClientApp {
                                                 && mouse.row >= pa.y
                                                 && mouse.row < pa.y + pa.height
                                             {
-                                                mouse_select =
-                                                    Some(MouseSelection {
-                                                        start_col: mouse.column,
-                                                        start_row: mouse.row,
-                                                        end_col: mouse
-                                                            .column
-                                                            .saturating_add(1),
-                                                        end_row: mouse.row,
-                                                    });
+                                                mouse_select = Some(
+                                                    begin_mouse_down_selection(
+                                                        &mut pending_single_click,
+                                                        fd,
+                                                        mouse.row,
+                                                        mouse.column,
+                                                        hide_borders,
+                                                        &mut status_notice,
+                                                        &mut last_drawn_counter,
+                                                    ),
+                                                );
                                             } else if let Some(pane_id) =
                                                 find_pane_id_at(
                                                     &fd.layout,
@@ -3942,44 +3945,25 @@ impl ClientApp {
                                             if let Some(ref fd) = frame {
                                                 let is_click =
                                                     selection_is_click(&sel);
-                                                if !is_click {
-                                                    let (cols, rows) =
-                                                        terminal::size()
-                                                            .unwrap_or((
-                                                                80, 24,
-                                                            ));
-                                                    let text =
-                                                        extract_text_from_frame_in_area(
-                                                            fd,
-                                                            &sel,
-                                                            server_layout_area(cols, rows),
-                                                            hide_borders,
-                                                        );
-                                                    if !text.is_empty() {
-                                                        let result =
-                                                            copy_to_clipboard(
-                                                                &text,
-                                                            );
-                                                        status_notice = Some((
-                                                            match result {
-                                                                ClipboardCopyResult::System => format!(
-                                                                    "copied {} chars",
-                                                                    text.chars().count()
-                                                                ),
-                                                                ClipboardCopyResult::Osc52 => format!(
-                                                                    "copied {} chars via OSC 52",
-                                                                    text.chars().count()
-                                                                ),
-                                                                ClipboardCopyResult::Unavailable => format!(
-                                                                    "yanked {} chars (clipboard unavailable)",
-                                                                    text.chars().count()
-                                                                ),
-                                                            },
-                                                            Instant::now()
-                                                                + Duration::from_secs(3),
-                                                        ));
-                                                        last_drawn_counter = 0;
-                                                    }
+                                                if is_click {
+                                                    schedule_single_click(
+                                                        &mut pending_single_click,
+                                                        sel.start_row,
+                                                        sel.start_col,
+                                                        mouse.modifiers
+                                                            .contains(
+                                                                KeyModifiers::CONTROL,
+                                                            ),
+                                                    );
+                                                } else {
+                                                    pending_single_click = None;
+                                                    copy_drag_selection(
+                                                        fd,
+                                                        &sel,
+                                                        hide_borders,
+                                                        &mut status_notice,
+                                                        &mut last_drawn_counter,
+                                                    );
                                                 }
                                             }
                                         }
@@ -4100,6 +4084,263 @@ fn selection_is_empty(sel: &MouseSelection) -> bool {
 fn selection_is_click(sel: &MouseSelection) -> bool {
     sel.start_row == sel.end_row
         && sel.end_col <= sel.start_col.saturating_add(1)
+}
+
+/// Display-column range `[start, end)` for the token bounded by whitespace.
+fn word_display_range_in_line(
+    line: &str,
+    pane_col: usize,
+) -> Option<(usize, usize)> {
+    use unicode_width::UnicodeWidthChar;
+
+    let spans: Vec<(usize, usize, char)> = line
+        .chars()
+        .scan(0usize, |col, ch| {
+            let width = ch.width().unwrap_or(1);
+            let start = *col;
+            *col += width;
+            Some((start, *col, ch))
+        })
+        .collect();
+    let idx = spans
+        .iter()
+        .position(|(start, end, _)| pane_col >= *start && pane_col < *end)?;
+    let is_space = |ch: char| ch.is_whitespace();
+
+    let mut start_idx = idx;
+    let mut end_idx = idx;
+    if is_space(spans[idx].2) {
+        while start_idx > 0 && is_space(spans[start_idx - 1].2) {
+            start_idx -= 1;
+        }
+        while end_idx + 1 < spans.len() && is_space(spans[end_idx + 1].2) {
+            end_idx += 1;
+        }
+    } else {
+        while start_idx > 0 && !is_space(spans[start_idx - 1].2) {
+            start_idx -= 1;
+        }
+        while end_idx + 1 < spans.len() && !is_space(spans[end_idx + 1].2) {
+            end_idx += 1;
+        }
+    }
+    Some((spans[start_idx].0, spans[end_idx].1))
+}
+
+fn pane_coords_at_screen(
+    fd: &FrameData,
+    screen_row: u16,
+    screen_col: u16,
+    hide_borders: bool,
+) -> Option<(Vec<PaneContentRow>, ratatui::layout::Rect, usize, usize)> {
+    let (cols, rows) = terminal::size().unwrap_or((80, 24));
+    let layout_area = server_layout_area(cols, rows);
+    let (row_texts, content_area) =
+        find_active_pane_content(&fd.layout, layout_area, hide_borders);
+    if screen_row < content_area.y
+        || screen_row >= content_area.y + content_area.height
+        || screen_col < content_area.x
+        || screen_col >= content_area.x + content_area.width
+    {
+        return None;
+    }
+    let pane_row = (screen_row - content_area.y) as usize;
+    let pane_col = (screen_col - content_area.x) as usize;
+    Some((row_texts, content_area, pane_row, pane_col))
+}
+
+fn selection_for_pane_range(
+    content_area: ratatui::layout::Rect,
+    screen_row: u16,
+    pane_start_col: usize,
+    pane_end_col: usize,
+) -> MouseSelection {
+    MouseSelection {
+        start_col: content_area.x + pane_start_col as u16,
+        start_row: screen_row,
+        end_col: content_area.x + pane_end_col as u16,
+        end_row: screen_row,
+    }
+}
+
+fn single_char_at_click(
+    fd: &FrameData,
+    screen_row: u16,
+    screen_col: u16,
+    hide_borders: bool,
+) -> Option<String> {
+    let (row_texts, _, pane_row, pane_col) =
+        pane_coords_at_screen(fd, screen_row, screen_col, hide_borders)?;
+    let line = row_texts.get(pane_row)?.text.as_str();
+    let mut col = 0usize;
+    for ch in line.chars() {
+        use unicode_width::UnicodeWidthChar;
+        let width = ch.width().unwrap_or(1);
+        if pane_col >= col && pane_col < col + width {
+            return Some(ch.to_string());
+        }
+        col += width;
+    }
+    None
+}
+
+fn word_selection_at_click(
+    fd: &FrameData,
+    screen_row: u16,
+    screen_col: u16,
+    hide_borders: bool,
+) -> Option<MouseSelection> {
+    let (row_texts, content_area, pane_row, pane_col) =
+        pane_coords_at_screen(fd, screen_row, screen_col, hide_borders)?;
+    let line = row_texts.get(pane_row)?.text.as_str();
+    let (start, end) = word_display_range_in_line(line, pane_col)?;
+    Some(selection_for_pane_range(
+        content_area,
+        screen_row,
+        start,
+        end,
+    ))
+}
+
+fn copy_text_and_notify(
+    text: &str,
+    status_notice: &mut Option<(String, Instant)>,
+    last_drawn_counter: &mut u64,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let result = copy_to_clipboard(text);
+    *status_notice = Some((
+        match result {
+            ClipboardCopyResult::System => {
+                format!("copied {} chars", text.chars().count())
+            }
+            ClipboardCopyResult::Osc52 => {
+                format!("copied {} chars via OSC 52", text.chars().count())
+            }
+            ClipboardCopyResult::Unavailable => format!(
+                "yanked {} chars (clipboard unavailable)",
+                text.chars().count()
+            ),
+        },
+        Instant::now() + Duration::from_secs(3),
+    ));
+    *last_drawn_counter = 0;
+}
+
+fn execute_single_click(
+    row: u16,
+    col: u16,
+    open_url_click: bool,
+    fd: &FrameData,
+    hide_borders: bool,
+    status_notice: &mut Option<(String, Instant)>,
+    last_drawn_counter: &mut u64,
+) {
+    if open_url_click {
+        if let Some(url) = detect_url_at_click(fd, row, col, hide_borders) {
+            open_url(&url);
+            *status_notice = Some((
+                format!("opening {}", truncate_status_url(&url)),
+                Instant::now() + Duration::from_secs(3),
+            ));
+            return;
+        }
+    }
+    if let Some(text) = single_char_at_click(fd, row, col, hide_borders) {
+        copy_text_and_notify(&text, status_notice, last_drawn_counter);
+    }
+}
+
+fn flush_pending_single_click(
+    pending: &mut Option<PendingSingleClick>,
+    fd: &FrameData,
+    hide_borders: bool,
+    status_notice: &mut Option<(String, Instant)>,
+    last_drawn_counter: &mut u64,
+) {
+    if let Some(click) = pending.take() {
+        execute_single_click(
+            click.row,
+            click.col,
+            click.open_url,
+            fd,
+            hide_borders,
+            status_notice,
+            last_drawn_counter,
+        );
+    }
+}
+
+fn schedule_single_click(
+    pending: &mut Option<PendingSingleClick>,
+    row: u16,
+    col: u16,
+    open_url: bool,
+) {
+    *pending = Some(PendingSingleClick {
+        row,
+        col,
+        deadline: Instant::now() + SINGLE_CLICK_DELAY,
+        open_url,
+    });
+}
+
+fn begin_mouse_down_selection(
+    pending: &mut Option<PendingSingleClick>,
+    fd: &FrameData,
+    mouse_row: u16,
+    mouse_col: u16,
+    hide_borders: bool,
+    status_notice: &mut Option<(String, Instant)>,
+    last_drawn_counter: &mut u64,
+) -> MouseSelection {
+    if let Some(prev) = pending.take() {
+        if prev.row == mouse_row
+            && prev.col == mouse_col
+            && Instant::now() <= prev.deadline
+        {
+            if let Some(sel) =
+                word_selection_at_click(fd, mouse_row, mouse_col, hide_borders)
+            {
+                return sel;
+            }
+        } else {
+            execute_single_click(
+                prev.row,
+                prev.col,
+                prev.open_url,
+                fd,
+                hide_borders,
+                status_notice,
+                last_drawn_counter,
+            );
+        }
+    }
+    MouseSelection {
+        start_col: mouse_col,
+        start_row: mouse_row,
+        end_col: mouse_col.saturating_add(1),
+        end_row: mouse_row,
+    }
+}
+
+fn copy_drag_selection(
+    fd: &FrameData,
+    sel: &MouseSelection,
+    hide_borders: bool,
+    status_notice: &mut Option<(String, Instant)>,
+    last_drawn_counter: &mut u64,
+) {
+    let (cols, rows) = terminal::size().unwrap_or((80, 24));
+    let text = extract_text_from_frame_in_area(
+        fd,
+        sel,
+        server_layout_area(cols, rows),
+        hide_borders,
+    );
+    copy_text_and_notify(&text, status_notice, last_drawn_counter);
 }
 
 struct PaneContentRow {
@@ -5970,6 +6211,182 @@ mod tests {
             active,
             rows_v2: vec![],
             title: None,
+        }
+    }
+
+    #[test]
+    fn word_display_range_selects_until_whitespace() {
+        assert_eq!(word_display_range_in_line("foo bar", 1), Some((0, 3)));
+        assert_eq!(word_display_range_in_line("foo bar", 5), Some((4, 7)));
+        assert_eq!(word_display_range_in_line("foo-bar baz", 2), Some((0, 7)));
+        assert_eq!(word_display_range_in_line("a=b", 1), Some((0, 3)));
+    }
+
+    #[test]
+    fn mouse_copy_reads_single_char_from_server_frame() {
+        let fd = test_frame(vec![test_row("abc", None)]);
+        let layout_area = server_layout_area(80, 24);
+        let (_, content_area) =
+            find_active_pane_content(&fd.layout, layout_area, true);
+        assert_eq!(
+            single_char_at_click(&fd, content_area.y, content_area.x + 1, true),
+            Some("b".to_string())
+        );
+    }
+
+    #[test]
+    fn mouse_copy_reads_word_from_server_frame() {
+        let fd = test_frame(vec![test_row("foo bar", None)]);
+        let layout_area = server_layout_area(80, 24);
+        let (_, content_area) =
+            find_active_pane_content(&fd.layout, layout_area, true);
+        let sel = word_selection_at_click(
+            &fd,
+            content_area.y,
+            content_area.x + 1,
+            true,
+        )
+        .expect("word selection");
+        assert_eq!(
+            extract_text_from_frame_in_area(&fd, &sel, layout_area, true),
+            "foo"
+        );
+    }
+
+    /// Integration helpers: build a real server frame and run mouse copy on it.
+    mod frame_copy_pipeline {
+        use std::{io, time::Duration};
+
+        use super::*;
+        use crate::{
+            layout::serialize_frame,
+            output::{frame_ansi_area, serialize_frame_ansi, FrameAnsiOptions},
+            pty::{spawn_pane, SpawnOptions},
+            types::{
+                session::{Size, WindowFlags},
+                LayoutNode, Pane, Rect, Window, WindowOptions,
+            },
+        };
+
+        const PANE_ROWS: u16 = 8;
+        const PANE_COLS: u16 = 40;
+
+        fn terminal_size() -> (u16, u16) {
+            // Tab bar + pane + status bar.
+            (PANE_COLS, PANE_ROWS + 2)
+        }
+
+        fn server_size() -> Size {
+            let (cols, rows) = terminal_size();
+            Size::new(rows.saturating_sub(1).max(1), cols.max(1))
+        }
+
+        fn layout_area() -> Rect {
+            let sz = server_size();
+            Rect::new(0, 0, sz.cols.max(1), sz.rows.saturating_sub(1).max(1))
+        }
+
+        fn silent_test_pane() -> io::Result<Pane> {
+            #[cfg(unix)]
+            let command = Some("/bin/cat");
+            #[cfg(windows)]
+            let command = Some("C:\\Windows\\System32\\timeout.exe");
+            spawn_pane(SpawnOptions {
+                pane_id: 1,
+                rows: PANE_ROWS,
+                cols: PANE_COLS,
+                command,
+                start_dir: None,
+                env: vec![],
+                scroll_on_erase_in_display: false,
+            })
+        }
+
+        fn test_window(pane: Pane) -> Window {
+            Window {
+                id: 1,
+                name: "test".to_string(),
+                root: LayoutNode::Leaf(pane),
+                active_pane_path: vec![],
+                options: WindowOptions::with_defaults(),
+                pane_mru: vec![1],
+                zoom_state: None,
+                flags: WindowFlags::default(),
+                layout_index: 0,
+                last_output_time: std::time::Instant::now(),
+                last_seen_version: 0,
+                default_start_dir: None,
+            }
+        }
+
+        /// Mirror server render_loop: layout JSON first, then ANSI paint.
+        fn build_frame_data(win: &Window) -> FrameData {
+            let json = serialize_frame(win, layout_area(), true);
+            serde_json::from_str(&json)
+                .expect("serialize_frame should produce FrameData")
+        }
+
+        fn assert_ansi_paints(win: &Window, text: &str) {
+            let ansi = serialize_frame_ansi(
+                win,
+                frame_ansi_area(server_size()),
+                true,
+                FrameAnsiOptions {
+                    clear_display: true,
+                },
+            );
+            assert!(
+                ansi.contains(text),
+                "ANSI paint should include {text:?}, got: {ansi:?}"
+            );
+        }
+
+        fn mouse_copy_first_row(fd: &FrameData, text_len: u16) -> String {
+            let (term_cols, term_rows) = terminal_size();
+            let layout_area = server_layout_area(term_cols, term_rows);
+            let (_, content_area) =
+                find_active_pane_content(&fd.layout, layout_area, true);
+            let sel = MouseSelection {
+                start_col: content_area.x,
+                start_row: content_area.y,
+                end_col: content_area.x + text_len,
+                end_row: content_area.y,
+            };
+            extract_text_from_frame_in_area(fd, &sel, layout_area, true)
+        }
+
+        fn feed_pane(pane: &Pane, bytes: &[u8]) {
+            let mut parser = pane.parser.lock().expect("parser lock");
+            parser.process(bytes);
+        }
+
+        #[test]
+        fn mouse_copy_reads_text_from_server_frame() {
+            let pane = silent_test_pane().expect("test pane");
+            feed_pane(&pane, b"plain_copy_text");
+            let win = test_window(pane);
+            let fd = build_frame_data(&win);
+            assert_ansi_paints(&win, "plain_copy_text");
+            assert_eq!(
+                mouse_copy_first_row(&fd, "plain_copy_text".len() as u16),
+                "plain_copy_text"
+            );
+        }
+
+        #[test]
+        fn mouse_copy_reads_sync_output_from_server_frame() {
+            let pane = silent_test_pane().expect("test pane");
+            feed_pane(&pane, b"\x1b[?2026hsync_copy_text");
+            std::thread::sleep(Duration::from_millis(160));
+            let win = test_window(pane);
+            let fd = build_frame_data(&win);
+            assert_ansi_paints(&win, "sync_copy_text");
+            assert_eq!(
+                mouse_copy_first_row(&fd, "sync_copy_text".len() as u16),
+                "sync_copy_text",
+                "rows_v2 must match ANSI after sync flush; \
+                 without write_leaf flush this returns empty while the screen shows text"
+            );
         }
     }
 }
