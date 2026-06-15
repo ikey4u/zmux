@@ -1,5 +1,3 @@
-#[cfg(windows)]
-use std::io::Write;
 use std::{
     collections::VecDeque,
     io::{self},
@@ -96,13 +94,6 @@ pub fn spawn_pane(opts: SpawnOptions<'_>) -> io::Result<Pane> {
             .take_writer()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?,
     ));
-
-    #[cfg(windows)]
-    {
-        if let Ok(mut w) = writer.lock() {
-            send_dsr_response(&mut **w);
-        }
-    }
 
     let mut term_state = AlacrittyTermState::new(opts.rows, opts.cols, 2000);
     term_state.set_scroll_on_erase_in_display(opts.scroll_on_erase_in_display);
@@ -272,9 +263,15 @@ fn resolve_windows_shell() -> String {
 }
 
 #[cfg(windows)]
+fn windows_powershell_emacs_script() -> &'static str {
+    r"function global:__zmux_emit_cwd { try { $p = (Get-Location).Path -replace '\\','/'; $e = [char]27; [Console]::Write([string]::Concat($e, ']7;file:///', $p, $e, '\')) } catch {} }; function global:prompt { __zmux_emit_cwd; 'PS ' + $executionContext.SessionState.Path.CurrentLocation + '> ' }; __zmux_emit_cwd; try { Import-Module PSReadLine -ErrorAction Stop; Set-PSReadLineOption -EditMode Emacs -ErrorAction Stop; function global:__zmux_bind($c,$f) { try { Set-PSReadLineKeyHandler -Chord $c -Function $f -ErrorAction Stop } catch {} }; __zmux_bind 'Ctrl+a' BeginningOfLine; __zmux_bind 'Ctrl+b' BackwardChar; __zmux_bind 'Ctrl+d' DeleteCharOrExit; __zmux_bind 'Ctrl+e' EndOfLine; __zmux_bind 'Ctrl+f' ForwardChar; __zmux_bind 'Ctrl+k' KillLine; __zmux_bind 'Ctrl+l' ClearScreen; __zmux_bind 'Ctrl+n' NextHistory; __zmux_bind 'Ctrl+p' PreviousHistory; __zmux_bind 'Ctrl+r' ReverseSearchHistory; __zmux_bind 'Ctrl+s' ForwardSearchHistory; __zmux_bind 'Ctrl+t' SwapCharacters; __zmux_bind 'Ctrl+u' BackwardKillInput; Remove-Item Function:\__zmux_bind -ErrorAction SilentlyContinue } catch {}"
+}
+
+#[cfg(windows)]
 fn configure_windows_default_shell(shell: &str, cmd: &mut CommandBuilder) {
     if is_windows_powershell_shell(shell) {
         cmd.arg("-NoLogo");
+        cmd.arg("-NoProfile");
         cmd.arg("-NoExit");
         cmd.arg("-Command");
         cmd.arg(windows_powershell_emacs_script());
@@ -304,31 +301,6 @@ fn is_windows_powershell_shell(shell: &str) -> bool {
         return false;
     };
     matches!(name.to_ascii_lowercase().as_str(), "pwsh" | "powershell")
-}
-
-#[cfg(windows)]
-const WINDOWS_POWERSHELL_EMACS_SCRIPT: &str = concat!(
-    "function global:__zmux_emit_cwd { try { $p = (Get-Location).Path -replace '\\\\','/'; ",
-    "$e = [char]27; [Console]::Write([string]::Concat($e, ']7;file:///', $p, $e, '\\')) } catch {} }; ",
-    "function global:__zmux_wrap_prompt { if (Test-Path Function:\\__zmux_prompt_wrapped) { return }; ",
-    "$global:__zmux_user_prompt = Get-Command prompt; ",
-    "function global:prompt { __zmux_emit_cwd; if ($null -ne $global:__zmux_user_prompt) { return (& $global:__zmux_user_prompt) }; ",
-    "return ('PS ' + $executionContext.SessionState.Path.CurrentLocation + '> ') }; ",
-    "function global:__zmux_prompt_wrapped { } }; ",
-    "__zmux_wrap_prompt; __zmux_emit_cwd; ",
-    "try { Import-Module PSReadLine -ErrorAction Stop; Set-PSReadLineOption -EditMode Emacs -ErrorAction Stop; ",
-    "function global:__zmux_bind($c,$f) { try { Set-PSReadLineKeyHandler -Chord $c -Function $f -ErrorAction Stop } catch {} }; ",
-    "__zmux_bind 'Ctrl+a' BeginningOfLine; __zmux_bind 'Ctrl+b' BackwardChar; __zmux_bind 'Ctrl+d' DeleteCharOrExit; ",
-    "__zmux_bind 'Ctrl+e' EndOfLine; __zmux_bind 'Ctrl+f' ForwardChar; __zmux_bind 'Ctrl+k' KillLine; ",
-    "__zmux_bind 'Ctrl+l' ClearScreen; __zmux_bind 'Ctrl+n' NextHistory; __zmux_bind 'Ctrl+p' PreviousHistory; ",
-    "__zmux_bind 'Ctrl+r' ReverseSearchHistory; __zmux_bind 'Ctrl+s' ForwardSearchHistory; ",
-    "__zmux_bind 'Ctrl+t' SwapCharacters; __zmux_bind 'Ctrl+u' BackwardKillInput; ",
-    "Remove-Item Function:\\__zmux_bind -ErrorAction SilentlyContinue } catch {}",
-);
-
-#[cfg(windows)]
-fn windows_powershell_emacs_script() -> &'static str {
-    WINDOWS_POWERSHELL_EMACS_SCRIPT
 }
 
 #[cfg(windows)]
@@ -397,9 +369,6 @@ fn start_reader_thread(
             crate::terminal::osc_colors::OscColorTracker::default();
         let mut query_tracker = term_queries::TermQueryTracker::default();
         let render_debounce_seq = Arc::new(AtomicU64::new(0));
-        let mut burst_window_start = Instant::now();
-        let mut burst_bytes = 0usize;
-        let mut suppress_until: Option<Instant> = None;
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => {
@@ -434,23 +403,8 @@ fn start_reader_thread(
                     query_tracker.process(data, &parser, &pty_writer);
                     data_version.fetch_add(1, Ordering::Relaxed);
                     render_dirty.store(true, Ordering::Relaxed);
-                    let now = Instant::now();
-                    if now.duration_since(burst_window_start)
-                        > Duration::from_millis(50)
-                    {
-                        burst_window_start = now;
-                        burst_bytes = 0;
-                    }
-                    burst_bytes = burst_bytes.saturating_add(n);
-                    let high_volume = n >= 2048 || burst_bytes >= 8192;
-                    if high_volume {
-                        suppress_until = Some(now + Duration::from_millis(120));
-                    }
-                    let suppress_render =
-                        suppress_until.is_some_and(|until| now < until);
-                    if should_render && !suppress_render {
-                        crate::types::events::mark_data_ready();
-                    } else {
+                    crate::types::events::mark_data_ready();
+                    if !should_render {
                         schedule_debounced_render(&render_debounce_seq);
                     }
                 }
@@ -459,17 +413,13 @@ fn start_reader_thread(
     });
 }
 
-static RENDER_DEBOUNCE_ARMED: AtomicBool = AtomicBool::new(false);
+const RENDER_DEBOUNCE_MS: u64 = 16;
 
 fn schedule_debounced_render(seq: &Arc<AtomicU64>) {
     let generation = seq.fetch_add(1, Ordering::Relaxed) + 1;
-    if RENDER_DEBOUNCE_ARMED.swap(true, Ordering::AcqRel) {
-        return;
-    }
     let seq = Arc::clone(seq);
     thread::spawn(move || {
-        thread::sleep(Duration::from_millis(120));
-        RENDER_DEBOUNCE_ARMED.store(false, Ordering::Relaxed);
+        thread::sleep(Duration::from_millis(RENDER_DEBOUNCE_MS));
         if seq.load(Ordering::Relaxed) == generation {
             crate::types::events::mark_data_ready();
         }
@@ -602,12 +552,6 @@ pub fn resize_pane(pane: &mut Pane, rows: u16, cols: u16) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(windows)]
-fn send_dsr_response(writer: &mut dyn Write) {
-    let _ = writer.write_all(b"\x1b[1;1R");
-    let _ = writer.flush();
-}
-
 #[cfg(unix)]
 fn apply_host_termios_to_slave(master: &dyn portable_pty::MasterPty) {
     let path = match master.tty_name() {
@@ -682,19 +626,52 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_powershell_script_wraps_existing_prompt() {
-        let script = windows_powershell_emacs_script();
-        assert!(script.contains("__zmux_wrap_prompt"));
-        assert!(script.contains("__zmux_user_prompt"));
-        assert!(script.contains("__zmux_emit_cwd"));
-        assert!(
-            script.contains("$global:__zmux_user_prompt = Get-Command prompt")
+    fn windows_default_shell_emits_prompt() -> io::Result<()> {
+        let started = Instant::now();
+        let mut pane = spawn_pane(SpawnOptions {
+            pane_id: 1,
+            rows: 24,
+            cols: 80,
+            command: None,
+            start_dir: None,
+            env: vec![],
+            scroll_on_erase_in_display: false,
+        })?;
+        let deadline = started + Duration::from_secs(15);
+        let mut saw_bytes = false;
+        while Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+            if pane.data_version.load(Ordering::Relaxed) > 0 {
+                saw_bytes = true;
+            }
+            let visible = pane
+                .parser
+                .lock()
+                .map(|mut parser| {
+                    parser.flush_sync_for_display();
+                    parser
+                        .visible_rows()
+                        .into_iter()
+                        .flat_map(|row| {
+                            row.into_iter()
+                                .filter_map(|cell| cell.map(|cell| cell.text))
+                        })
+                        .collect::<String>()
+                })
+                .unwrap_or_default();
+            if visible.contains('>') {
+                eprintln!(
+                    "windows prompt visible after {:?} (saw_bytes={saw_bytes})",
+                    started.elapsed()
+                );
+                let _ = pane.child.kill();
+                return Ok(());
+            }
+        }
+        let _ = pane.child.kill();
+        panic!(
+            "windows prompt did not appear within 15s (saw_bytes={saw_bytes})"
         );
-        assert!(script.contains("return (& $global:__zmux_user_prompt)"));
-        assert!(script.contains(
-            "return ('PS ' + $executionContext.SessionState.Path.CurrentLocation + '> ')"
-        ));
-        assert!(!script.contains(".ScriptBlock"));
     }
 
     #[cfg(unix)]

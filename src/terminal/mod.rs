@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     hash::{Hash, Hasher},
+    time::{Duration, Instant},
 };
 
 use alacritty_terminal::{
@@ -66,6 +67,7 @@ pub struct AlacrittyTermState {
     output_buffer: OutputBuffer,
     row_hashes: Vec<u64>,
     last_display_offset: usize,
+    sync_started_at: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -96,6 +98,7 @@ impl AlacrittyTermState {
             output_buffer: OutputBuffer::default(),
             row_hashes: Vec::new(),
             last_display_offset: 0,
+            sync_started_at: None,
         }
     }
 
@@ -195,6 +198,7 @@ impl AlacrittyTermState {
     }
 
     pub fn process(&mut self, data: &[u8]) -> bool {
+        let flushed_before = self.flush_sync_if_timed_out();
         if self.scroll_on_erase_in_display {
             self.process_with_scroll_on_erase(data);
         } else if self.pending_scroll_erase_escape.is_empty() {
@@ -205,7 +209,78 @@ impl AlacrittyTermState {
             bytes.extend_from_slice(data);
             self.parser.advance(&mut self.term, &bytes);
         }
-        !data.is_empty() && !self.sync_update_active()
+        self.track_sync_session();
+        let flushed_after = self.flush_sync_if_timed_out();
+        (!data.is_empty() && !self.sync_update_active())
+            || flushed_before
+            || flushed_after
+    }
+
+    fn track_sync_session(&mut self) {
+        if self.parser.sync_bytes_count() > 0 && self.sync_started_at.is_none()
+        {
+            self.sync_started_at = Some(Instant::now());
+        } else if self.parser.sync_bytes_count() == 0
+            && !self.sync_timeout_active()
+        {
+            self.sync_started_at = None;
+        }
+    }
+
+    fn sync_timeout_active(&self) -> bool {
+        self.parser.sync_timeout().sync_timeout().is_some()
+    }
+
+    fn sync_timeout_expired(&self) -> bool {
+        self.parser
+            .sync_timeout()
+            .sync_timeout()
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    fn sync_session_aged_out(&self) -> bool {
+        self.sync_started_at.is_some_and(|started| {
+            started.elapsed() >= Duration::from_millis(50)
+        })
+    }
+
+    /// Buffered synchronized-output bytes waiting to be painted.
+    pub fn has_pending_sync_paint(&self) -> bool {
+        self.parser.sync_bytes_count() > 0
+    }
+
+    /// Apply buffered synchronized-output bytes once their deadline passes.
+    /// Alacritty does this in its event loop; without it PSReadLine prompt
+    /// redraws stay invisible until `\x1b[?2026l` arrives.
+    pub fn flush_sync_if_timed_out(&mut self) -> bool {
+        self.flush_sync_for_display()
+    }
+
+    /// Paint buffered synchronized output when it is safe to do so.
+    /// Flushing an empty BSU session breaks CPR responses and PSReadLine input.
+    pub fn flush_sync_for_display(&mut self) -> bool {
+        if self.parser.sync_bytes_count() == 0 {
+            return false;
+        }
+        if !(self.sync_timeout_expired() || self.sync_session_aged_out()) {
+            return false;
+        }
+        self.apply_pending_sync();
+        true
+    }
+
+    /// Apply buffered sync bytes before answering a CPR query from the shell.
+    pub fn flush_sync_before_cpr(&mut self) -> bool {
+        if self.parser.sync_bytes_count() == 0 {
+            return false;
+        }
+        self.apply_pending_sync();
+        true
+    }
+
+    fn apply_pending_sync(&mut self) {
+        self.parser.stop_sync(&mut self.term);
+        self.sync_started_at = None;
     }
 
     fn process_with_scroll_on_erase(&mut self, data: &[u8]) {
@@ -304,7 +379,7 @@ impl AlacrittyTermState {
         self.term.grid_mut().reset_region::<Color, _>(..);
     }
 
-    fn sync_update_active(&self) -> bool {
+    pub fn sync_update_active(&self) -> bool {
         self.parser.sync_bytes_count() > 0
             || self.parser.sync_timeout().sync_timeout().is_some()
     }
@@ -678,5 +753,38 @@ mod tests {
         assert_eq!(first_row_text(&term), "");
         assert!(term.process(b"\x1b[?2026l"));
         assert_eq!(first_row_text(&term), "hello world");
+    }
+
+    #[test]
+    fn synchronized_output_flushes_after_timeout() {
+        let mut term = AlacrittyTermState::new(3, 20, 2000);
+
+        assert!(!term.process(b"\x1b[?2026hhello"));
+        assert_eq!(first_row_text(&term), "");
+        std::thread::sleep(std::time::Duration::from_millis(160));
+        assert!(term.flush_sync_if_timed_out());
+        assert_eq!(first_row_text(&term), "hello");
+    }
+
+    #[test]
+    fn synchronized_output_waits_for_display_deadline() {
+        let mut term = AlacrittyTermState::new(3, 20, 2000);
+
+        assert!(!term.process(b"\x1b[?2026hhello"));
+        assert_eq!(first_row_text(&term), "");
+        assert!(!term.flush_sync_for_display());
+        std::thread::sleep(std::time::Duration::from_millis(160));
+        assert!(term.flush_sync_for_display());
+        assert_eq!(first_row_text(&term), "hello");
+    }
+
+    #[test]
+    fn synchronized_output_cpr_flush_applies_pending_bytes() {
+        let mut term = AlacrittyTermState::new(3, 20, 2000);
+
+        assert!(!term.process(b"\x1b[?2026hhello"));
+        assert!(!term.flush_sync_for_display());
+        assert!(term.flush_sync_before_cpr());
+        assert_eq!(first_row_text(&term), "hello");
     }
 }
