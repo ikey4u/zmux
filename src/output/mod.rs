@@ -306,7 +306,13 @@ fn layout_color_str(name: &str, fg: bool) -> Color {
 }
 
 fn pane_paint_pending(pane: &Pane, opts: &FrameAnsiOptions) -> bool {
-    opts.clear_display || pane.render_dirty.load(Ordering::Relaxed)
+    if opts.clear_display || pane.render_dirty.load(Ordering::Relaxed) {
+        return true;
+    }
+    pane.parser
+        .lock()
+        .ok()
+        .is_some_and(|parser| parser.has_pending_sync_paint())
 }
 
 fn finish_pane_paint(pane: &Pane) {
@@ -394,13 +400,16 @@ fn write_pane(
         return;
     }
     let snapshot = match pane.parser.lock() {
-        Ok(parser) => Some((
-            pane_default_codes(
-                parser.pane_default_fg(),
-                parser.pane_default_bg(),
-            ),
-            parser.visible_rows(),
-        )),
+        Ok(mut parser) => {
+            parser.flush_sync_for_display();
+            Some((
+                pane_default_codes(
+                    parser.pane_default_fg(),
+                    parser.pane_default_bg(),
+                ),
+                parser.visible_rows(),
+            ))
+        }
         Err(_) => None,
     };
     let Some(((pane_fg, pane_bg), rows)) = snapshot else {
