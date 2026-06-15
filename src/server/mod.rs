@@ -751,31 +751,11 @@ where
                 };
                 let sz =
                     size_arc.lock().map(|s| *s).unwrap_or(Size::new(24, 80));
+                flush_sync_for_display_updates(&mut s);
                 reap_dead_panes(&mut s, sz);
                 if server_is_empty(&s) {
                     log_server("all sessions empty, sending exit frame");
                     "{\"type\":\"frame\",\"exit\":true,\"layout\":{\"type\":\"leaf\",\"id\":0,\"rows\":1,\"cols\":1,\"cursor_row\":0,\"cursor_col\":0,\"hide_cursor\":true,\"alternate_screen\":false,\"mouse_mode\":0,\"in_copy_mode\":false,\"cursor_shape\":255,\"active\":false,\"rows_v2\":[]}}".to_string()
-                } else if let Some(mut frame) =
-                    latest_frame.lock().ok().and_then(|frame| frame.clone())
-                {
-                    if let Some(yank_text) = yank_ref {
-                        frame.yank_text = Some(yank_text.to_string());
-                    }
-                    serde_json::to_string(&frame).unwrap_or_else(|_| {
-                        let session = s.active_session().unwrap();
-                        let win = session
-                            .windows
-                            .get(session.active_window_idx)
-                            .unwrap();
-                        build_frame_json(
-                            session,
-                            win,
-                            frame_layout_area(sz),
-                            None,
-                            s.hide_borders,
-                            sz,
-                        )
-                    })
                 } else {
                     let session = match s.active_session() {
                         Some(s) => s,
@@ -786,17 +766,26 @@ where
                             Some(w) => w,
                             None => continue,
                         };
-                    let area = frame_layout_area(sz);
                     build_frame_json(
                         session,
                         win,
-                        area,
+                        frame_layout_area(sz),
                         yank_ref.as_deref(),
                         s.hide_borders,
                         sz,
+                        FrameAnsiOptions {
+                            clear_display: true,
+                        },
                     )
                 }
             };
+            if !json.contains("\"exit\":true") {
+                if let Ok(fd) = serde_json::from_str::<FrameData>(&json) {
+                    if let Ok(mut frame) = latest_frame.lock() {
+                        *frame = Some(fd);
+                    }
+                }
+            }
             if send_frame(&mut write_stream, &json).is_err() {
                 break;
             }
@@ -1034,6 +1023,9 @@ fn refresh_latest_frame(
         None,
         state.hide_borders,
         size,
+        FrameAnsiOptions {
+            clear_display: true,
+        },
     );
     if let Ok(fd) = serde_json::from_str::<FrameData>(&json) {
         if let Ok(mut frame) = latest_frame.lock() {
@@ -1049,6 +1041,7 @@ fn build_frame_json(
     yank_text: Option<&str>,
     hide_borders: bool,
     size: Size,
+    ansi_opts: FrameAnsiOptions,
 ) -> String {
     use crate::layout::serialize_frame;
     let layout_json = serialize_frame(win, area, hide_borders);
@@ -1060,9 +1053,7 @@ fn build_frame_json(
         win,
         frame_ansi_area(size),
         hide_borders,
-        FrameAnsiOptions {
-            clear_display: true,
-        },
+        ansi_opts,
     );
     let ansi_b64 = encode_ansi_base64(&ansi);
     let session_name = &session.name;
@@ -1224,6 +1215,35 @@ fn root_pane_size(size: Size) -> (u16, u16) {
     pane_viewport_size(frame_layout_area(size), false)
 }
 
+fn flush_sync_for_display_updates(state: &mut Server) -> bool {
+    let mut flushed = false;
+    for session in &mut state.sessions {
+        for window in &mut session.windows {
+            flush_sync_for_display_in_layout(&mut window.root, &mut flushed);
+        }
+    }
+    flushed
+}
+
+fn flush_sync_for_display_in_layout(node: &mut LayoutNode, flushed: &mut bool) {
+    match node {
+        LayoutNode::Leaf(pane) => {
+            if let Ok(mut parser) = pane.parser.lock() {
+                if parser.flush_sync_for_display() {
+                    pane.render_dirty
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    *flushed = true;
+                }
+            }
+        }
+        LayoutNode::Split { children, .. } => {
+            for child in children {
+                flush_sync_for_display_in_layout(child, flushed);
+            }
+        }
+    }
+}
+
 fn render_loop(
     state: Arc<Mutex<Server>>,
     latest_frame: Arc<Mutex<Option<FrameData>>>,
@@ -1236,9 +1256,16 @@ fn render_loop(
     loop {
         crate::types::events::wait_render(Duration::from_millis(16));
 
+        let sync_flushed = state
+            .lock()
+            .ok()
+            .map(|mut s| flush_sync_for_display_updates(&mut s))
+            .unwrap_or(false);
         let dirty = PTY_DATA_READY.swap(false, Ordering::Relaxed);
-        let should_reap =
-            first || dirty || last_reap.elapsed() >= Duration::from_millis(250);
+        let should_reap = first
+            || dirty
+            || sync_flushed
+            || last_reap.elapsed() >= Duration::from_millis(250);
         let (should_exit, reaped) = if should_reap {
             last_reap = Instant::now();
             let mut s = match state.lock() {
@@ -1251,10 +1278,10 @@ fn render_loop(
         } else {
             (false, false)
         };
-        if !dirty && !first && !reaped {
+        if !dirty && !first && !reaped && !sync_flushed {
             continue;
         }
-        first = false;
+        let clear_on_paint = first;
         if should_exit {
             log_server("render loop found server empty, exiting");
             #[cfg(unix)]
@@ -1315,8 +1342,9 @@ fn render_loop(
             let ansi_area = frame_ansi_area(sz);
             let layout_fp = layout_fingerprint(win, ansi_area, s.hide_borders);
             let clear_display =
-                first || layout_fp != last_layout_fp || force_clear;
+                clear_on_paint || layout_fp != last_layout_fp || force_clear;
             last_layout_fp = layout_fp;
+            first = false;
             let ansi = serialize_frame_ansi(
                 win,
                 ansi_area,

@@ -100,8 +100,13 @@ fn respond(
     let response = match query {
         TermQuery::DeviceStatus => b"\x1b[0n".to_vec(),
         TermQuery::CursorPosition => {
-            let (row, col) =
-                parser.lock().map(|p| p.cursor_position()).unwrap_or((0, 0));
+            let (row, col) = parser
+                .lock()
+                .map(|mut p| {
+                    p.flush_sync_before_cpr();
+                    p.cursor_position()
+                })
+                .unwrap_or((0, 0));
             format!("\x1b[{};{}R", row + 1, col + 1).into_bytes()
         }
     };
