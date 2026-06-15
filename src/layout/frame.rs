@@ -241,7 +241,7 @@ fn write_leaf(pane: &Pane, is_active: bool, out: &mut String) {
         out.push('}');
         return;
     }
-    let Ok(parser) = pane.parser.lock() else {
+    let Ok(mut parser) = pane.parser.lock() else {
         let _ = write!(
             out,
             "{{\"type\":\"leaf\",\"id\":{},\"rows\":{},\"cols\":{},\
@@ -251,6 +251,10 @@ fn write_leaf(pane: &Pane, is_active: bool, out: &mut String) {
         );
         return;
     };
+    // Keep rows_v2 aligned with server ANSI output. write_pane() flushes
+    // synchronized output before visible_rows(); without the same flush here
+    // mouse copy reads stale/blank rows while the screen shows fresh content.
+    parser.flush_sync_for_display();
     let (cr, cc) = parser.cursor_position();
     let hide_cursor = parser.hide_cursor();
     let alt = parser.alternate_screen();
@@ -496,6 +500,23 @@ mod tests {
 
         assert_eq!(rows[0]["line"], Value::from(0));
         assert_eq!(rows[1]["line"], Value::from(0));
+    }
+
+    #[test]
+    fn terminal_rows_need_flush_before_serialize_during_sync() {
+        // Low-level reminder only; the integration test
+        // `mouse_copy_reads_sync_output_from_server_frame` guards the real bug.
+        let mut term = AlacrittyTermState::new(3, 20, 2000);
+        assert!(!term.process(b"\x1b[?2026hhello"));
+        let mut without_flush = String::new();
+        write_rows_v2(&term, 3, 20, &mut without_flush);
+        assert!(!without_flush.contains("hello"));
+
+        std::thread::sleep(std::time::Duration::from_millis(160));
+        assert!(term.flush_sync_for_display());
+        let mut with_flush = String::new();
+        write_rows_v2(&term, 3, 20, &mut with_flush);
+        assert!(with_flush.contains("hello"));
     }
 
     fn serialized_rows_for(input: &[u8], rows: u16, cols: u16) -> Vec<Value> {
