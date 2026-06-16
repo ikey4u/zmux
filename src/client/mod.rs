@@ -105,14 +105,18 @@ enum InputMode {
 
 const RESIZE_IDLE_TIMEOUT: Duration = Duration::from_millis(500);
 const SCROLL_LINES: usize = 3;
-const SINGLE_CLICK_DELAY: Duration = Duration::from_millis(400);
+const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(400);
 
-struct PendingSingleClick {
+struct LastMouseClick {
     row: u16,
     col: u16,
-    deadline: Instant,
-    /// When true (Ctrl held), open a URL at the click instead of copying.
-    open_url: bool,
+    at: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct MouseDragOrigin {
+    row: u16,
+    col: u16,
 }
 
 struct ClientTab {
@@ -1270,7 +1274,8 @@ impl ClientApp {
         let backend = TerminalBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
         let mut mouse_select: Option<MouseSelection> = None;
-        let mut pending_single_click: Option<PendingSingleClick> = None;
+        let mut mouse_drag_origin: Option<MouseDragOrigin> = None;
+        let mut last_mouse_click: Option<LastMouseClick> = None;
 
         let prefix_key = (KeyCode::Char('a'), KeyModifiers::CONTROL);
         let mut mode = InputMode::Normal;
@@ -1283,6 +1288,9 @@ impl ClientApp {
         let mut status_notice: Option<(String, Instant)> = None;
         let mut hide_borders = false;
         let mut applied_cursor_style: Option<SetCursorStyle> = None;
+        let mut applied_mouse_pointer: Option<MousePointerShape> = None;
+        let mut last_mouse_pos: Option<(u16, u16)> = None;
+        let mut last_drawn_mouse_select: Option<MouseSelection> = None;
         let mut last_draw_time = Instant::now() - Duration::from_millis(16);
         let mut last_drawn_counter: u64 = 0;
         let mut last_overlay_rect: Option<ratatui::layout::Rect> = None;
@@ -1290,19 +1298,6 @@ impl ClientApp {
             loop {
                 let frame = tabs.active_client().latest_frame();
                 let current_counter = tabs.active_client().frame_counter();
-                if let (Some(pending), Some(ref fd)) =
-                    (pending_single_click.as_ref(), frame.as_ref())
-                {
-                    if Instant::now() >= pending.deadline {
-                        flush_pending_single_click(
-                            &mut pending_single_click,
-                            fd,
-                            hide_borders,
-                            &mut status_notice,
-                            &mut last_drawn_counter,
-                        );
-                    }
-                }
                 if matches!(
                     copy_mode_sync_suppress_frame,
                     Some(counter) if counter != current_counter
@@ -1416,6 +1411,7 @@ impl ClientApp {
                 let hide_status = has_prompt;
 
                 let (cols, rows) = terminal::size().unwrap_or((80, 24));
+                let mut drew_terminal_output = false;
                 let terminal_area =
                     ratatui::layout::Rect::new(0, 0, cols, rows);
                 let current_overlay_rect =
@@ -1434,6 +1430,7 @@ impl ClientApp {
                 if frame_new
                     || last_draw_time.elapsed() >= Duration::from_millis(16)
                 {
+                    drew_terminal_output = true;
                     if frame_new {
                         if let Some(ref fd) = frame {
                             if let Some(ref ansi) = fd.ansi {
@@ -1445,10 +1442,29 @@ impl ClientApp {
                                         "failed to write pane ansi: {err}"
                                     ));
                                 }
+                                if let Err(err) = refresh_mouse_pointer(
+                                    terminal.backend_mut(),
+                                    &mut applied_mouse_pointer,
+                                    last_mouse_pos,
+                                    frame.as_ref(),
+                                    cols,
+                                    rows,
+                                    hide_borders,
+                                    hide_status,
+                                    has_overlay || has_prompt,
+                                    true,
+                                ) {
+                                    log_client(&format!(
+                                        "failed to set mouse pointer after ansi: {err}"
+                                    ));
+                                }
+                                last_drawn_mouse_select = None;
                             }
                         }
                     }
-                    let draw_ansi_selection = mouse_select.is_some()
+                    let draw_ansi_selection = mouse_select
+                        .as_ref()
+                        .is_some_and(|sel| !selection_is_empty(sel))
                         && frame.as_ref().is_some_and(|fd| fd.ansi.is_some());
                     terminal.draw(|f| {
                         let in_prefix = mode == InputMode::Prefix;
@@ -1578,22 +1594,61 @@ impl ClientApp {
                             }
                         }
                     })?;
+                    if frame.as_ref().is_some_and(|fd| fd.ansi.is_some()) {
+                        if let Some(prev) = last_drawn_mouse_select.take() {
+                            if mouse_select.is_none() {
+                                let (sr, sc, er, ec) = prev.normalized_bounds();
+                                if let Some(ref fd) = frame {
+                                    let layout_area =
+                                        server_layout_area(cols, rows);
+                                    if let Err(err) =
+                                        restore_mouse_selection_ansi(
+                                            terminal.backend_mut(),
+                                            fd,
+                                            sr,
+                                            sc,
+                                            er,
+                                            ec,
+                                            layout_area,
+                                            hide_borders,
+                                        )
+                                    {
+                                        log_client(&format!(
+                                            "failed to restore after selection: {err}"
+                                        ));
+                                    }
+                                }
+                            } else {
+                                last_drawn_mouse_select = Some(prev);
+                            }
+                        }
+                    }
                     if draw_ansi_selection {
-                        if let (Some(ref fd), Some(ref sel)) =
+                        if let (Some(ref fd), Some(sel)) =
                             (frame.as_ref(), mouse_select.as_ref())
                         {
-                            let (cols, rows) =
-                                terminal::size().unwrap_or((80, 24));
                             let layout_area = server_layout_area(cols, rows);
-                            if let Err(err) = write_active_pane_layout_ansi(
-                                terminal.backend_mut(),
-                                fd,
-                                layout_area,
-                                hide_borders,
-                            ) {
-                                log_client(&format!(
-                                    "failed to restore active pane for selection: {err}"
-                                ));
+                            if let Some(prev) = last_drawn_mouse_select {
+                                if !mouse_selection_bounds_eq(&prev, sel) {
+                                    let (sr, sc, er, ec) =
+                                        prev.normalized_bounds();
+                                    if let Err(err) =
+                                        restore_mouse_selection_ansi(
+                                            terminal.backend_mut(),
+                                            fd,
+                                            sr,
+                                            sc,
+                                            er,
+                                            ec,
+                                            layout_area,
+                                            hide_borders,
+                                        )
+                                    {
+                                        log_client(&format!(
+                                            "failed to restore selection region: {err}"
+                                        ));
+                                    }
+                                }
                             }
                             if let Err(err) = write_mouse_selection_ansi(
                                 terminal.backend_mut(),
@@ -1607,6 +1662,7 @@ impl ClientApp {
                                     "failed to write selection ansi: {err}"
                                 ));
                             }
+                            last_drawn_mouse_select = Some(*sel);
                         }
                     }
                     if let Some(ref fd) = frame {
@@ -1633,6 +1689,21 @@ impl ClientApp {
                     last_draw_time = Instant::now();
                     last_drawn_counter = current_counter;
                     last_overlay_rect = current_overlay_rect;
+                }
+
+                if let Err(err) = refresh_mouse_pointer(
+                    terminal.backend_mut(),
+                    &mut applied_mouse_pointer,
+                    last_mouse_pos,
+                    frame.as_ref(),
+                    cols,
+                    rows,
+                    hide_borders,
+                    hide_status,
+                    has_overlay || has_prompt,
+                    drew_terminal_output,
+                ) {
+                    log_client(&format!("failed to set mouse pointer: {err}"));
                 }
 
                 if event::poll(Duration::from_millis(8))? {
@@ -3510,6 +3581,23 @@ impl ClientApp {
                             }
                         }
                         Event::Mouse(mouse) => {
+                            last_mouse_pos = Some((mouse.column, mouse.row));
+                            if let Err(err) = refresh_mouse_pointer(
+                                terminal.backend_mut(),
+                                &mut applied_mouse_pointer,
+                                last_mouse_pos,
+                                frame.as_ref(),
+                                cols,
+                                rows,
+                                hide_borders,
+                                hide_status,
+                                has_overlay || has_prompt,
+                                true,
+                            ) {
+                                log_client(&format!(
+                                    "failed to set mouse pointer on move: {err}"
+                                ));
+                            }
                             if mode == InputMode::Prefix {
                                 prefix_from_copy_mode = false;
                             }
@@ -3519,7 +3607,8 @@ impl ClientApp {
                                 && !matches!(mode, InputMode::TabChooser { .. })
                             {
                                 mouse_select = None;
-                                pending_single_click = None;
+                                mouse_drag_origin = None;
+                                last_mouse_click = None;
                                 if matches!(
                                     mouse.kind,
                                     MouseEventKind::Down(MouseButton::Left)
@@ -3734,17 +3823,28 @@ impl ClientApp {
                                                         && mouse.row
                                                             < pa.y + pa.height
                                                     {
-                                                        mouse_select = Some(
-                                                            begin_mouse_down_selection(
-                                                                &mut pending_single_click,
+                                                        if let Some(sel) =
+                                                            try_word_select_on_double_click(
+                                                                &mut last_mouse_click,
                                                                 fd,
                                                                 mouse.row,
                                                                 mouse.column,
                                                                 hide_borders,
-                                                                &mut status_notice,
-                                                                &mut last_drawn_counter,
-                                                            ),
-                                                        );
+                                                            )
+                                                        {
+                                                            mouse_select =
+                                                                Some(sel);
+                                                            mouse_drag_origin =
+                                                                None;
+                                                        } else {
+                                                            // 不在 Down 时清除已有选区，
+                                                            // 等到真正开始拖拽（Drag）再建立新选区
+                                                            mouse_drag_origin =
+                                                                Some(MouseDragOrigin {
+                                                                    row: mouse.row,
+                                                                    col: mouse.column,
+                                                                });
+                                                        }
                                                     } else if let Some(
                                                         pane_id,
                                                     ) =
@@ -3797,32 +3897,66 @@ impl ClientApp {
                                                             mouse.column;
                                                         sel.end_row = mouse.row;
                                                     }
+                                                } else if let Some(origin) =
+                                                    mouse_drag_origin
+                                                {
+                                                    if let Some(ref fd) = frame
+                                                    {
+                                                        mouse_select = Some(
+                                                            mouse_selection_from_drag(
+                                                                origin,
+                                                                mouse,
+                                                                fd,
+                                                                hide_borders,
+                                                            ),
+                                                        );
+                                                    }
                                                 }
                                             }
                                             MouseEventKind::Up(
                                                 MouseButton::Left,
                                             ) => {
+                                                let refresh_ansi =
+                                                    frame.as_ref().is_some_and(
+                                                        |fd| fd.ansi.is_some(),
+                                                    );
                                                 if let Some(sel) =
                                                     mouse_select.take()
                                                 {
                                                     if let Some(ref fd) = frame
                                                     {
-                                                        let is_click =
-                                                            selection_is_click(
-                                                                &sel,
-                                                            );
-                                                        if is_click {
-                                                            schedule_single_click(
-                                                                &mut pending_single_click,
-                                                                sel.start_row,
-                                                                sel.start_col,
-                                                                mouse.modifiers
-                                                                    .contains(
-                                                                        KeyModifiers::CONTROL,
-                                                                    ),
-                                                            );
+                                                        if selection_is_caret(
+                                                            &sel,
+                                                        ) {
+                                                            if mouse.modifiers.contains(
+                                                                KeyModifiers::CONTROL,
+                                                            ) {
+                                                                if let Some(url) = detect_url_at_click(
+                                                                    fd,
+                                                                    sel.start_row,
+                                                                    sel.start_col,
+                                                                    hide_borders,
+                                                                ) {
+                                                                    open_url(&url);
+                                                                    status_notice = Some((
+                                                                        format!(
+                                                                            "opening {}",
+                                                                            truncate_status_url(&url)
+                                                                        ),
+                                                                        Instant::now()
+                                                                            + Duration::from_secs(3),
+                                                                    ));
+                                                                }
+                                                            }
+                                                            last_mouse_click =
+                                                                Some(LastMouseClick {
+                                                                    row: sel.start_row,
+                                                                    col: sel.start_col,
+                                                                    at: Instant::now(),
+                                                                });
                                                         } else {
-                                                            pending_single_click = None;
+                                                            last_mouse_click =
+                                                                None;
                                                             copy_drag_selection(
                                                                 fd,
                                                                 &sel,
@@ -3832,6 +3966,47 @@ impl ClientApp {
                                                             );
                                                         }
                                                     }
+                                                } else if mouse_drag_origin
+                                                    .is_some()
+                                                {
+                                                    // Down 时未建立选区（非双击），Up 时也未拖拽 → 单击
+                                                    if let Some(ref fd) = frame
+                                                    {
+                                                        if mouse.modifiers.contains(
+                                                            KeyModifiers::CONTROL,
+                                                        ) {
+                                                            if let Some(url) = detect_url_at_click(
+                                                                fd,
+                                                                mouse.row,
+                                                                mouse.column,
+                                                                hide_borders,
+                                                            ) {
+                                                                open_url(&url);
+                                                                status_notice = Some((
+                                                                    format!(
+                                                                        "opening {}",
+                                                                        truncate_status_url(&url)
+                                                                    ),
+                                                                    Instant::now()
+                                                                        + Duration::from_secs(3),
+                                                                ));
+                                                            }
+                                                        }
+                                                        last_mouse_click = Some(
+                                                            LastMouseClick {
+                                                                row: mouse.row,
+                                                                col: mouse
+                                                                    .column,
+                                                                at:
+                                                                    Instant::now(
+                                                                    ),
+                                                            },
+                                                        );
+                                                    }
+                                                }
+                                                mouse_drag_origin = None;
+                                                if refresh_ansi {
+                                                    last_drawn_counter = 0;
                                                 }
                                             }
                                             _ => {}
@@ -3868,17 +4043,31 @@ impl ClientApp {
                                                 && mouse.row >= pa.y
                                                 && mouse.row < pa.y + pa.height
                                             {
-                                                mouse_select = Some(
-                                                    begin_mouse_down_selection(
-                                                        &mut pending_single_click,
+                                                if let Some(sel) =
+                                                    try_word_select_on_double_click(
+                                                        &mut last_mouse_click,
                                                         fd,
                                                         mouse.row,
                                                         mouse.column,
                                                         hide_borders,
-                                                        &mut status_notice,
-                                                        &mut last_drawn_counter,
-                                                    ),
-                                                );
+                                                    )
+                                                {
+                                                    mouse_select = Some(sel);
+                                                    mouse_drag_origin = None;
+                                                } else {
+                                                    mouse_select = Some(
+                                                        caret_selection(
+                                                            mouse.row,
+                                                            mouse.column,
+                                                        ),
+                                                    );
+                                                    mouse_drag_origin = Some(
+                                                        MouseDragOrigin {
+                                                            row: mouse.row,
+                                                            col: mouse.column,
+                                                        },
+                                                    );
+                                                }
                                             } else if let Some(pane_id) =
                                                 find_pane_id_at(
                                                     &fd.layout,
@@ -3938,25 +4127,59 @@ impl ClientApp {
                                                 sel.end_col = mouse.column;
                                                 sel.end_row = mouse.row;
                                             }
+                                        } else if let Some(origin) =
+                                            mouse_drag_origin
+                                        {
+                                            if let Some(ref fd) = frame {
+                                                mouse_select = Some(
+                                                    mouse_selection_from_drag(
+                                                        origin,
+                                                        mouse,
+                                                        fd,
+                                                        hide_borders,
+                                                    ),
+                                                );
+                                            }
                                         }
                                     }
                                     MouseEventKind::Up(MouseButton::Left) => {
+                                        let refresh_ansi =
+                                            frame.as_ref().is_some_and(|fd| {
+                                                fd.ansi.is_some()
+                                            });
                                         if let Some(sel) = mouse_select.take() {
                                             if let Some(ref fd) = frame {
-                                                let is_click =
-                                                    selection_is_click(&sel);
-                                                if is_click {
-                                                    schedule_single_click(
-                                                        &mut pending_single_click,
-                                                        sel.start_row,
-                                                        sel.start_col,
-                                                        mouse.modifiers
-                                                            .contains(
-                                                                KeyModifiers::CONTROL,
-                                                            ),
-                                                    );
+                                                if selection_is_caret(&sel) {
+                                                    if mouse.modifiers.contains(
+                                                        KeyModifiers::CONTROL,
+                                                    ) {
+                                                        if let Some(url) =
+                                                            detect_url_at_click(
+                                                                fd,
+                                                                sel.start_row,
+                                                                sel.start_col,
+                                                                hide_borders,
+                                                            )
+                                                        {
+                                                            open_url(&url);
+                                                            status_notice = Some((
+                                                                format!(
+                                                                    "opening {}",
+                                                                    truncate_status_url(&url)
+                                                                ),
+                                                                Instant::now()
+                                                                    + Duration::from_secs(3),
+                                                            ));
+                                                        }
+                                                    }
+                                                    last_mouse_click =
+                                                        Some(LastMouseClick {
+                                                            row: sel.start_row,
+                                                            col: sel.start_col,
+                                                            at: Instant::now(),
+                                                        });
                                                 } else {
-                                                    pending_single_click = None;
+                                                    last_mouse_click = None;
                                                     copy_drag_selection(
                                                         fd,
                                                         &sel,
@@ -3966,6 +4189,10 @@ impl ClientApp {
                                                     );
                                                 }
                                             }
+                                        }
+                                        mouse_drag_origin = None;
+                                        if refresh_ansi {
+                                            last_drawn_counter = 0;
                                         }
                                     }
                                     _ => {}
@@ -4005,6 +4232,10 @@ impl ClientApp {
             LeaveAlternateScreen,
             SetCursorStyle::DefaultUserShape,
             cursor::Show
+        );
+        let _ = write_mouse_pointer_shape(
+            terminal.backend_mut(),
+            MousePointerShape::Default,
         );
         run_result
     }
@@ -4067,6 +4298,7 @@ fn mouse_for_pane(
     Some(mouse)
 }
 
+#[derive(Clone, Copy)]
 struct MouseSelection {
     start_col: u16,
     start_row: u16,
@@ -4075,15 +4307,56 @@ struct MouseSelection {
     end_row: u16,
 }
 
+impl MouseSelection {
+    fn normalized_bounds(self) -> (u16, u16, u16, u16) {
+        normalized_mouse_selection(&self)
+    }
+}
+
+fn mouse_selection_bounds_eq(a: &MouseSelection, b: &MouseSelection) -> bool {
+    a.normalized_bounds() == b.normalized_bounds()
+}
+
 fn selection_is_empty(sel: &MouseSelection) -> bool {
+    if selection_is_caret(sel) {
+        return true;
+    }
     let (start_row, start_col, end_row, end_col) =
         normalized_mouse_selection(sel);
     start_row == end_row && start_col >= end_col
 }
 
-fn selection_is_click(sel: &MouseSelection) -> bool {
-    sel.start_row == sel.end_row
-        && sel.end_col <= sel.start_col.saturating_add(1)
+fn selection_is_caret(sel: &MouseSelection) -> bool {
+    sel.start_row == sel.end_row && sel.start_col == sel.end_col
+}
+
+fn caret_selection(row: u16, col: u16) -> MouseSelection {
+    MouseSelection {
+        start_col: col,
+        start_row: row,
+        end_col: col,
+        end_row: row,
+    }
+}
+
+fn try_word_select_on_double_click(
+    last: &mut Option<LastMouseClick>,
+    fd: &FrameData,
+    row: u16,
+    col: u16,
+    hide_borders: bool,
+) -> Option<MouseSelection> {
+    let is_double = last.as_ref().is_some_and(|prev| {
+        prev.row == row
+            && prev.col == col
+            && prev.at.elapsed() <= DOUBLE_CLICK_INTERVAL
+    });
+    if is_double {
+        last.take();
+        word_selection_at_click(fd, row, col, hide_borders)
+    } else {
+        None
+    }
 }
 
 /// Display-column range `[start, end)` for the token bounded by whitespace.
@@ -4163,25 +4436,21 @@ fn selection_for_pane_range(
     }
 }
 
-fn single_char_at_click(
+fn copy_drag_selection(
     fd: &FrameData,
-    screen_row: u16,
-    screen_col: u16,
+    sel: &MouseSelection,
     hide_borders: bool,
-) -> Option<String> {
-    let (row_texts, _, pane_row, pane_col) =
-        pane_coords_at_screen(fd, screen_row, screen_col, hide_borders)?;
-    let line = row_texts.get(pane_row)?.text.as_str();
-    let mut col = 0usize;
-    for ch in line.chars() {
-        use unicode_width::UnicodeWidthChar;
-        let width = ch.width().unwrap_or(1);
-        if pane_col >= col && pane_col < col + width {
-            return Some(ch.to_string());
-        }
-        col += width;
-    }
-    None
+    status_notice: &mut Option<(String, Instant)>,
+    last_drawn_counter: &mut u64,
+) {
+    let (cols, rows) = terminal::size().unwrap_or((80, 24));
+    let text = extract_text_from_frame_in_area(
+        fd,
+        sel,
+        server_layout_area(cols, rows),
+        hide_borders,
+    );
+    copy_text_and_notify(&text, status_notice, last_drawn_counter);
 }
 
 fn word_selection_at_click(
@@ -4229,118 +4498,25 @@ fn copy_text_and_notify(
     *last_drawn_counter = 0;
 }
 
-fn execute_single_click(
-    row: u16,
-    col: u16,
-    open_url_click: bool,
+fn mouse_selection_from_drag(
+    origin: MouseDragOrigin,
+    mouse: MouseEvent,
     fd: &FrameData,
     hide_borders: bool,
-    status_notice: &mut Option<(String, Instant)>,
-    last_drawn_counter: &mut u64,
-) {
-    if open_url_click {
-        if let Some(url) = detect_url_at_click(fd, row, col, hide_borders) {
-            open_url(&url);
-            *status_notice = Some((
-                format!("opening {}", truncate_status_url(&url)),
-                Instant::now() + Duration::from_secs(3),
-            ));
-            return;
-        }
-    }
-    if let Some(text) = single_char_at_click(fd, row, col, hide_borders) {
-        copy_text_and_notify(&text, status_notice, last_drawn_counter);
-    }
-}
-
-fn flush_pending_single_click(
-    pending: &mut Option<PendingSingleClick>,
-    fd: &FrameData,
-    hide_borders: bool,
-    status_notice: &mut Option<(String, Instant)>,
-    last_drawn_counter: &mut u64,
-) {
-    if let Some(click) = pending.take() {
-        execute_single_click(
-            click.row,
-            click.col,
-            click.open_url,
-            fd,
-            hide_borders,
-            status_notice,
-            last_drawn_counter,
-        );
-    }
-}
-
-fn schedule_single_click(
-    pending: &mut Option<PendingSingleClick>,
-    row: u16,
-    col: u16,
-    open_url: bool,
-) {
-    *pending = Some(PendingSingleClick {
-        row,
-        col,
-        deadline: Instant::now() + SINGLE_CLICK_DELAY,
-        open_url,
-    });
-}
-
-fn begin_mouse_down_selection(
-    pending: &mut Option<PendingSingleClick>,
-    fd: &FrameData,
-    mouse_row: u16,
-    mouse_col: u16,
-    hide_borders: bool,
-    status_notice: &mut Option<(String, Instant)>,
-    last_drawn_counter: &mut u64,
 ) -> MouseSelection {
-    if let Some(prev) = pending.take() {
-        if prev.row == mouse_row
-            && prev.col == mouse_col
-            && Instant::now() <= prev.deadline
-        {
-            if let Some(sel) =
-                word_selection_at_click(fd, mouse_row, mouse_col, hide_borders)
-            {
-                return sel;
-            }
-        } else {
-            execute_single_click(
-                prev.row,
-                prev.col,
-                prev.open_url,
-                fd,
-                hide_borders,
-                status_notice,
-                last_drawn_counter,
-            );
-        }
-    }
-    MouseSelection {
-        start_col: mouse_col,
-        start_row: mouse_row,
-        end_col: mouse_col.saturating_add(1),
-        end_row: mouse_row,
-    }
-}
-
-fn copy_drag_selection(
-    fd: &FrameData,
-    sel: &MouseSelection,
-    hide_borders: bool,
-    status_notice: &mut Option<(String, Instant)>,
-    last_drawn_counter: &mut u64,
-) {
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
-    let text = extract_text_from_frame_in_area(
-        fd,
-        sel,
-        server_layout_area(cols, rows),
-        hide_borders,
-    );
-    copy_text_and_notify(&text, status_notice, last_drawn_counter);
+    let fa = server_frame_area(cols, rows);
+    let pa = active_pane_content_rect(fd, fa, hide_borders);
+    MouseSelection {
+        start_col: origin.col,
+        start_row: origin.row,
+        end_col: mouse
+            .column
+            .saturating_add(1)
+            .max(pa.x)
+            .min(pa.x + pa.width),
+        end_row: mouse.row.max(pa.y).min(pa.y + pa.height.saturating_sub(1)),
+    }
 }
 
 struct PaneContentRow {
@@ -4450,11 +4626,12 @@ fn render_mouse_selection(
 ) {
     use ratatui::style::{Color, Modifier, Style};
 
-    let (start_row, start_col, end_row, end_col) =
-        normalized_mouse_selection(sel);
     if selection_is_empty(sel) {
         return;
     }
+
+    let (start_row, start_col, end_row, end_col) =
+        normalized_mouse_selection(sel);
 
     let frame_area = f.area();
     let pa = active_pane_content_rect(
@@ -4606,6 +4783,47 @@ fn slice_by_display_col(s: &str, col_start: usize, col_end: usize) -> String {
         col += w;
     }
     result
+}
+
+fn active_pane_layout_rect(
+    layout: &LayoutJson,
+    area: ratatui::layout::Rect,
+    hide_borders: bool,
+) -> ratatui::layout::Rect {
+    match layout {
+        LayoutJson::Leaf { active: true, .. } => area,
+        LayoutJson::Split {
+            direction,
+            sizes,
+            children,
+        } => {
+            let chunks = split_layout_rects_for_extract(
+                area,
+                direction,
+                sizes,
+                children.len(),
+                hide_borders,
+            );
+            for (child, chunk) in children.iter().zip(chunks.iter()) {
+                let rect = active_pane_layout_rect(child, *chunk, hide_borders);
+                if pane_tree_has_active(child) {
+                    return rect;
+                }
+            }
+            area
+        }
+        LayoutJson::Leaf { .. } => area,
+    }
+}
+
+fn pane_tree_has_active(layout: &LayoutJson) -> bool {
+    match layout {
+        LayoutJson::Leaf { active: true, .. } => true,
+        LayoutJson::Leaf { .. } => false,
+        LayoutJson::Split { children, .. } => {
+            children.iter().any(pane_tree_has_active)
+        }
+    }
 }
 
 fn active_pane_content_rect(
@@ -4789,6 +5007,157 @@ fn split_layout_rects_for_extract(
         offset += dim + gap;
     }
     rects
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MousePointerShape {
+    Default,
+    Text,
+}
+
+impl MousePointerShape {
+    fn osc_name(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Text => "text",
+        }
+    }
+}
+
+fn write_mouse_pointer_shape<W: Write>(
+    writer: &mut W,
+    shape: MousePointerShape,
+) -> io::Result<()> {
+    write!(writer, "\x1b]22;{}\x07", shape.osc_name())?;
+    writer.flush()
+}
+
+fn apply_mouse_pointer_shape<W: Write>(
+    writer: &mut W,
+    applied: &mut Option<MousePointerShape>,
+    desired: Option<MousePointerShape>,
+    force: bool,
+) -> io::Result<()> {
+    let Some(desired) = desired else {
+        return Ok(());
+    };
+    if !force && *applied == Some(desired) {
+        return Ok(());
+    }
+    write_mouse_pointer_shape(writer, desired)?;
+    *applied = Some(desired);
+    Ok(())
+}
+
+fn refresh_mouse_pointer<W: Write>(
+    writer: &mut W,
+    applied: &mut Option<MousePointerShape>,
+    last_mouse_pos: Option<(u16, u16)>,
+    frame: Option<&FrameData>,
+    cols: u16,
+    rows: u16,
+    hide_borders: bool,
+    hide_status: bool,
+    ui_overlay_active: bool,
+    force: bool,
+) -> io::Result<()> {
+    let desired = desired_mouse_pointer_shape(
+        last_mouse_pos,
+        frame,
+        cols,
+        rows,
+        hide_borders,
+        hide_status,
+        ui_overlay_active,
+    );
+    apply_mouse_pointer_shape(writer, applied, desired, force)
+}
+
+fn desired_mouse_pointer_shape(
+    last_mouse_pos: Option<(u16, u16)>,
+    frame: Option<&FrameData>,
+    cols: u16,
+    rows: u16,
+    hide_borders: bool,
+    hide_status: bool,
+    ui_overlay_active: bool,
+) -> Option<MousePointerShape> {
+    if ui_overlay_active {
+        return Some(MousePointerShape::Default);
+    }
+    let (col, row) = last_mouse_pos?;
+    let fd = frame?;
+    Some(mouse_pointer_shape_at(
+        row,
+        col,
+        cols,
+        rows,
+        fd,
+        hide_borders,
+        hide_status,
+    ))
+}
+
+fn mouse_pointer_shape_at(
+    row: u16,
+    col: u16,
+    cols: u16,
+    rows: u16,
+    fd: &FrameData,
+    hide_borders: bool,
+    hide_status: bool,
+) -> MousePointerShape {
+    if row == 0 {
+        return MousePointerShape::Default;
+    }
+    if let Some(status_row) = status_bar_screen_row(rows, hide_status) {
+        if row == status_row {
+            return MousePointerShape::Default;
+        }
+    }
+    let layout_area = server_layout_area(cols, rows);
+    if col < layout_area.x
+        || col >= layout_area.x + layout_area.width
+        || row < layout_area.y
+        || row >= layout_area.y + layout_area.height
+    {
+        return MousePointerShape::Default;
+    }
+    if let (Some(hovered), Some(active)) = (
+        find_pane_id_at(&fd.layout, layout_area, col, row, hide_borders),
+        active_pane_id(&fd.layout),
+    ) {
+        if hovered != active {
+            return MousePointerShape::Default;
+        }
+    }
+    // 应用程序启用了鼠标模式，鼠标事件直接转发给 PTY，不做文字选择
+    if active_mouse_mode(fd) != 0 {
+        return MousePointerShape::Default;
+    }
+    let pane_area =
+        active_pane_layout_rect(&fd.layout, layout_area, hide_borders);
+    // 去掉 border 占用的 1 格，使光标只在真正的内容区内变为 I 型
+    let content_area =
+        if !hide_borders && pane_area.width > 2 && pane_area.height > 2 {
+            ratatui::layout::Rect {
+                x: pane_area.x + 1,
+                y: pane_area.y + 1,
+                width: pane_area.width - 2,
+                height: pane_area.height - 2,
+            }
+        } else {
+            pane_area
+        };
+    if col >= content_area.x
+        && col < content_area.x + content_area.width
+        && row >= content_area.y
+        && row < content_area.y + content_area.height
+    {
+        MousePointerShape::Text
+    } else {
+        MousePointerShape::Default
+    }
 }
 
 fn cursor_style_for_shape(shape: Option<u8>) -> SetCursorStyle {
@@ -5911,6 +6280,104 @@ mod tests {
     }
 
     #[test]
+    fn mouse_pointer_is_text_over_active_pane_content() {
+        let fd = test_frame(vec![test_row("hello", None)]);
+        let (cols, rows) = (80u16, 24u16);
+        let (_, content) = find_active_pane_content(
+            &fd.layout,
+            server_layout_area(cols, rows),
+            true,
+        );
+        assert_eq!(
+            mouse_pointer_shape_at(
+                content.y, content.x, cols, rows, &fd, true, false,
+            ),
+            MousePointerShape::Text
+        );
+        assert_eq!(
+            mouse_pointer_shape_at(0, 0, cols, rows, &fd, true, false),
+            MousePointerShape::Default
+        );
+    }
+
+    #[test]
+    fn mouse_pointer_is_arrow_over_inactive_pane() {
+        let fd = FrameData {
+            frame_type: "frame".to_string(),
+            layout: LayoutJson::Split {
+                direction: "horizontal".to_string(),
+                sizes: vec![50, 50],
+                children: vec![
+                    LayoutJson::Leaf {
+                        id: 1,
+                        rows: 1,
+                        cols: 1,
+                        cursor_row: 0,
+                        cursor_col: 0,
+                        hide_cursor: false,
+                        alternate_screen: false,
+                        mouse_mode: 0,
+                        in_copy_mode: false,
+                        scroll_ratio: None,
+                        cursor_shape: 0,
+                        active: true,
+                        rows_v2: vec![test_row("left", None)],
+                        title: None,
+                    },
+                    LayoutJson::Leaf {
+                        id: 2,
+                        rows: 1,
+                        cols: 1,
+                        cursor_row: 0,
+                        cursor_col: 0,
+                        hide_cursor: false,
+                        alternate_screen: false,
+                        mouse_mode: 0,
+                        in_copy_mode: false,
+                        scroll_ratio: None,
+                        cursor_shape: 0,
+                        active: false,
+                        rows_v2: vec![test_row("right", None)],
+                        title: None,
+                    },
+                ],
+            },
+            status: None,
+            ansi: None,
+            exit: false,
+            yank_text: None,
+        };
+        let (cols, rows) = (101u16, 22u16);
+        let layout_area = server_layout_area(cols, rows);
+        let (_, active_content) =
+            find_active_pane_content(&fd.layout, layout_area, false);
+        assert_eq!(
+            mouse_pointer_shape_at(
+                active_content.y + 1,
+                active_content.x + 1,
+                cols,
+                rows,
+                &fd,
+                false,
+                false,
+            ),
+            MousePointerShape::Text
+        );
+        assert_eq!(
+            mouse_pointer_shape_at(
+                layout_area.y + 1,
+                layout_area.x + 80,
+                cols,
+                rows,
+                &fd,
+                false,
+                false,
+            ),
+            MousePointerShape::Default
+        );
+    }
+
+    #[test]
     fn mouse_copy_supports_reverse_drag_with_exclusive_end() {
         let fd = test_frame(vec![test_row("abcdef", None)]);
         let sel = MouseSelection {
@@ -6228,9 +6695,15 @@ mod tests {
         let layout_area = server_layout_area(80, 24);
         let (_, content_area) =
             find_active_pane_content(&fd.layout, layout_area, true);
+        let sel = MouseSelection {
+            start_col: content_area.x + 1,
+            start_row: content_area.y,
+            end_col: content_area.x + 2,
+            end_row: content_area.y,
+        };
         assert_eq!(
-            single_char_at_click(&fd, content_area.y, content_area.x + 1, true),
-            Some("b".to_string())
+            extract_text_from_frame_in_area(&fd, &sel, layout_area, true),
+            "b"
         );
     }
 
