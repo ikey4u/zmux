@@ -170,6 +170,122 @@ pub fn skip_pane_area_for_ansi(
     mark_layout_area_skip(f, &fd.layout, chunks[0], hide_borders);
 }
 
+/// Repaint a screen rectangle from layout rows_v2 (used to undo selection overlay).
+pub fn write_rows_v2_rect_ansi<W: io::Write>(
+    writer: &mut W,
+    rows_v2: &[RowRunsJson],
+    content_area: Rect,
+    start_row: u16,
+    start_col: u16,
+    end_row: u16,
+    end_col: u16,
+) -> io::Result<()> {
+    use crate::output::{
+        vte_goto, write_style_diff, CharacterStyles, DEFAULT_STYLES,
+    };
+
+    if start_row > end_row || (start_row == end_row && start_col >= end_col) {
+        return Ok(());
+    }
+
+    let sr = start_row
+        .max(content_area.y)
+        .min(content_area.y + content_area.height.saturating_sub(1));
+    let sc = start_col
+        .max(content_area.x)
+        .min(content_area.x + content_area.width.saturating_sub(1));
+    let er = end_row
+        .max(content_area.y)
+        .min(content_area.y + content_area.height.saturating_sub(1));
+    let ec = end_col
+        .max(content_area.x)
+        .min(content_area.x + content_area.width);
+    if sr == er && sc >= ec {
+        return Ok(());
+    }
+
+    let mut buf = String::new();
+    let mut current = DEFAULT_STYLES;
+    let max_cols = content_area.width as usize;
+
+    for row in sr..=er {
+        let col_begin = if row == sr { sc } else { content_area.x };
+        let col_end = if row == er {
+            ec
+        } else {
+            content_area.x + content_area.width
+        };
+        let pane_row = (row - content_area.y) as usize;
+        let Some(row_data) = rows_v2.get(pane_row) else {
+            continue;
+        };
+        let pane_col_begin =
+            (col_begin.saturating_sub(content_area.x)) as usize;
+        let pane_col_end =
+            ((col_end.saturating_sub(content_area.x)) as usize).min(max_cols);
+        if pane_col_begin >= pane_col_end {
+            continue;
+        }
+
+        let y = row;
+        let mut col = 0usize;
+        for run in &row_data.runs {
+            if col >= max_cols {
+                break;
+            }
+            let style =
+                CharacterStyles::from_layout_run(&run.fg, &run.bg, run.flags);
+            for ch in run.text.chars() {
+                if col >= max_cols {
+                    break;
+                }
+                let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+                if col >= pane_col_end {
+                    break;
+                }
+                if col + w > pane_col_begin {
+                    vte_goto(content_area.x + col as u16, y, &mut buf);
+                    write_style_diff(&mut current, style, &mut buf);
+                    buf.push(ch);
+                }
+                col += w;
+            }
+        }
+    }
+
+    if !buf.is_empty() {
+        writer.write_all(buf.as_bytes())?;
+        writer.flush()?;
+    }
+    Ok(())
+}
+
+pub fn restore_mouse_selection_ansi<W: io::Write>(
+    writer: &mut W,
+    fd: &FrameData,
+    start_row: u16,
+    start_col: u16,
+    end_row: u16,
+    end_col: u16,
+    layout_area: Rect,
+    hide_borders: bool,
+) -> io::Result<()> {
+    let Some((rows_v2, content_area)) =
+        active_pane_rows_v2(&fd.layout, layout_area, hide_borders)
+    else {
+        return Ok(());
+    };
+    write_rows_v2_rect_ansi(
+        writer,
+        rows_v2,
+        content_area,
+        start_row,
+        start_col,
+        end_row,
+        end_col,
+    )
+}
+
 /// Repaint the active pane from layout JSON before drawing a mouse selection overlay.
 /// Server-side ANSI skips unchanged panes, so the client must restore the active pane
 /// when only the selection bounds change.
