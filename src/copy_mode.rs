@@ -398,33 +398,58 @@ pub fn move_right(pane: &mut Pane) {
 }
 
 pub fn move_up(pane: &mut Pane) {
-    with_state(pane, |state, width, height| {
-        rebuild_wrapped(state, width, height);
-        let (row_idx, _) = current_display_position(state);
-        if row_idx > 0 {
-            state.cursor = point_from_display_position(
-                state,
-                row_idx - 1,
-                state.preferred_column,
-            );
-        }
-        ensure_cursor_visible(state, height);
+    with_state(pane, |state, _, height| {
+        move_vertical(state, -1, height);
     });
 }
 
 pub fn move_down(pane: &mut Pane) {
-    with_state(pane, |state, width, height| {
-        rebuild_wrapped(state, width, height);
-        let (row_idx, _) = current_display_position(state);
-        if row_idx + 1 < state.wrapped.rows.len() {
-            state.cursor = point_from_display_position(
-                state,
-                row_idx + 1,
-                state.preferred_column,
-            );
-        }
-        ensure_cursor_visible(state, height);
+    with_state(pane, |state, _, height| {
+        move_vertical(state, 1, height);
     });
+}
+
+/// Vertical movement in copy mode. Line selection (`V`) moves by logical
+/// snapshot lines; all other modes move by wrapped display rows.
+fn move_vertical(state: &mut CopyModeState, delta: isize, height: usize) {
+    if state.selection_mode == SelectionMode::Line {
+        move_by_logical_line(state, delta);
+    } else {
+        move_by_display_row(state, delta);
+    }
+    state.preferred_column = current_display_position(state).1;
+    ensure_cursor_visible(state, height);
+}
+
+fn move_by_logical_line(state: &mut CopyModeState, delta: isize) {
+    if delta == 0 {
+        return;
+    }
+    let last_line = state.snapshot.lines.len().saturating_sub(1);
+    if delta < 0 {
+        state.cursor.line = state.cursor.line.saturating_sub((-delta) as usize);
+    } else {
+        state.cursor.line = (state.cursor.line + delta as usize).min(last_line);
+    }
+    state.cursor.col = 0;
+    state.cursor = clamp_point(&state.snapshot, state.cursor);
+}
+
+fn move_by_display_row(state: &mut CopyModeState, delta: isize) {
+    if delta == 0 {
+        return;
+    }
+    let (row_idx, _) = current_display_position(state);
+    let max_row = state.wrapped.rows.len().saturating_sub(1);
+    let target = if delta < 0 {
+        row_idx.saturating_sub((-delta) as usize)
+    } else {
+        (row_idx + delta as usize).min(max_row)
+    };
+    if target != row_idx {
+        state.cursor =
+            point_from_display_position(state, target, state.preferred_column);
+    }
 }
 
 pub fn page_up(pane: &mut Pane) {
@@ -462,7 +487,9 @@ pub fn scroll_up(pane: &mut Pane, lines: usize) -> CopyScrollResult {
     };
     rebuild_wrapped(state, width, height);
     state.scroll_top = state.scroll_top.saturating_sub(lines);
-    sync_cursor_to_visible_viewport(state, height);
+    if state.anchor.is_none() {
+        sync_cursor_to_visible_viewport(state, height);
+    }
     if entering {
         CopyScrollResult::Entered
     } else {
@@ -486,7 +513,9 @@ pub fn scroll_down(pane: &mut Pane, lines: usize) -> CopyScrollResult {
         exit(pane);
         return CopyScrollResult::Exited;
     }
-    sync_cursor_to_visible_viewport(state, height);
+    if state.anchor.is_none() {
+        sync_cursor_to_visible_viewport(state, height);
+    }
     CopyScrollResult::Scrolled
 }
 
@@ -1546,7 +1575,10 @@ enum StyleKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::history::{PaneTextSnapshot, SnapshotLine};
+    use crate::types::{
+        history::{PaneTextSnapshot, SnapshotLine},
+        SelectionMode,
+    };
 
     fn snapshot(lines: &[&str]) -> PaneTextSnapshot {
         PaneTextSnapshot {
@@ -1790,5 +1822,73 @@ mod tests {
         let (row, _) = current_display_position(&state);
         assert!(row >= state.scroll_top);
         assert!(row < state.scroll_top + 4);
+    }
+
+    #[test]
+    fn line_selection_moves_by_logical_line_not_wrapped_row() {
+        let long = "abcdefghijklmnopqrstuvwxyz";
+        let mut state = CopyModeState::new(snapshot(&[long, "short", "tail"]));
+        rebuild_wrapped(&mut state, 10, 3);
+        state.selection_mode = SelectionMode::Line;
+        state.anchor = Some(CopyPoint { line: 0, col: 0 });
+        state.cursor = CopyPoint { line: 0, col: 0 };
+
+        move_vertical(&mut state, 1, 3);
+
+        assert_eq!(state.cursor.line, 1);
+        assert_eq!(state.cursor.col, 0);
+        assert_eq!(selection_text(&state), format!("{}\nshort", long));
+    }
+
+    #[test]
+    fn line_selection_k_shrinks_selection() {
+        let mut state = CopyModeState::new(snapshot(&["one", "two", "three"]));
+        rebuild_wrapped(&mut state, 20, 3);
+        state.selection_mode = SelectionMode::Line;
+        state.anchor = Some(CopyPoint { line: 0, col: 0 });
+        state.cursor = CopyPoint { line: 2, col: 0 };
+
+        move_vertical(&mut state, -1, 3);
+
+        assert_eq!(state.cursor.line, 1);
+        assert_eq!(selection_text(&state), "one\ntwo");
+    }
+
+    #[test]
+    fn line_selection_j_scrolls_when_cursor_leaves_viewport() {
+        let lines: Vec<String> = (0..12).map(|i| i.to_string()).collect();
+        let line_refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let mut state = CopyModeState::new(snapshot(&line_refs));
+        rebuild_wrapped(&mut state, 10, 4);
+        state.scroll_top = 0;
+        state.selection_mode = SelectionMode::Line;
+        state.anchor = Some(CopyPoint { line: 0, col: 0 });
+        state.cursor = CopyPoint { line: 3, col: 0 };
+
+        move_vertical(&mut state, 1, 4);
+
+        assert_eq!(state.cursor.line, 4);
+        let (row, _) = current_display_position(&state);
+        assert!(row >= state.scroll_top);
+        assert!(row < state.scroll_top + 4);
+    }
+
+    #[test]
+    fn scroll_up_preserves_cursor_when_selection_active() {
+        let mut state = CopyModeState::new(snapshot(&[
+            "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11",
+        ]));
+        rebuild_wrapped(&mut state, 10, 4);
+        state.scroll_top = state.wrapped.rows.len().saturating_sub(4);
+        state.selection_mode = SelectionMode::Line;
+        state.anchor = Some(CopyPoint { line: 8, col: 0 });
+        state.cursor = CopyPoint { line: 10, col: 0 };
+        let cursor = state.cursor;
+        let anchor = state.anchor;
+
+        state.scroll_top = state.scroll_top.saturating_sub(3);
+
+        assert_eq!(state.cursor, cursor);
+        assert_eq!(state.anchor, anchor);
     }
 }
