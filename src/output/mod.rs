@@ -25,8 +25,17 @@ use crate::{
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FrameAnsiOptions {
-    /// Prepend `\x1b[2J` before painting pane content.
+    /// Destructively clear the whole pane area before painting. Needed only when the
+    /// layout geometry changed (panes added/removed/resized, active pane switched),
+    /// since otherwise per-pane repaints fully overwrite their own cells. Doing this
+    /// every frame causes a full-screen blank flash (flicker).
     pub clear_display: bool,
+    /// Repaint every pane regardless of its dirty flag. The client frame transport is a
+    /// lossy single-slot pull: the server may overwrite an unsent frame, so an
+    /// incremental (dirty-only) frame can be dropped and its update lost, making other
+    /// panes' text vanish. Forcing a full repaint each frame keeps every pane correct
+    /// without the destructive clear above.
+    pub force_repaint: bool,
 }
 
 fn border_styles(active: bool) -> CharacterStyles {
@@ -306,7 +315,10 @@ fn layout_color_str(name: &str, fg: bool) -> Color {
 }
 
 fn pane_paint_pending(pane: &Pane, opts: &FrameAnsiOptions) -> bool {
-    if opts.clear_display || pane.render_dirty.load(Ordering::Relaxed) {
+    if opts.clear_display
+        || opts.force_repaint
+        || pane.render_dirty.load(Ordering::Relaxed)
+    {
         return true;
     }
     pane.parser
@@ -356,6 +368,11 @@ fn write_pane(
     }
     let has_border = !hide_borders && area.width > 2 && area.height > 2;
     let inner = content_area(area, has_border);
+    // Erase the pane's own inner rect before repainting. `write_terminal_row` advances
+    // by each cell's display width, so wide-char spacer columns (and stale graphemes
+    // left by a shrinking line) are not always overwritten in place; clearing first
+    // guarantees no ghost cells survive. This is a localized erase emitted in the same
+    // ANSI blob as the repaint, so it does not flicker like a full-screen clear would.
     write_erase_rect(inner, out);
     if pane.copy_state.is_some() {
         let pane_defaults = pane
@@ -907,6 +924,7 @@ mod tests {
         let dirty = Arc::new(AtomicBool::new(false));
         let opts = FrameAnsiOptions {
             clear_display: true,
+            force_repaint: false,
         };
         assert!(opts.clear_display || dirty.load(Ordering::Relaxed));
     }

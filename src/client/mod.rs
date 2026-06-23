@@ -1628,41 +1628,40 @@ impl ClientApp {
                             (frame.as_ref(), mouse_select.as_ref())
                         {
                             let layout_area = server_layout_area(cols, rows);
-                            if let Some(prev) = last_drawn_mouse_select {
-                                if !mouse_selection_bounds_eq(&prev, sel) {
-                                    let (sr, sc, er, ec) =
+                            let selection_changed = last_drawn_mouse_select
+                                .is_none_or(|prev| {
+                                    !mouse_selection_bounds_eq(&prev, sel)
+                                });
+                            if selection_changed {
+                                let (sr, sc, er, ec) = sel.normalized_bounds();
+                                let mut repaint_start = sr;
+                                let mut repaint_end = er;
+                                if let Some(prev) = last_drawn_mouse_select {
+                                    let (prev_sr, _, prev_er, _) =
                                         prev.normalized_bounds();
-                                    if let Err(err) =
-                                        restore_mouse_selection_ansi(
-                                            terminal.backend_mut(),
-                                            fd,
-                                            sr,
-                                            sc,
-                                            er,
-                                            ec,
-                                            layout_area,
-                                            hide_borders,
-                                        )
-                                    {
-                                        log_client(&format!(
-                                            "failed to restore selection region: {err}"
-                                        ));
-                                    }
+                                    repaint_start = repaint_start.min(prev_sr);
+                                    repaint_end = repaint_end.max(prev_er);
                                 }
+                                if let Err(err) =
+                                    write_active_pane_selection_ansi(
+                                        terminal.backend_mut(),
+                                        fd,
+                                        layout_area,
+                                        hide_borders,
+                                        repaint_start,
+                                        repaint_end,
+                                        sr,
+                                        sc,
+                                        er,
+                                        ec,
+                                    )
+                                {
+                                    log_client(&format!(
+                                        "failed to draw selection overlay: {err}"
+                                    ));
+                                }
+                                last_drawn_mouse_select = Some(*sel);
                             }
-                            if let Err(err) = write_mouse_selection_ansi(
-                                terminal.backend_mut(),
-                                fd,
-                                sel,
-                                cols,
-                                rows,
-                                hide_borders,
-                            ) {
-                                log_client(&format!(
-                                    "failed to write selection ansi: {err}"
-                                ));
-                            }
-                            last_drawn_mouse_select = Some(*sel);
                         }
                     }
                     if let Some(ref fd) = frame {
@@ -4524,73 +4523,6 @@ struct PaneContentRow {
     line: Option<usize>,
 }
 
-fn write_mouse_selection_ansi<W: Write>(
-    writer: &mut W,
-    fd: &FrameData,
-    sel: &MouseSelection,
-    cols: u16,
-    rows: u16,
-    hide_borders: bool,
-) -> io::Result<()> {
-    let (start_row, start_col, end_row, end_col) =
-        normalized_mouse_selection(sel);
-    if selection_is_empty(sel) {
-        return Ok(());
-    }
-    let layout_area = server_layout_area(cols, rows);
-    let (pane_rows, content_area) =
-        find_active_pane_content(&fd.layout, layout_area, hide_borders);
-    if pane_rows.is_empty() {
-        return Ok(());
-    }
-    let sr = start_row
-        .max(content_area.y)
-        .min(content_area.y + content_area.height.saturating_sub(1));
-    let sc = start_col
-        .max(content_area.x)
-        .min(content_area.x + content_area.width.saturating_sub(1));
-    let er = end_row
-        .max(content_area.y)
-        .min(content_area.y + content_area.height.saturating_sub(1));
-    let ec = end_col
-        .max(content_area.x)
-        .min(content_area.x + content_area.width);
-    if sr == er && sc >= ec {
-        return Ok(());
-    }
-    for row in sr..=er {
-        let col_begin = if row == sr { sc } else { content_area.x };
-        let col_end = if row == er {
-            ec
-        } else {
-            content_area.x + content_area.width
-        };
-        let pane_row = (row - content_area.y) as usize;
-        let Some(row_data) = pane_rows.get(pane_row) else {
-            continue;
-        };
-        let mut col = col_begin;
-        while col < col_end {
-            let pane_col = (col - content_area.x) as usize;
-            let Some((ch, width)) =
-                glyph_at_display_col(&row_data.text, pane_col)
-            else {
-                col += 1;
-                continue;
-            };
-            write!(
-                writer,
-                "\x1b[{};{}H\x1b[30;46m{}\x1b[m",
-                row + 1,
-                col + 1,
-                ch
-            )?;
-            col = col.saturating_add(width.max(1));
-        }
-    }
-    writer.flush()
-}
-
 fn normalized_mouse_selection(sel: &MouseSelection) -> (u16, u16, u16, u16) {
     let end_inclusive_col = sel.end_col.saturating_sub(1);
     if (sel.start_row, sel.start_col) <= (sel.end_row, end_inclusive_col) {
@@ -4603,19 +4535,6 @@ fn normalized_mouse_selection(sel: &MouseSelection) -> (u16, u16, u16, u16) {
             sel.start_col.saturating_add(1),
         )
     }
-}
-
-fn glyph_at_display_col(s: &str, target_col: usize) -> Option<(char, u16)> {
-    use unicode_width::UnicodeWidthChar;
-    let mut col = 0usize;
-    for ch in s.chars() {
-        let width = ch.width().unwrap_or(1) as u16;
-        if target_col >= col && target_col < col + width as usize {
-            return Some((ch, width));
-        }
-        col += width as usize;
-    }
-    None
 }
 
 fn render_mouse_selection(
@@ -6806,6 +6725,7 @@ mod tests {
                 true,
                 FrameAnsiOptions {
                     clear_display: true,
+                    force_repaint: true,
                 },
             );
             assert!(

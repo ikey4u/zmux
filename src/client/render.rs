@@ -339,6 +339,120 @@ pub fn write_active_pane_layout_ansi<W: io::Write>(
     writer.flush()
 }
 
+/// Repaint the rows spanned by a mouse selection (plus any rows that previously held
+/// a selection) directly from `rows_v2`, drawing the selection highlight inline.
+///
+/// Painting the full width of each affected row from the authoritative layout data —
+/// instead of overlaying only the selected glyphs — prevents earlier text on the line
+/// from being swallowed. Because the background text and the highlight are produced in
+/// one pass from the same source and advance through the row identically to the way the
+/// server paints it, every glyph stays at its exact column and the selection cannot
+/// drift sideways.
+#[allow(clippy::too_many_arguments)]
+pub fn write_active_pane_selection_ansi<W: io::Write>(
+    writer: &mut W,
+    fd: &FrameData,
+    layout_area: Rect,
+    hide_borders: bool,
+    repaint_start_row: u16,
+    repaint_end_row: u16,
+    sel_start_row: u16,
+    sel_start_col: u16,
+    sel_end_row: u16,
+    sel_end_col: u16,
+) -> io::Result<()> {
+    use crate::output::{
+        vte_goto, write_style_diff, CharacterStyles, RESET_STYLES,
+    };
+
+    let Some((rows_v2, content_area)) =
+        active_pane_rows_v2(&fd.layout, layout_area, hide_borders)
+    else {
+        return Ok(());
+    };
+    if content_area.width == 0 || content_area.height == 0 {
+        return Ok(());
+    }
+
+    let content_top = content_area.y;
+    let content_bottom = content_area.y + content_area.height.saturating_sub(1);
+    let start = repaint_start_row.max(content_top).min(content_bottom);
+    let end = repaint_end_row.max(content_top).min(content_bottom);
+    if start > end {
+        return Ok(());
+    }
+    let row_left = content_area.x;
+    let row_right = content_area.x + content_area.width; // exclusive
+    let max_cols = content_area.width as usize;
+    let highlight = CharacterStyles::from_layout_run("black", "cyan", 0);
+    let reset_cell = CharacterStyles::from_layout_run("default", "default", 0);
+
+    let mut buf = String::new();
+    for y in start..=end {
+        let pane_row = (y - content_area.y) as usize;
+        let Some(row_data) = rows_v2.get(pane_row) else {
+            continue;
+        };
+
+        // Highlighted column span for this row (absolute, half-open [begin, end)).
+        let (hl_begin, hl_end) = if y < sel_start_row || y > sel_end_row {
+            (0u16, 0u16)
+        } else {
+            let begin = if y == sel_start_row {
+                sel_start_col
+            } else {
+                row_left
+            };
+            let end_col = if y == sel_end_row {
+                sel_end_col
+            } else {
+                row_right
+            };
+            (begin.max(row_left), end_col.min(row_right))
+        };
+
+        vte_goto(content_area.x, y, &mut buf);
+        // vte_goto emits `\x1b[m`, so the physical terminal is at default style.
+        let mut current = RESET_STYLES;
+        let mut col = 0usize;
+        for run in &row_data.runs {
+            if col >= max_cols {
+                break;
+            }
+            let normal =
+                CharacterStyles::from_layout_run(&run.fg, &run.bg, run.flags);
+            for ch in run.text.chars() {
+                if col >= max_cols {
+                    break;
+                }
+                let abs_col = content_area.x + col as u16;
+                let selected = hl_begin < hl_end
+                    && abs_col >= hl_begin
+                    && abs_col < hl_end;
+                let style = if selected { highlight } else { normal };
+                write_style_diff(&mut current, style, &mut buf);
+                buf.push(ch);
+                col += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+            }
+        }
+        // `rows_v2` normally spans the full width, but guard against short rows so
+        // stale highlight cells from a previous, wider selection get cleared.
+        while col < max_cols {
+            let abs_col = content_area.x + col as u16;
+            let selected =
+                hl_begin < hl_end && abs_col >= hl_begin && abs_col < hl_end;
+            let style = if selected { highlight } else { reset_cell };
+            write_style_diff(&mut current, style, &mut buf);
+            buf.push(' ');
+            col += 1;
+        }
+    }
+    // Leave the terminal in a clean style state for the cursor and later writes.
+    buf.push_str("\x1b[m");
+    writer.write_all(buf.as_bytes())?;
+    writer.flush()
+}
+
 fn active_pane_rows_v2<'a>(
     layout: &'a LayoutJson,
     area: Rect,
@@ -2528,5 +2642,310 @@ mod tests {
         };
 
         assert_eq!(active_cursor_shape(&fd), None);
+    }
+
+    fn cellrun(text: &str, fg: &str) -> CellRunJson {
+        CellRunJson {
+            text: text.to_string(),
+            fg: fg.to_string(),
+            bg: "default".to_string(),
+            flags: 0,
+            width: unicode_display_width(text) as u16,
+        }
+    }
+
+    fn row_from_runs(runs: Vec<CellRunJson>) -> RowRunsJson {
+        let end_col = runs.iter().map(|r| r.width as usize).sum();
+        RowRunsJson {
+            runs,
+            line: None,
+            start_col: 0,
+            end_col,
+        }
+    }
+
+    fn active_leaf_frame(cols: u16, rows_v2: Vec<RowRunsJson>) -> FrameData {
+        FrameData {
+            frame_type: "frame".to_string(),
+            layout: LayoutJson::Leaf {
+                id: 1,
+                rows: rows_v2.len() as u16,
+                cols,
+                cursor_row: 0,
+                cursor_col: 0,
+                hide_cursor: false,
+                alternate_screen: false,
+                mouse_mode: 0,
+                in_copy_mode: false,
+                scroll_ratio: None,
+                cursor_shape: 0,
+                active: true,
+                rows_v2,
+                title: None,
+            },
+            status: None,
+            ansi: None,
+            exit: false,
+            yank_text: None,
+        }
+    }
+
+    /// Decode the raw ANSI the selection overlay emits into `(row, col, char,
+    /// highlighted)` cells. The overlay uses absolute cursor jumps and SGR
+    /// background `46` (cyan) for the highlight, so we replay those to learn where
+    /// each glyph actually lands and whether it is highlighted.
+    fn decode_selection_ansi(out: &str) -> Vec<(u16, u16, char, bool)> {
+        use unicode_width::UnicodeWidthChar;
+        let mut cells = Vec::new();
+        let mut row = 0u16;
+        let mut col = 0u16;
+        let mut bg_cyan = false;
+        let mut chars = out.chars();
+        while let Some(c) = chars.next() {
+            if c != '\x1b' {
+                cells.push((row, col, c, bg_cyan));
+                col += UnicodeWidthChar::width(c).unwrap_or(1) as u16;
+                continue;
+            }
+            if chars.next() != Some('[') {
+                continue;
+            }
+            let mut params = String::new();
+            let final_byte = loop {
+                match chars.next() {
+                    Some(ch) if ch.is_ascii_digit() || ch == ';' => {
+                        params.push(ch)
+                    }
+                    Some(ch) => break ch,
+                    None => return cells,
+                }
+            };
+            match final_byte {
+                'H' => {
+                    let mut it = params.split(';');
+                    let r = it
+                        .next()
+                        .and_then(|s| s.parse::<u16>().ok())
+                        .unwrap_or(1);
+                    let cc = it
+                        .next()
+                        .and_then(|s| s.parse::<u16>().ok())
+                        .unwrap_or(1);
+                    row = r.saturating_sub(1);
+                    col = cc.saturating_sub(1);
+                }
+                'm' => {
+                    if params.is_empty() {
+                        bg_cyan = false;
+                    } else {
+                        for p in params.split(';') {
+                            match p {
+                                "0" | "" => bg_cyan = false,
+                                "46" => bg_cyan = true,
+                                "49" => bg_cyan = false,
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        cells
+    }
+
+    fn row_cells(
+        cells: &[(u16, u16, char, bool)],
+        row: u16,
+    ) -> Vec<(u16, char, bool)> {
+        cells
+            .iter()
+            .filter(|c| c.0 == row)
+            .map(|c| (c.1, c.2, c.3))
+            .collect()
+    }
+
+    #[test]
+    fn selection_overlay_keeps_full_row_and_highlights_exact_columns() {
+        // Regression: selecting "BC" in "ABCDEFG" must keep every glyph on the
+        // line (no swallow) and place B/C at their original columns (no drift).
+        let fd = active_leaf_frame(
+            7,
+            vec![row_from_runs(vec![cellrun("ABCDEFG", "default")])],
+        );
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 7,
+            height: 1,
+        };
+        let mut out = Vec::new();
+        write_active_pane_selection_ansi(
+            &mut out, &fd, area, true, 0, 0, 0, 1, 0, 3,
+        )
+        .unwrap();
+        let cells = decode_selection_ansi(&String::from_utf8(out).unwrap());
+        assert_eq!(
+            row_cells(&cells, 0),
+            vec![
+                (0, 'A', false),
+                (1, 'B', true),
+                (2, 'C', true),
+                (3, 'D', false),
+                (4, 'E', false),
+                (5, 'F', false),
+                (6, 'G', false),
+            ]
+        );
+    }
+
+    #[test]
+    fn selection_overlay_preserves_styled_prefix_before_selection() {
+        // Regression for the "deleted by us:" swallow: selecting text after a
+        // styled prefix must repaint the whole line, leaving the prefix intact
+        // and unhighlighted.
+        let prefix = "deleted by us: ";
+        let suffix = "file";
+        let prefix_len = unicode_display_width(prefix) as u16;
+        let cols =
+            unicode_display_width(prefix) + unicode_display_width(suffix);
+        let fd = active_leaf_frame(
+            cols as u16,
+            vec![row_from_runs(vec![
+                cellrun(prefix, "red"),
+                cellrun(suffix, "default"),
+            ])],
+        );
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: cols as u16,
+            height: 1,
+        };
+        let mut out = Vec::new();
+        write_active_pane_selection_ansi(
+            &mut out,
+            &fd,
+            area,
+            true,
+            0,
+            0,
+            0,
+            prefix_len,
+            0,
+            cols as u16,
+        )
+        .unwrap();
+        let cells = decode_selection_ansi(&String::from_utf8(out).unwrap());
+        let text: String = row_cells(&cells, 0).iter().map(|c| c.1).collect();
+        assert_eq!(text, format!("{prefix}{suffix}"));
+        assert!(cells
+            .iter()
+            .filter(|c| c.0 == 0 && c.1 < prefix_len)
+            .all(|c| !c.3));
+        assert!(cells
+            .iter()
+            .filter(|c| c.0 == 0 && c.1 >= prefix_len)
+            .all(|c| c.3));
+    }
+
+    #[test]
+    fn selection_overlay_clears_previously_highlighted_cells() {
+        // Regression: when the selection shrinks, repainting the full row must
+        // clear stale highlight so only the current selection stays highlighted.
+        let fd = active_leaf_frame(
+            7,
+            vec![row_from_runs(vec![cellrun("ABCDEFG", "default")])],
+        );
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 7,
+            height: 1,
+        };
+        let mut out = Vec::new();
+        write_active_pane_selection_ansi(
+            &mut out, &fd, area, true, 0, 0, 0, 2, 0, 3,
+        )
+        .unwrap();
+        let cells = decode_selection_ansi(&String::from_utf8(out).unwrap());
+        let highlighted: Vec<(u16, char)> = cells
+            .iter()
+            .filter(|c| c.0 == 0 && c.3)
+            .map(|c| (c.1, c.2))
+            .collect();
+        assert_eq!(highlighted, vec![(2, 'C')]);
+    }
+
+    #[test]
+    fn selection_overlay_handles_wide_chars_without_drift() {
+        // Regression: a double-width glyph must keep following text at the right
+        // column. "A你B": 你 spans cols 1..3, B sits at col 3.
+        let fd = active_leaf_frame(
+            4,
+            vec![row_from_runs(vec![cellrun("A你B", "default")])],
+        );
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 1,
+        };
+        let mut out = Vec::new();
+        write_active_pane_selection_ansi(
+            &mut out, &fd, area, true, 0, 0, 0, 1, 0, 3,
+        )
+        .unwrap();
+        let cells = decode_selection_ansi(&String::from_utf8(out).unwrap());
+        assert_eq!(
+            row_cells(&cells, 0),
+            vec![(0, 'A', false), (1, '你', true), (3, 'B', false)]
+        );
+    }
+
+    #[test]
+    fn selection_overlay_spans_multiple_rows() {
+        // Regression: a block selection from (row0,col2) to (row1,col2) must
+        // highlight the tail of the first row and the head of the second row,
+        // while keeping all glyphs in place.
+        let fd = active_leaf_frame(
+            5,
+            vec![
+                row_from_runs(vec![cellrun("ABCDE", "default")]),
+                row_from_runs(vec![cellrun("FGHIJ", "default")]),
+            ],
+        );
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 5,
+            height: 2,
+        };
+        let mut out = Vec::new();
+        write_active_pane_selection_ansi(
+            &mut out, &fd, area, true, 0, 1, 0, 2, 1, 2,
+        )
+        .unwrap();
+        let cells = decode_selection_ansi(&String::from_utf8(out).unwrap());
+        assert_eq!(
+            row_cells(&cells, 0),
+            vec![
+                (0, 'A', false),
+                (1, 'B', false),
+                (2, 'C', true),
+                (3, 'D', true),
+                (4, 'E', true),
+            ]
+        );
+        assert_eq!(
+            row_cells(&cells, 1),
+            vec![
+                (0, 'F', true),
+                (1, 'G', true),
+                (2, 'H', false),
+                (3, 'I', false),
+                (4, 'J', false),
+            ]
+        );
     }
 }
