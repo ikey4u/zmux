@@ -625,6 +625,9 @@ where
 
     log_server("entering main loop");
     let mut pending_yank: Option<String> = None;
+    // Per-connection geometry tracking: only do a destructive full-screen clear when
+    // the layout actually changes, otherwise repaint all panes in place (no flicker).
+    let mut last_layout_fp: Option<u64> = None;
     loop {
         let line = match recv_line(&mut reader) {
             Ok(l) if l.is_empty() => {
@@ -766,6 +769,13 @@ where
                             Some(w) => w,
                             None => continue,
                         };
+                    let layout_fp = layout_fingerprint(
+                        win,
+                        frame_ansi_area(sz),
+                        s.hide_borders,
+                    );
+                    let clear_display = last_layout_fp != Some(layout_fp);
+                    last_layout_fp = Some(layout_fp);
                     build_frame_json(
                         session,
                         win,
@@ -774,7 +784,8 @@ where
                         s.hide_borders,
                         sz,
                         FrameAnsiOptions {
-                            clear_display: true,
+                            clear_display,
+                            force_repaint: true,
                         },
                     )
                 }
@@ -1025,6 +1036,7 @@ fn refresh_latest_frame(
         size,
         FrameAnsiOptions {
             clear_display: true,
+            force_repaint: true,
         },
     );
     if let Ok(fd) = serde_json::from_str::<FrameData>(&json) {
@@ -1349,7 +1361,10 @@ fn render_loop(
                 win,
                 ansi_area,
                 s.hide_borders,
-                FrameAnsiOptions { clear_display },
+                FrameAnsiOptions {
+                    clear_display,
+                    force_repaint: false,
+                },
             );
             let ansi_b64 = encode_ansi_base64(&ansi);
             format!(
@@ -2569,6 +2584,143 @@ mod tests {
         let win = &state.sessions[0].windows[0];
         let after = layout_fingerprint(win, area, false);
         assert_ne!(before, after);
+        Ok(())
+    }
+
+    fn set_all_render_dirty(node: &LayoutNode, dirty: bool) {
+        match node {
+            LayoutNode::Leaf(pane) => {
+                pane.render_dirty.store(dirty, Ordering::Relaxed)
+            }
+            LayoutNode::Split { children, .. } => {
+                for child in children {
+                    set_all_render_dirty(child, dirty);
+                }
+            }
+        }
+    }
+
+    fn corner_count(ansi: &str) -> usize {
+        ansi.matches('┌').count()
+    }
+
+    #[test]
+    fn force_repaint_paints_all_panes_without_destructive_clear(
+    ) -> io::Result<()> {
+        // Two-pane layout. Regression for "other pane's text disappears" and
+        // "panes flicker": a steady-state frame (no layout change) must repaint
+        // every pane (force_repaint) yet must NOT emit the full-screen clear.
+        let sz = Size::new(24, 80);
+        let mut state = Server::new();
+        make_session(&mut state, "0", sz)?;
+        let mut split = ParsedCommand::parse("split-window -h");
+        cmd_split_window(&mut state, &split.remove(0), sz);
+
+        let win = &state.sessions[0].windows[0];
+        let area = frame_ansi_area(sz);
+
+        // Even with every pane marked clean, force_repaint repaints all panes.
+        set_all_render_dirty(&win.root, false);
+        let repainted = serialize_frame_ansi(
+            win,
+            area,
+            false,
+            FrameAnsiOptions {
+                clear_display: false,
+                force_repaint: true,
+            },
+        );
+        assert!(
+            !repainted.contains("\x1b[K"),
+            "steady-state force_repaint must not emit a destructive screen clear"
+        );
+        assert!(
+            corner_count(&repainted) >= 2,
+            "force_repaint must repaint both panes even when clean, got: {repainted:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn clean_panes_are_skipped_without_force_repaint() -> io::Result<()> {
+        // Incremental frames (no force_repaint, no clear) skip clean panes — this is
+        // exactly why a dropped incremental frame loses content, which force_repaint
+        // on the FRAME? path now prevents.
+        let sz = Size::new(24, 80);
+        let mut state = Server::new();
+        make_session(&mut state, "0", sz)?;
+        let mut split = ParsedCommand::parse("split-window -h");
+        cmd_split_window(&mut state, &split.remove(0), sz);
+
+        let win = &state.sessions[0].windows[0];
+        let area = frame_ansi_area(sz);
+
+        set_all_render_dirty(&win.root, false);
+        let incremental =
+            serialize_frame_ansi(win, area, false, FrameAnsiOptions::default());
+        assert_eq!(
+            corner_count(&incremental),
+            0,
+            "clean panes must be skipped without force_repaint/clear_display"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn pane_repaint_erases_inner_to_prevent_ghosts() -> io::Result<()> {
+        // Regression for stale "ghost" cells: every pane must erase its own inner
+        // rect before repainting, because the content pass advances by display width
+        // and can leave wide-char spacer cells (and shrinking-line leftovers)
+        // untouched. The erase pass positions the cursor at each inner row start, the
+        // same spot the content pass uses, so each inner row is positioned twice.
+        let sz = Size::new(24, 80);
+        let mut state = Server::new();
+        make_session(&mut state, "0", sz)?;
+
+        let win = &state.sessions[0].windows[0];
+        let ansi = serialize_frame_ansi(
+            win,
+            frame_ansi_area(sz),
+            false,
+            FrameAnsiOptions {
+                clear_display: false,
+                force_repaint: true,
+            },
+        );
+        // Inner origin for an 80x24 bordered pane is screen col 2, row 3 (1-based).
+        let inner_row0_goto = "\x1b[3;2H";
+        assert!(
+            ansi.matches(inner_row0_goto).count() >= 2,
+            "pane inner must be erased before repaint (erase pass + content pass), \
+             got count {} in: {ansi:?}",
+            ansi.matches(inner_row0_goto).count()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn clear_display_emits_full_screen_clear() -> io::Result<()> {
+        let sz = Size::new(24, 80);
+        let mut state = Server::new();
+        make_session(&mut state, "0", sz)?;
+
+        let win = &state.sessions[0].windows[0];
+        let area = frame_ansi_area(sz);
+        let full = serialize_frame_ansi(
+            win,
+            area,
+            false,
+            FrameAnsiOptions {
+                clear_display: true,
+                force_repaint: true,
+            },
+        );
+        assert!(
+            full.contains("\x1b[K"),
+            "clear_display frame must emit the screen clear"
+        );
         Ok(())
     }
 
