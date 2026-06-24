@@ -816,7 +816,11 @@ fn refresh_snapshot(
 fn rebuild_wrapped(state: &mut CopyModeState, width: usize, height: usize) {
     let width = width.max(1);
     let height = height.max(1);
-    if state.wrapped.width != width || state.wrapped.rows.is_empty() {
+    if state.wrapped.width != width
+        || state.wrapped.rows.is_empty()
+        || state.wrapped.source_lines != state.snapshot.lines.len()
+        || state.wrapped.source_cursor_line != state.snapshot.cursor_line
+    {
         state.wrapped = build_wrapped_snapshot(&state.snapshot, width);
     }
     clamp_cursor(state);
@@ -891,6 +895,8 @@ pub(crate) fn build_wrapped_snapshot(
         width,
         rows,
         line_ranges,
+        source_lines: snapshot.lines.len(),
+        source_cursor_line: snapshot.cursor_line,
     }
 }
 
@@ -953,11 +959,19 @@ fn point_display_position(
         }
     }
     let row = &state.wrapped.rows[row_idx];
-    let col = display_width_between(
-        &state.snapshot.lines[row.line],
-        row.start_col,
-        point.col.min(row.end_col),
-    );
+    let col = if row.line >= state.snapshot.lines.len() {
+        if point.line >= state.snapshot.lines.len() {
+            state.snapshot.cursor_col
+        } else {
+            0
+        }
+    } else {
+        display_width_between(
+            &state.snapshot.lines[row.line],
+            row.start_col,
+            point.col.min(row.end_col),
+        )
+    };
     (row_idx, col)
 }
 
@@ -968,6 +982,12 @@ fn point_from_display_position(
 ) -> CopyPoint {
     let row_idx = row_idx.min(state.wrapped.rows.len().saturating_sub(1));
     let row = &state.wrapped.rows[row_idx];
+    if row.line >= state.snapshot.lines.len() {
+        return CopyPoint {
+            line: state.snapshot.cursor_line,
+            col: state.snapshot.cursor_col,
+        };
+    }
     let line = &state.snapshot.lines[row.line];
     let mut col = row.start_col;
     let mut used = 0usize;
@@ -1890,5 +1910,67 @@ mod tests {
 
         assert_eq!(state.cursor, cursor);
         assert_eq!(state.anchor, anchor);
+    }
+
+    fn snapshot_with_cursor_on_new_line(lines: &[&str]) -> PaneTextSnapshot {
+        PaneTextSnapshot {
+            lines: lines
+                .iter()
+                .map(|line| SnapshotLine {
+                    text: (*line).to_string(),
+                    terminated: true,
+                    styles: Vec::new(),
+                })
+                .collect(),
+            cursor_line: lines.len(),
+            cursor_col: 0,
+        }
+    }
+
+    #[test]
+    fn point_from_display_position_handles_cursor_pseudo_row() {
+        let snap = snapshot_with_cursor_on_new_line(&["prompt> "]);
+        let mut state = CopyModeState::new(snap);
+        rebuild_wrapped(&mut state, 80, 24);
+        let pseudo_row = state.wrapped.rows.len() - 1;
+        assert_eq!(
+            state.wrapped.rows[pseudo_row].line,
+            state.snapshot.lines.len()
+        );
+
+        let point = point_from_display_position(&state, pseudo_row, 0);
+        assert_eq!(
+            point,
+            CopyPoint {
+                line: state.snapshot.cursor_line,
+                col: state.snapshot.cursor_col,
+            }
+        );
+    }
+
+    #[test]
+    fn move_down_onto_cursor_pseudo_row_does_not_panic() {
+        let snap = snapshot_with_cursor_on_new_line(&["line"]);
+        let mut state = CopyModeState::new(snap);
+        rebuild_wrapped(&mut state, 80, 24);
+        state.cursor = CopyPoint { line: 0, col: 0 };
+
+        move_vertical(&mut state, 1, 24);
+
+        assert_eq!(state.cursor.line, state.snapshot.cursor_line);
+        assert_eq!(state.cursor.col, state.snapshot.cursor_col);
+    }
+
+    #[test]
+    fn rebuild_wrapped_refreshes_when_snapshot_line_count_changes() {
+        let mut state =
+            CopyModeState::new(snapshot(&["a", "b", "c", "d", "e"]));
+        rebuild_wrapped(&mut state, 10, 3);
+        assert_eq!(state.wrapped.source_lines, 5);
+
+        refresh_snapshot(&mut state, snapshot(&["only"]), 10, 3);
+
+        assert_eq!(state.wrapped.source_lines, 1);
+        assert_eq!(state.wrapped.rows.len(), 1);
     }
 }
