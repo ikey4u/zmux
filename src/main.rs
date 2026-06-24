@@ -132,6 +132,8 @@ fn run_server_daemon(
 ) -> io::Result<()> {
     use zmux::{server::InProcessServer, types::session::Size};
 
+    zmux::server::install_server_panic_hook();
+
     #[cfg(unix)]
     zmux::pty::remember_host_termios();
 
