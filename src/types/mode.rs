@@ -37,6 +37,9 @@ pub struct WrappedSnapshot {
     pub width: usize,
     pub rows: Vec<WrappedRow>,
     pub line_ranges: Vec<(usize, usize)>,
+    /// Snapshot shape used to build `rows`; rebuilt when these diverge.
+    pub source_lines: usize,
+    pub source_cursor_line: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
