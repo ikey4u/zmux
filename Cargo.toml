@@ -47,4 +47,13 @@ windows-sys = { version = "0.59", features = [
 opt-level = 3
 lto = true
 codegen-units = 1
-strip = "symbols"
+# Keep line tables so panic-hook backtraces resolve to file:line in the
+# deployed binary; "symbols" would strip them and leave only addresses.
+strip = "debuginfo"
+# Abort the whole process on any panic (the panic hook still runs first, so the
+# crash is logged) instead of unwinding a single worker thread and poisoning the
+# shared Mutex, which previously caused a silent half-dead cascade.
+panic = "abort"
+
+[profile.dev]
+panic = "abort"
