@@ -50,6 +50,9 @@ pub fn spawn_pane(opts: SpawnOptions<'_>) -> io::Result<Pane> {
         .openpty(size)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
+    #[cfg(unix)]
+    configure_pty_nonblocking(&*pair.master);
+
     let shell = resolve_shell(opts.command);
     let mut cmd = CommandBuilder::new(&shell);
 
@@ -371,7 +374,21 @@ fn start_reader_thread(
         let render_debounce_seq = Arc::new(AtomicU64::new(0));
         loop {
             match reader.read(&mut buf) {
-                Ok(0) | Err(_) => {
+                Ok(0) => {
+                    dead_flag.store(true, Ordering::Relaxed);
+                    data_version.fetch_add(1, Ordering::Relaxed);
+                    render_dirty.store(true, Ordering::Relaxed);
+                    crate::types::events::mark_data_ready();
+                    break;
+                }
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    thread::sleep(Duration::from_millis(16));
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => {
                     dead_flag.store(true, Ordering::Relaxed);
                     data_version.fetch_add(1, Ordering::Relaxed);
                     render_dirty.store(true, Ordering::Relaxed);
@@ -550,6 +567,22 @@ pub fn resize_pane(pane: &mut Pane, rows: u16, cols: u16) -> io::Result<()> {
     pane.last_rows = rows;
     pane.last_cols = cols;
     Ok(())
+}
+
+/// Non-blocking PTY master writes so input forwarding never blocks a server
+/// worker thread indefinitely when the child is busy writing and not reading stdin.
+#[cfg(unix)]
+fn configure_pty_nonblocking(master: &dyn portable_pty::MasterPty) {
+    let Some(fd) = master.as_raw_fd() else {
+        return;
+    };
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 {
+            return;
+        }
+        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
 }
 
 #[cfg(unix)]

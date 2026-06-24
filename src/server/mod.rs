@@ -101,26 +101,14 @@ impl InProcessServer {
     }
 
     pub fn send_input(&self, bytes: &[u8]) {
-        let mut s = match self.state.lock() {
-            Ok(s) => s,
-            Err(_) => return,
+        let writer = clone_active_pane_writer(&self.state);
+        let Some(writer) = writer else {
+            return;
         };
-        let session = match s.active_session_mut() {
-            Some(s) => s,
-            None => return,
-        };
-        let win = match session.windows.get_mut(session.active_window_idx) {
-            Some(w) => w,
-            None => return,
-        };
-        if let Some(pane) =
-            crate::layout::active_pane_mut(&mut win.root, &win.active_pane_path)
-        {
-            if let Err(e) = write_pane_input(pane, bytes) {
-                log_server(&format!("input write failed: {}", e));
-            } else {
-                mark_data_ready();
-            }
+        if let Err(e) = write_pty_writer(&writer, bytes) {
+            log_server(&format!("input write failed: {}", e));
+        } else {
+            mark_data_ready();
         }
     }
 
@@ -684,24 +672,9 @@ where
         if line.starts_with("INPUT ") {
             let hex = &line["INPUT ".len()..];
             if let Ok(bytes) = decode_hex(hex) {
-                let mut s = match state.lock() {
-                    Ok(s) => s,
-                    Err(_) => break,
-                };
-                let session = match s.active_session_mut() {
-                    Some(s) => s,
-                    None => continue,
-                };
-                let win =
-                    match session.windows.get_mut(session.active_window_idx) {
-                        Some(w) => w,
-                        None => continue,
-                    };
-                if let Some(pane) = crate::layout::active_pane_mut(
-                    &mut win.root,
-                    &win.active_pane_path,
-                ) {
-                    if let Err(e) = write_pane_input(pane, &bytes) {
+                let writer = clone_active_pane_writer(&state);
+                if let Some(writer) = writer {
+                    if let Err(e) = write_pty_writer(&writer, &bytes) {
                         log_server(&format!("input write failed: {}", e));
                     }
                 }
@@ -1197,11 +1170,24 @@ fn build_session_tree_json(state: &Arc<Mutex<Server>>) -> String {
     out
 }
 
-fn write_pane_input(pane: &crate::types::Pane, bytes: &[u8]) -> io::Result<()> {
-    let mut writer = pane.writer.lock().map_err(|_| {
+fn clone_active_pane_writer(
+    state: &Arc<Mutex<Server>>,
+) -> Option<crate::pty::PtyWriter> {
+    let s = state.lock().ok()?;
+    let session = s.active_session()?;
+    let win = session.windows.get(session.active_window_idx)?;
+    let pane = crate::layout::active_pane(&win.root, &win.active_pane_path)?;
+    Some(Arc::clone(&pane.writer))
+}
+
+fn write_pty_writer(
+    writer: &crate::pty::PtyWriter,
+    bytes: &[u8],
+) -> io::Result<()> {
+    let mut guard = writer.lock().map_err(|_| {
         io::Error::new(io::ErrorKind::Other, "pty writer poisoned")
     })?;
-    write_pty_input(&mut **writer, bytes)
+    write_pty_input(&mut **guard, bytes)
 }
 
 fn write_pty_input(writer: &mut dyn Write, bytes: &[u8]) -> io::Result<()> {
