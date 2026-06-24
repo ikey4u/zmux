@@ -2,7 +2,7 @@ use std::{
     io::{self, BufReader, Write},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex,
+        mpsc, Arc, Mutex,
     },
     thread,
     time::Duration,
@@ -33,10 +33,16 @@ fn log_socket(msg: &str) {
 
 const INPUT_CHUNK_SIZE: usize = 4096;
 
+enum ControlWrite {
+    Line(String),
+    Input(Vec<u8>),
+}
+
 pub struct SocketClient {
     socket_name: String,
     latest_frame: Arc<Mutex<Option<FrameData>>>,
     write_stream: Arc<Mutex<Box<dyn Write + Send>>>,
+    control_tx: mpsc::Sender<ControlWrite>,
     frame_counter: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
 }
@@ -151,6 +157,20 @@ impl SocketClient {
             Arc::new(Mutex::new(Box::new(control_stream)));
         let frame_write_arc: Arc<Mutex<Box<dyn Write + Send>>> =
             Arc::new(Mutex::new(Box::new(writer)));
+        let (control_tx, control_rx) = mpsc::channel();
+        let control_write = Arc::clone(&write_arc);
+        thread::spawn(move || {
+            for msg in control_rx {
+                match msg {
+                    ControlWrite::Line(line) => {
+                        let _ = send_line_on(&control_write, &line);
+                    }
+                    ControlWrite::Input(bytes) => {
+                        pump_input_chunks(&control_write, &bytes);
+                    }
+                }
+            }
+        });
         let frame_counter: Arc<AtomicU64> = Arc::new(AtomicU64::new(1));
         let shutdown: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
@@ -244,18 +264,16 @@ impl SocketClient {
             socket_name: socket_name.to_string(),
             latest_frame,
             write_stream: write_arc,
+            control_tx,
             frame_counter,
             shutdown,
         })
     }
 
     fn send_line(&self, line: &str) -> bool {
-        let mut ws = match self.write_stream.lock() {
-            Ok(ws) => ws,
-            Err(_) => return false,
-        };
-        ws.write_all(format!("{}\n", line).as_bytes()).is_ok()
-            && ws.flush().is_ok()
+        self.control_tx
+            .send(ControlWrite::Line(line.to_string()))
+            .is_ok()
     }
 
     pub fn latest_frame(&self) -> Option<FrameData> {
@@ -266,15 +284,10 @@ impl SocketClient {
         self.frame_counter.load(Ordering::Relaxed)
     }
     pub fn send_input(&self, bytes: &[u8]) {
-        let mut chunks = bytes.chunks(INPUT_CHUNK_SIZE).peekable();
-        while let Some(chunk) = chunks.next() {
-            if !self.send_line(&format!("INPUT {}", encode_hex(chunk))) {
-                break;
-            }
-            if chunks.peek().is_some() {
-                thread::sleep(Duration::from_millis(1));
-            }
+        if bytes.is_empty() {
+            return;
         }
+        let _ = self.control_tx.send(ControlWrite::Input(bytes.to_vec()));
     }
 
     pub fn run_command(&self, cmd: &str) {
@@ -559,6 +572,33 @@ impl SocketClient {
         }
         let mut buf_reader = reader;
         recv_resp(&mut buf_reader).unwrap_or_default()
+    }
+}
+
+fn send_line_on(
+    write_stream: &Arc<Mutex<Box<dyn Write + Send>>>,
+    line: &str,
+) -> bool {
+    let mut ws = match write_stream.lock() {
+        Ok(ws) => ws,
+        Err(_) => return false,
+    };
+    ws.write_all(format!("{}\n", line).as_bytes()).is_ok() && ws.flush().is_ok()
+}
+
+fn pump_input_chunks(
+    write_stream: &Arc<Mutex<Box<dyn Write + Send>>>,
+    bytes: &[u8],
+) {
+    let mut chunks = bytes.chunks(INPUT_CHUNK_SIZE).peekable();
+    while let Some(chunk) = chunks.next() {
+        if !send_line_on(write_stream, &format!("INPUT {}", encode_hex(chunk)))
+        {
+            break;
+        }
+        if chunks.peek().is_some() {
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 
