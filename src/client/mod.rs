@@ -1209,6 +1209,7 @@ impl ClientApp {
     }
 
     pub fn run(&self) -> io::Result<()> {
+        install_client_panic_hook();
         let (cols, rows) = terminal::size().unwrap_or((80, 24));
         let size = server_content_size(cols, rows);
         let session_name =
@@ -5905,20 +5906,71 @@ fn visible_entries_full<'a>(
         .collect()
 }
 
+fn client_log_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("zmux_client.log")
+}
+
 fn log_client(msg: &str) {
     use std::io::Write;
-    let path = std::env::temp_dir().join("zmux_client.log");
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)
+        .open(client_log_path())
     {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let _ = writeln!(f, "[{}] {}", ts, msg);
+        // Format the whole record first and emit it with a single write so
+        // concurrent writers (poll thread, main loop) don't interleave bytes.
+        let _ = f.write_all(format!("[{}] {}\n", ts, msg).as_bytes());
     }
+}
+
+fn panic_payload_str(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
+/// Install a process-wide panic hook for the client. On panic it best-effort
+/// restores the terminal (so the user isn't stranded in raw mode / the alt
+/// screen and the message isn't swallowed) and records the location, message
+/// and backtrace to the client log.
+fn install_client_panic_hook() {
+    use std::sync::Once;
+    static HOOK: Once = Once::new();
+    HOOK.call_once(|| {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let mut out = io::stdout();
+            let _ = terminal::disable_raw_mode();
+            let _ = execute!(
+                out,
+                DisableBracketedPaste,
+                DisableMouseCapture,
+                LeaveAlternateScreen,
+                cursor::Show
+            );
+            let location = info
+                .location()
+                .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let msg = panic_payload_str(info.payload());
+            let backtrace = std::backtrace::Backtrace::force_capture();
+            log_client(&format!("PANIC at {location}: {msg}\n{backtrace}"));
+            let _ = writeln!(
+                out,
+                "\r\nzmux client panicked at {location}: {msg}\r\n(backtrace logged to {})",
+                client_log_path().display()
+            );
+            default_hook(info);
+        }));
+    });
 }
 
 #[cfg(unix)]

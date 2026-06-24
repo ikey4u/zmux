@@ -503,20 +503,61 @@ fn prune_empty_sessions(state: &mut Server) -> bool {
     old_len != state.sessions.len()
 }
 
+fn server_log_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("zmux_server.log")
+}
+
 fn log_server(msg: &str) {
     use std::io::Write;
-    let path = std::env::temp_dir().join("zmux_server.log");
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)
+        .open(server_log_path())
     {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let _ = writeln!(f, "[{}] {}", ts, msg);
+        // Format the whole record first and write it once so concurrent
+        // worker threads (render loop, per-client handlers) don't interleave.
+        let _ = f.write_all(format!("[{}] {}\n", ts, msg).as_bytes());
     }
+}
+
+fn panic_payload_str(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
+/// Install a process-wide panic hook for the server daemon. The daemon's
+/// stdout/stderr are redirected to /dev/null, so a panic would otherwise be
+/// completely silent. This records the panicking thread, location, message and
+/// backtrace to the server log before delegating to the default hook.
+pub fn install_server_panic_hook() {
+    use std::sync::Once;
+    static HOOK: Once = Once::new();
+    HOOK.call_once(|| {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let thread = std::thread::current();
+            let thread_name = thread.name().unwrap_or("<unnamed>").to_string();
+            let location = info
+                .location()
+                .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let msg = panic_payload_str(info.payload());
+            let backtrace = std::backtrace::Backtrace::force_capture();
+            log_server(&format!(
+                "PANIC in thread '{thread_name}' at {location}: {msg}\n{backtrace}"
+            ));
+            default_hook(info);
+        }));
+    });
 }
 
 fn handle_client<S>(
