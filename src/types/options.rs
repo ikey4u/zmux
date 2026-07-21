@@ -34,7 +34,10 @@ impl Default for GlobalOptions {
             status_interval: 15,
             mouse_enabled: true,
             focus_events: false,
-            scroll_on_erase_in_display: cfg!(target_os = "macos"),
+            // Full-screen TUIs such as cursor-agent repeatedly use ED 2 while
+            // repainting. Treating it as scrollback makes their redraw frames flood
+            // the pane history; users can still opt into this compatibility mode.
+            scroll_on_erase_in_display: false,
             set_clipboard: "on".to_string(),
             copy_command: String::new(),
             destroy_unattached: false,
@@ -50,6 +53,16 @@ impl Default for GlobalOptions {
                 "SSH_CONNECTION".to_string(),
             ],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GlobalOptions;
+
+    #[test]
+    fn scroll_on_erase_is_disabled_by_default() {
+        assert!(!GlobalOptions::default().scroll_on_erase_in_display);
     }
 }
 
