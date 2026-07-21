@@ -2697,7 +2697,7 @@ mod tests {
 
     #[test]
     fn pane_repaint_erases_inner_to_prevent_ghosts() -> io::Result<()> {
-        // Regression for stale "ghost" cells: every pane must erase its own inner
+        // Regression for stale "ghost" cells: every repaint must erase its inner
         // rect before repainting, because the content pass advances by display width
         // and can leave wide-char spacer cells (and shrinking-line leftovers)
         // untouched. The erase pass positions the cursor at each inner row start, the
@@ -2707,6 +2707,7 @@ mod tests {
         make_session(&mut state, "0", sz)?;
 
         let win = &state.sessions[0].windows[0];
+        set_all_render_dirty(&win.root, false);
         let ansi = serialize_frame_ansi(
             win,
             frame_ansi_area(sz),

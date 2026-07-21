@@ -368,11 +368,10 @@ fn write_pane(
     }
     let has_border = !hide_borders && area.width > 2 && area.height > 2;
     let inner = content_area(area, has_border);
-    // Erase the pane's own inner rect before repainting. `write_terminal_row` advances
-    // by each cell's display width, so wide-char spacer columns (and stale graphemes
-    // left by a shrinking line) are not always overwritten in place; clearing first
-    // guarantees no ghost cells survive. This is a localized erase emitted in the same
-    // ANSI blob as the repaint, so it does not flicker like a full-screen clear would.
+    // `write_terminal_row` advances by display width, so wide-char spacer columns
+    // and shrinking-line leftovers are not always overwritten in place. Clear the
+    // pane before every repaint to avoid stale cells; the client submits this ANSI
+    // frame with synchronized updates, so the intermediate blank state is invisible.
     write_erase_rect(inner, out);
     if pane.copy_state.is_some() {
         let pane_defaults = pane
