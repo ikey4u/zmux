@@ -591,7 +591,17 @@ pub fn write_server_ansi<W: Write>(
     let bytes = STANDARD
         .decode(ansi_b64.trim())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    writer.write_all(&bytes)?;
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    // Present the pane update atomically. Without this, erase-then-paint (and
+    // multi-pane force_repaint) can flash blank cells between host writes —
+    // very visible when an AI TUI floods output across a split layout.
+    writer.write_all(b"\x1b[?2026h")?;
+    let content_result = writer.write_all(&bytes);
+    let end_result = writer.write_all(b"\x1b[?2026l");
+    content_result?;
+    end_result?;
     writer.flush()
 }
 
@@ -2379,6 +2389,31 @@ pub fn render_session_chooser(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_server_ansi_wraps_synchronized_update() {
+        let payload = b"hello";
+        let b64 = STANDARD.encode(payload);
+        let mut out = Vec::new();
+        write_server_ansi(&mut out, &b64).unwrap();
+        assert!(
+            out.starts_with(b"\x1b[?2026h"),
+            "expected BSU prefix, got {out:?}"
+        );
+        assert!(
+            out.ends_with(b"\x1b[?2026l"),
+            "expected ESU suffix, got {out:?}"
+        );
+        assert!(out.windows(payload.len()).any(|w| w == payload));
+    }
+
+    #[test]
+    fn write_server_ansi_skips_empty_payload() {
+        let b64 = STANDARD.encode(b"");
+        let mut out = Vec::new();
+        write_server_ansi(&mut out, &b64).unwrap();
+        assert!(out.is_empty(), "empty ansi must not emit sync markers");
+    }
 
     #[test]
     fn chooser_overlay_panel_is_stable_for_same_terminal_size() {
