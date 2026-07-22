@@ -887,15 +887,28 @@ fn handle_copy_key_line(state: &Arc<Mutex<Server>>, key: &str) {
 }
 
 fn handle_scroll_line(state: &Arc<Mutex<Server>>, rest: &str) {
-    let (direction, lines) = if let Some(n) = rest.strip_prefix("up ") {
-        ("up", n.parse::<usize>().unwrap_or(3))
-    } else if let Some(n) = rest.strip_prefix("down ") {
-        ("down", n.parse::<usize>().unwrap_or(3))
-    } else {
-        return;
+    let mut parts = rest.split_whitespace();
+    let direction = match parts.next() {
+        Some("up") => "up",
+        Some("down") => "down",
+        _ => return,
     };
+    let lines = parts
+        .next()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(3);
+    let pane_id = parts
+        .next()
+        .and_then(|target| target.strip_prefix('%'))
+        .and_then(|id| id.parse::<usize>().ok());
+    if parts.next().is_some() {
+        return;
+    }
+    if lines == 0 {
+        return;
+    }
     if let Ok(mut s) = state.lock() {
-        let result = with_active_pane_mut(&mut s, |pane| {
+        let scroll = |pane: &mut crate::types::Pane| {
             let result = match direction {
                 "up" => crate::copy_mode::scroll_up(pane, lines),
                 "down" => crate::copy_mode::scroll_down(pane, lines),
@@ -908,7 +921,12 @@ fn handle_scroll_line(state: &Arc<Mutex<Server>>, rest: &str) {
                 pane.mark_render_dirty();
             }
             result
-        })
+        };
+        let result = if let Some(pane_id) = pane_id {
+            with_pane_by_id_mut(&mut s, pane_id, scroll)
+        } else {
+            with_active_pane_mut(&mut s, scroll)
+        }
         .unwrap_or(crate::copy_mode::CopyScrollResult::Unavailable);
         if result.needs_full_clear() {
             s.force_clear_display = true;
@@ -1780,6 +1798,17 @@ fn with_active_pane_mut<T>(
     Some(f(pane))
 }
 
+fn with_pane_by_id_mut<T>(
+    state: &mut Server,
+    pane_id: usize,
+    f: impl FnOnce(&mut crate::types::Pane) -> T,
+) -> Option<T> {
+    let session = state.active_session_mut()?;
+    let win = session.windows.get_mut(session.active_window_idx)?;
+    let pane = crate::layout::find_pane_by_id_mut(&mut win.root, pane_id)?;
+    Some(f(pane))
+}
+
 fn active_pane_start_dir(win: &Window) -> Option<String> {
     crate::layout::active_pane(&win.root, &win.active_pane_path)
         .and_then(crate::pty::pane_current_dir)
@@ -2590,6 +2619,59 @@ mod tests {
         make_session(&mut state, "0", sz)?;
         resize_all_panes(&mut state, sz);
         assert!(state.force_clear_display);
+        Ok(())
+    }
+
+    #[test]
+    fn targeted_scroll_does_not_mutate_the_active_sibling_pane(
+    ) -> io::Result<()> {
+        let sz = Size::new(24, 80);
+        let mut state = Server::new();
+        make_session(&mut state, "0", sz)?;
+
+        let mut split = ParsedCommand::parse("split-window -h");
+        cmd_split_window(&mut state, &split.remove(0), sz);
+        let mut split = ParsedCommand::parse("split-window -v");
+        cmd_split_window(&mut state, &split.remove(0), sz);
+
+        let pane_ids = {
+            let win = &state.sessions[0].windows[0];
+            crate::layout::collect_pane_ids(&win.root)
+        };
+        assert_eq!(pane_ids.len(), 3);
+        let p1 = pane_ids[0];
+        let p2 = pane_ids[1];
+
+        {
+            let win = &mut state.sessions[0].windows[0];
+            {
+                let pane =
+                    crate::layout::find_pane_by_id_mut(&mut win.root, p2)
+                        .unwrap();
+                let mut parser = pane.parser.lock().unwrap();
+                for line in 0..100 {
+                    parser.process(format!("p2 line {line}\r\n").as_bytes());
+                }
+            }
+            win.active_pane_path =
+                crate::layout::find_pane_path(&win.root, p1).unwrap();
+        }
+
+        let state = Arc::new(Mutex::new(state));
+        handle_scroll_line(&state, &format!("up 3 %{p2}"));
+
+        let state = state.lock().unwrap();
+        let win = &state.sessions[0].windows[0];
+        let p1 = crate::layout::find_pane_by_id(&win.root, p1).unwrap();
+        let p2 = crate::layout::find_pane_by_id(&win.root, p2).unwrap();
+        assert!(
+            p1.copy_state.is_none(),
+            "scrolling p2 must not put active sibling p1 into copy mode"
+        );
+        assert!(
+            p2.copy_state.is_some(),
+            "target pane must receive the scroll operation"
+        );
         Ok(())
     }
 
