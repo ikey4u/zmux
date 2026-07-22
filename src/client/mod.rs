@@ -1434,32 +1434,35 @@ impl ClientApp {
                     drew_terminal_output = true;
                     if frame_new {
                         if let Some(ref fd) = frame {
-                            if let Some(ref ansi) = fd.ansi {
-                                if let Err(err) = write_server_ansi(
-                                    terminal.backend_mut(),
-                                    ansi,
-                                ) {
-                                    log_client(&format!(
-                                        "failed to write pane ansi: {err}"
-                                    ));
+                            if should_write_server_ansi(has_overlay, has_prompt)
+                            {
+                                if let Some(ref ansi) = fd.ansi {
+                                    if let Err(err) = write_server_ansi(
+                                        terminal.backend_mut(),
+                                        ansi,
+                                    ) {
+                                        log_client(&format!(
+                                            "failed to write pane ansi: {err}"
+                                        ));
+                                    }
+                                    if let Err(err) = refresh_mouse_pointer(
+                                        terminal.backend_mut(),
+                                        &mut applied_mouse_pointer,
+                                        last_mouse_pos,
+                                        frame.as_ref(),
+                                        cols,
+                                        rows,
+                                        hide_borders,
+                                        hide_status,
+                                        has_overlay || has_prompt,
+                                        true,
+                                    ) {
+                                        log_client(&format!(
+                                            "failed to set mouse pointer after ansi: {err}"
+                                        ));
+                                    }
+                                    last_drawn_mouse_select = None;
                                 }
-                                if let Err(err) = refresh_mouse_pointer(
-                                    terminal.backend_mut(),
-                                    &mut applied_mouse_pointer,
-                                    last_mouse_pos,
-                                    frame.as_ref(),
-                                    cols,
-                                    rows,
-                                    hide_borders,
-                                    hide_status,
-                                    has_overlay || has_prompt,
-                                    true,
-                                ) {
-                                    log_client(&format!(
-                                        "failed to set mouse pointer after ansi: {err}"
-                                    ));
-                                }
-                                last_drawn_mouse_select = None;
                             }
                         }
                     }
@@ -1972,10 +1975,7 @@ impl ClientApp {
                                         }
                                         _ if is_shifted_letter(key, 'H') => {
                                             if let Some(message) =
-                                                run_command_notice(
-                                                    tabs.active_client(),
-                                                    "set-pane-start-dir",
-                                                )
+                                                set_tab_start_dir(&mut tabs)
                                             {
                                                 status_notice = Some((
                                                     message,
@@ -3786,8 +3786,15 @@ impl ClientApp {
                                     } else {
                                         match mouse.kind {
                                             MouseEventKind::ScrollUp => {
-                                                tabs.active_client()
-                                                    .scroll_up(SCROLL_LINES);
+                                                scroll_pane_at_mouse(
+                                                    tabs.active_client(),
+                                                    frame.as_ref(),
+                                                    mouse,
+                                                    cols,
+                                                    rows,
+                                                    hide_borders,
+                                                    "up",
+                                                );
                                                 mode = InputMode::CopyMode;
                                                 copy_mode_confirmed = false;
                                                 copy_mode_exit_pending = false;
@@ -3795,8 +3802,15 @@ impl ClientApp {
                                                 last_drawn_counter = 0;
                                             }
                                             MouseEventKind::ScrollDown => {
-                                                tabs.active_client()
-                                                    .scroll_down(SCROLL_LINES);
+                                                scroll_pane_at_mouse(
+                                                    tabs.active_client(),
+                                                    frame.as_ref(),
+                                                    mouse,
+                                                    cols,
+                                                    rows,
+                                                    hide_borders,
+                                                    "down",
+                                                );
                                                 last_drawn_counter = 0;
                                             }
                                             MouseEventKind::Down(
@@ -4015,13 +4029,27 @@ impl ClientApp {
                                 }
                                 InputMode::CopyMode => match mouse.kind {
                                     MouseEventKind::ScrollUp => {
-                                        tabs.active_client()
-                                            .scroll_up(SCROLL_LINES);
+                                        scroll_pane_at_mouse(
+                                            tabs.active_client(),
+                                            frame.as_ref(),
+                                            mouse,
+                                            cols,
+                                            rows,
+                                            hide_borders,
+                                            "up",
+                                        );
                                         last_drawn_counter = 0;
                                     }
                                     MouseEventKind::ScrollDown => {
-                                        tabs.active_client()
-                                            .scroll_down(SCROLL_LINES);
+                                        scroll_pane_at_mouse(
+                                            tabs.active_client(),
+                                            frame.as_ref(),
+                                            mouse,
+                                            cols,
+                                            rows,
+                                            hide_borders,
+                                            "down",
+                                        );
                                         last_drawn_counter = 0;
                                     }
                                     MouseEventKind::Down(MouseButton::Left) => {
@@ -4873,6 +4901,38 @@ fn find_pane_id_at(
     }
 }
 
+/// Scroll the pane under the pointer, not whichever pane happened to be active.
+/// Selecting it first keeps client copy-mode state aligned with the server.
+fn scroll_pane_at_mouse(
+    server: &SocketClient,
+    frame: Option<&FrameData>,
+    mouse: MouseEvent,
+    cols: u16,
+    rows: u16,
+    hide_borders: bool,
+    direction: &str,
+) {
+    let pane_id = frame.and_then(|fd| {
+        find_pane_id_at(
+            &fd.layout,
+            server_layout_area(cols, rows),
+            mouse.column,
+            mouse.row,
+            hide_borders,
+        )
+    });
+    if let Some(pane_id) = pane_id {
+        if frame.and_then(|fd| active_pane_id(&fd.layout)) != Some(pane_id) {
+            server.run_command(&format!("select-pane -t %{}", pane_id));
+        }
+        server.scroll_pane(pane_id, direction, SCROLL_LINES);
+    } else if direction == "up" {
+        server.scroll_up(SCROLL_LINES);
+    } else {
+        server.scroll_down(SCROLL_LINES);
+    }
+}
+
 fn active_pane_id(layout: &LayoutJson) -> Option<usize> {
     match layout {
         LayoutJson::Leaf {
@@ -5263,6 +5323,22 @@ fn run_command_notice(server: &SocketClient, cmd: &str) -> Option<String> {
     None
 }
 
+fn set_tab_start_dir(tabs: &mut TabManager) -> Option<String> {
+    let output = tabs
+        .active_client()
+        .run_command_with_output("set-pane-start-dir");
+    let Some(path) = start_dir_from_command_output(&output) else {
+        return Some("set start dir failed".to_string());
+    };
+    tabs.start_dir = Some(path.clone());
+    Some(format!("start dir: {}", path))
+}
+
+fn start_dir_from_command_output(output: &str) -> Option<String> {
+    let path = output.trim();
+    (!path.is_empty()).then(|| path.to_string())
+}
+
 fn is_resize_modifier_key(key: KeyEvent) -> bool {
     matches!(
         key.code,
@@ -5308,6 +5384,13 @@ fn status_banner_for_mode(
         (None, Some(notice)) => Some(notice.to_string()),
         (None, None) => None,
     }
+}
+
+/// A server ANSI frame writes directly to the terminal, bypassing Ratatui's
+/// overlay buffer. Defer it until the overlay closes so pane output cannot
+/// paint over a chooser or prompt between UI draws.
+fn should_write_server_ansi(has_overlay: bool, has_prompt: bool) -> bool {
+    !has_overlay && !has_prompt
 }
 
 enum ClipboardCopyResult {
@@ -6216,6 +6299,22 @@ fn truncate_status_url(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_dir_command_output_is_preserved_for_new_tabs() {
+        assert_eq!(
+            start_dir_from_command_output("  /Users/me/project\n"),
+            Some("/Users/me/project".to_string())
+        );
+        assert_eq!(start_dir_from_command_output(" \n\t"), None);
+    }
+
+    #[test]
+    fn server_ansi_is_deferred_while_an_overlay_is_visible() {
+        assert!(should_write_server_ansi(false, false));
+        assert!(!should_write_server_ansi(true, false));
+        assert!(!should_write_server_ansi(false, true));
+    }
 
     #[test]
     fn build_osc52_sequence_base64_encodes_utf8_text() {

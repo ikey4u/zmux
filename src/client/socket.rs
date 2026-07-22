@@ -458,6 +458,10 @@ impl SocketClient {
         self.send_line(&format!("SCROLL down {}", lines));
     }
 
+    pub fn scroll_pane(&self, pane_id: usize, direction: &str, lines: usize) {
+        self.send_line(&format!("SCROLL {} {} %{}", direction, lines, pane_id));
+    }
+
     pub fn scroll_display(&self, delta: i32) {
         self.send_line(&format!("SCROLL_DISPLAY {}", delta));
     }
