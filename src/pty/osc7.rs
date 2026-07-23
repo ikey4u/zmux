@@ -1,28 +1,60 @@
 use std::sync::{Arc, Mutex};
 
+/// Parse an OSC 7 payload (e.g. `file://host/path` or `file:///C:/Users`)
+/// into a native filesystem path.
+///
+/// The `file://` URI is allowed to carry a hostname between the `//` and the
+/// first `/` (shells emit `file://$HOST$PWD`). We strip that host so we keep
+/// only the absolute path. On Unix the path is returned verbatim (forward
+/// slashes, leading `/` intact); on Windows drive-letter paths are rewritten
+/// to use backslashes.
 pub fn parse_osc7_payload(payload: &str) -> Option<String> {
     let payload = payload.trim();
-    let file_url = payload.strip_prefix("file://").unwrap_or(payload);
-    let path = if let Some(rest) = file_url.strip_prefix('/') {
-        if rest.len() >= 2 && rest.as_bytes().get(1) == Some(&b':') {
-            rest
-        } else if let Some(slash) = file_url.find('/') {
-            &file_url[slash..]
+    let after_scheme = payload.strip_prefix("file://").unwrap_or(payload);
+
+    // After stripping `file://`, one of:
+    //   `/abs/path`            -> empty host, unix abs path
+    //   `//abs/path`           -> extra slash, treat as abs path
+    //   `host/abs/path`        -> host (no `:`) to strip
+    //   `C:/Users` / `C:\Users` -> windows drive path
+    let path = if after_scheme.starts_with('/') {
+        // Empty host (or stray slashes): the real path follows.
+        let trimmed = after_scheme.trim_start_matches('/');
+        if trimmed.len() >= 2 && trimmed.as_bytes().get(1) == Some(&b':') {
+            // `/C:/Users` style drive path on Windows: no leading slash.
+            trimmed.to_string()
         } else {
-            file_url
+            // `/abs/path` on unix.
+            format!("/{}", trimmed)
         }
-    } else if file_url.len() >= 2 && file_url.as_bytes().get(1) == Some(&b':') {
-        file_url
-    } else if let Some(slash) = file_url.find('/') {
-        &file_url[slash..]
+    } else if after_scheme.len() >= 2
+        && after_scheme.as_bytes().get(1) == Some(&b':')
+    {
+        // Windows drive path like `C:/Users` with no scheme slashes.
+        after_scheme.to_string()
+    } else if let Some(slash) = after_scheme.find('/') {
+        // `host/path` -> keep the path (including its leading slash).
+        after_scheme[slash..].to_string()
     } else {
-        file_url
+        after_scheme.to_string()
     };
-    let path = path.trim_start_matches('/');
+
+    let path = path.trim();
     if path.is_empty() {
         return None;
     }
-    Some(path.replace('/', "\\"))
+
+    Some(normalize_path(path))
+}
+
+#[cfg(windows)]
+fn normalize_path(path: &str) -> String {
+    path.replace('/', "\\")
+}
+
+#[cfg(not(windows))]
+fn normalize_path(path: &str) -> String {
+    path.to_string()
 }
 
 #[derive(Default)]
@@ -89,6 +121,7 @@ impl CwdTracker {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
     #[test]
     fn parses_windows_file_uri() {
         assert_eq!(
@@ -97,6 +130,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn parses_cmd_style_file_uri() {
         assert_eq!(
@@ -105,11 +139,43 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn parses_unix_file_uri_with_host() {
+        // macOS/Linux shells emit `file://$HOST$PWD`.
+        assert_eq!(
+            parse_osc7_payload("file://ZHQLI-MC6/Users/z9/Dev/zmux"),
+            Some("/Users/z9/Dev/zmux".to_string())
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn parses_unix_file_uri_without_host() {
+        assert_eq!(
+            parse_osc7_payload("file:///Users/z9/Dev/zmux"),
+            Some("/Users/z9/Dev/zmux".to_string())
+        );
+    }
+
+    #[cfg(windows)]
     #[test]
     fn tracker_extracts_osc7_from_output() {
         let cwd = Arc::new(Mutex::new(None));
         let mut tracker = CwdTracker::default();
         tracker.process(b"hello\x1b]7;file:///D:/Projects/zmux\x07world", &cwd);
         assert_eq!(cwd.lock().unwrap().as_deref(), Some(r"D:\Projects\zmux"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn tracker_extracts_osc7_from_output() {
+        let cwd = Arc::new(Mutex::new(None));
+        let mut tracker = CwdTracker::default();
+        tracker.process(
+            b"hello\x1b]7;file://ZHQLI-MC6/Users/z9/Dev/zmux\x07world",
+            &cwd,
+        );
+        assert_eq!(cwd.lock().unwrap().as_deref(), Some("/Users/z9/Dev/zmux"));
     }
 }
