@@ -71,7 +71,7 @@ fn split_rects(
 
     for (i, &pct) in sizes.iter().enumerate().take(count) {
         let dim = if i == count - 1 {
-            available.saturating_sub(offset)
+            total_dim.saturating_sub(offset)
         } else {
             (available as u32 * pct as u32 / total_pct as u32) as u16
         };
@@ -164,5 +164,64 @@ fn collect_borders(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_rects_fills_entire_area_horizontal() {
+        let area = Rect::new(0, 0, 200, 50);
+        let rects = split_rects(
+            area,
+            &SplitDirection::Horizontal,
+            &[50, 50],
+            2,
+            BORDER_SIZE,
+        );
+        let last = rects.last().unwrap();
+        assert_eq!(
+            last.x + last.width,
+            area.width,
+            "last pane must fill to the right edge"
+        );
+    }
+
+    #[test]
+    fn split_rects_fills_entire_area_vertical() {
+        let area = Rect::new(0, 0, 80, 50);
+        let rects = split_rects(
+            area,
+            &SplitDirection::Vertical,
+            &[50, 50],
+            2,
+            BORDER_SIZE,
+        );
+        let last = rects.last().unwrap();
+        assert_eq!(
+            last.y + last.height,
+            area.height,
+            "last pane must fill to the bottom edge"
+        );
+    }
+
+    #[test]
+    fn split_rects_three_panes_fills_area() {
+        let area = Rect::new(0, 0, 100, 30);
+        let rects = split_rects(
+            area,
+            &SplitDirection::Horizontal,
+            &[33, 34, 33],
+            3,
+            BORDER_SIZE,
+        );
+        let last = rects.last().unwrap();
+        assert_eq!(
+            last.x + last.width,
+            area.width,
+            "last pane in 3-way split must fill to the right edge"
+        );
     }
 }
