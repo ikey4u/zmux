@@ -181,7 +181,7 @@ pub fn write_rows_v2_rect_ansi<W: io::Write>(
     end_col: u16,
 ) -> io::Result<()> {
     use crate::output::{
-        vte_goto, write_style_diff, CharacterStyles, DEFAULT_STYLES,
+        vte_goto, write_style_diff, CharacterStyles, RESET_STYLES,
     };
 
     if start_row > end_row || (start_row == end_row && start_col >= end_col) {
@@ -205,7 +205,6 @@ pub fn write_rows_v2_rect_ansi<W: io::Write>(
     }
 
     let mut buf = String::new();
-    let mut current = DEFAULT_STYLES;
     let max_cols = content_area.width as usize;
 
     for row in sr..=er {
@@ -243,8 +242,19 @@ pub fn write_rows_v2_rect_ansi<W: io::Write>(
                 if col >= pane_col_end {
                     break;
                 }
+                // A wide glyph that does not fit in the remaining columns would
+                // spill past the pane edge; skip it (advance by its width so the
+                // spacer is respected) instead of painting it.
+                if col + w > pane_col_end {
+                    col += w;
+                    continue;
+                }
                 if col + w > pane_col_begin {
                     vte_goto(content_area.x + col as u16, y, &mut buf);
+                    // `vte_goto` appends SGR reset, so the cached style must
+                    // reset too. Otherwise adjacent glyphs in the same colored
+                    // run are restored with the terminal default foreground.
+                    let mut current = RESET_STYLES;
                     write_style_diff(&mut current, style, &mut buf);
                     buf.push(ch);
                 }
@@ -309,10 +319,9 @@ pub fn write_active_pane_layout_ansi<W: io::Write>(
     );
     use crate::output::{
         vte_goto, write_erase_rect, write_style_diff, CharacterStyles,
-        DEFAULT_STYLES,
+        RESET_STYLES,
     };
     write_erase_rect(area, &mut buf);
-    let mut current = DEFAULT_STYLES;
     let max_rows = content_area.height as usize;
     let max_cols = content_area.width as usize;
     for (row_idx, row_data) in rows_v2.iter().enumerate().take(max_rows) {
@@ -323,6 +332,7 @@ pub fn write_active_pane_layout_ansi<W: io::Write>(
                 break;
             }
             vte_goto(content_area.x + col as u16, y, &mut buf);
+            let mut current = RESET_STYLES;
             let style =
                 CharacterStyles::from_layout_run(&run.fg, &run.bg, run.flags);
             write_style_diff(&mut current, style, &mut buf);
@@ -425,6 +435,14 @@ pub fn write_active_pane_selection_ansi<W: io::Write>(
                 if col >= max_cols {
                     break;
                 }
+                let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+                // A wide glyph that does not fit in the remaining columns would
+                // spill past the pane edge; skip it (advance by its width so the
+                // spacer is respected) instead of painting it.
+                if col + w > max_cols {
+                    col += w;
+                    continue;
+                }
                 let abs_col = content_area.x + col as u16;
                 let selected = hl_begin < hl_end
                     && abs_col >= hl_begin
@@ -432,7 +450,7 @@ pub fn write_active_pane_selection_ansi<W: io::Write>(
                 let style = if selected { highlight } else { normal };
                 write_style_diff(&mut current, style, &mut buf);
                 buf.push(ch);
-                col += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+                col += w;
             }
         }
         // `rows_v2` normally spans the full width, but guard against short rows so
@@ -588,20 +606,45 @@ pub fn write_server_ansi<W: Write>(
     writer: &mut W,
     ansi_b64: &str,
 ) -> io::Result<()> {
+    if ansi_b64.trim().is_empty() {
+        return Ok(());
+    }
+    begin_server_ansi_update(writer)?;
+    let content_result = write_server_ansi_payload(writer, ansi_b64);
+    let end_result = end_server_ansi_update(writer);
+    content_result?;
+    end_result
+}
+
+/// Start an atomic server-ANSI paint. Call [`end_server_ansi_update`] after any
+/// ratatui overlay that must appear in the same presentation.
+pub fn begin_server_ansi_update<W: Write>(writer: &mut W) -> io::Result<()> {
+    // Hide the cursor for the whole paint. Server ANSI issues many CUPs (row
+    // starts, borders, wide-glyph resync). If the cursor stays visible, each
+    // hop shows up as a flashing white fleck — especially on every keystroke.
+    writer.write_all(b"\x1b[?25l")?;
+    writer.write_all(b"\x1b[?2026h")
+}
+
+/// Write a decoded server ANSI payload into an open synchronized update.
+/// Returns `Ok(false)` for an empty payload.
+pub fn write_server_ansi_payload<W: Write>(
+    writer: &mut W,
+    ansi_b64: &str,
+) -> io::Result<bool> {
     let bytes = STANDARD
         .decode(ansi_b64.trim())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     if bytes.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
-    // Present the pane update atomically. Without this, erase-then-paint (and
-    // multi-pane force_repaint) can flash blank cells between host writes —
-    // very visible when an AI TUI floods output across a split layout.
-    writer.write_all(b"\x1b[?2026h")?;
-    let content_result = writer.write_all(&bytes);
-    let end_result = writer.write_all(b"\x1b[?2026l");
-    content_result?;
-    end_result?;
+    writer.write_all(&bytes)?;
+    Ok(true)
+}
+
+/// Finish an atomic server-ANSI paint and present its buffered output.
+pub fn end_server_ansi_update<W: Write>(writer: &mut W) -> io::Result<()> {
+    writer.write_all(b"\x1b[?2026l")?;
     writer.flush()
 }
 
@@ -931,7 +974,7 @@ fn split_layout_rects(
     let mut offset = 0u16;
     for (index, &pct) in sizes.iter().enumerate().take(count) {
         let dim = if index + 1 == count {
-            available.saturating_sub(offset)
+            total_dim.saturating_sub(offset)
         } else {
             (available as u32 * pct as u32 / total_pct as u32) as u16
         };
@@ -2148,6 +2191,8 @@ pub fn render_prompt(f: &mut Frame, label: &str, buf: &str) {
         width: area.width,
         height: 1,
     };
+    // Pane ANSI may have run just before this draw; force the prompt row out.
+    prepare_overlay_draw(f, prompt_area);
 
     let content = format!("{}{}", label, buf);
     let para = Paragraph::new(content.clone())
@@ -2397,8 +2442,8 @@ mod tests {
         let mut out = Vec::new();
         write_server_ansi(&mut out, &b64).unwrap();
         assert!(
-            out.starts_with(b"\x1b[?2026h"),
-            "expected BSU prefix, got {out:?}"
+            out.starts_with(b"\x1b[?25l\x1b[?2026h"),
+            "expected hide-cursor + BSU prefix, got {out:?}"
         );
         assert!(
             out.ends_with(b"\x1b[?2026l"),
@@ -2496,7 +2541,7 @@ mod tests {
                     x: 0,
                     y: 12,
                     width: 80,
-                    height: 10,
+                    height: 11,
                 },
             ]
         );
@@ -2723,6 +2768,27 @@ mod tests {
             exit: false,
             yank_text: None,
         }
+    }
+
+    #[test]
+    fn selection_restore_reapplies_color_after_each_cursor_reset() {
+        // `write_rows_v2_rect_ansi` uses vte_goto per cell. Since that helper
+        // resets SGR, both glyphs must explicitly reapply their red foreground.
+        let rows = vec![row_from_runs(vec![cellrun("AB", "red")])];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 1,
+        };
+        let mut out = Vec::new();
+        write_rows_v2_rect_ansi(&mut out, &rows, area, 0, 0, 0, 2).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(
+            out.matches("\x1b[31m").count(),
+            2,
+            "both restored cells must retain red after vte_goto: {out:?}"
+        );
     }
 
     /// Decode the raw ANSI the selection overlay emits into `(row, col, char,

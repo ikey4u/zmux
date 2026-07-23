@@ -1292,13 +1292,14 @@ impl ClientApp {
         let mut applied_mouse_pointer: Option<MousePointerShape> = None;
         let mut last_mouse_pos: Option<(u16, u16)> = None;
         let mut last_drawn_mouse_select: Option<MouseSelection> = None;
-        let mut last_draw_time = Instant::now() - Duration::from_millis(16);
         let mut last_drawn_counter: u64 = 0;
+        let mut last_ansi_frame: Option<(String, u64)> = None;
         let mut last_overlay_rect: Option<ratatui::layout::Rect> = None;
         let run_result: io::Result<()> = (|| {
             loop {
                 let frame = tabs.active_client().latest_frame();
                 let current_counter = tabs.active_client().frame_counter();
+                let active_socket_name = tabs.active_socket_name();
                 if matches!(
                     copy_mode_sync_suppress_frame,
                     Some(counter) if counter != current_counter
@@ -1379,6 +1380,7 @@ impl ClientApp {
                 {
                     mode = InputMode::Normal;
                     resize_deadline = None;
+                    last_drawn_counter = 0;
                 }
                 if mode != InputMode::Resize {
                     resize_deadline = None;
@@ -1386,6 +1388,7 @@ impl ClientApp {
                 if matches!(status_notice.as_ref(), Some((_, expires_at)) if now >= *expires_at)
                 {
                     status_notice = None;
+                    last_drawn_counter = 0;
                 }
                 let status_notice_text =
                     status_notice.as_ref().map(|(text, _)| text.clone());
@@ -1424,26 +1427,51 @@ impl ClientApp {
                         None
                     };
                 if stale_overlay_rect.is_some() {
-                    last_drawn_counter = 0;
+                    // The old overlay was drawn directly over server ANSI. Ask the
+                    // server for a complete pane repaint before drawing again;
+                    // replaying the latest incremental frame would leave the
+                    // covered portion of an inactive pane blank.
+                    tabs.active_client().refresh_display();
+                    last_drawn_counter = current_counter;
+                    last_overlay_rect = current_overlay_rect;
                 }
 
-                let frame_new = current_counter != last_drawn_counter;
-                if frame_new
-                    || last_draw_time.elapsed() >= Duration::from_millis(16)
-                {
+                let redraw_needed = current_counter != last_drawn_counter;
+                let server_frame_new = last_ansi_frame.as_ref().is_none_or(
+                    |(socket_name, counter)| {
+                        socket_name != &active_socket_name
+                            || *counter != current_counter
+                    },
+                );
+                if redraw_needed {
                     drew_terminal_output = true;
-                    if frame_new {
+                    let mut server_ansi_update_open = false;
+                    if server_frame_new {
                         if let Some(ref fd) = frame {
                             if should_write_server_ansi(has_overlay, has_prompt)
                             {
                                 if let Some(ref ansi) = fd.ansi {
-                                    if let Err(err) = write_server_ansi(
-                                        terminal.backend_mut(),
-                                        ansi,
-                                    ) {
-                                        log_client(&format!(
-                                            "failed to write pane ansi: {err}"
-                                        ));
+                                    if !ansi.trim().is_empty() {
+                                        match begin_server_ansi_update(
+                                            terminal.backend_mut(),
+                                        ) {
+                                            Ok(()) => {
+                                                server_ansi_update_open = true;
+                                                if let Err(err) =
+                                                    write_server_ansi_payload(
+                                                        terminal.backend_mut(),
+                                                        ansi,
+                                                    )
+                                                {
+                                                    log_client(&format!(
+                                                        "failed to write pane ansi: {err}"
+                                                    ));
+                                                }
+                                            }
+                                            Err(err) => log_client(&format!(
+                                                "failed to begin pane ANSI paint: {err}"
+                                            )),
+                                        }
                                     }
                                     if let Err(err) = refresh_mouse_pointer(
                                         terminal.backend_mut(),
@@ -1461,7 +1489,16 @@ impl ClientApp {
                                             "failed to set mouse pointer after ansi: {err}"
                                         ));
                                     }
-                                    last_drawn_mouse_select = None;
+                                    // An incremental ANSI frame can update a sibling
+                                    // pane only. Keep the last highlighted bounds
+                                    // while the selection has just been cleared so
+                                    // the post-draw restore below can repaint its
+                                    // underlying cells. While a selection remains
+                                    // active, invalidate it so an ANSI update cannot
+                                    // erase the highlight permanently.
+                                    if mouse_select.is_some() {
+                                        last_drawn_mouse_select = None;
+                                    }
                                 }
                             }
                         }
@@ -1470,7 +1507,7 @@ impl ClientApp {
                         .as_ref()
                         .is_some_and(|sel| !selection_is_empty(sel))
                         && frame.as_ref().is_some_and(|fd| fd.ansi.is_some());
-                    terminal.draw(|f| {
+                    if let Err(err) = terminal.draw(|f| {
                         let in_prefix = mode == InputMode::Prefix;
                         if let Some(ref fd) = frame {
                             skip_pane_area_for_ansi(f, fd, hide_borders);
@@ -1597,7 +1634,13 @@ impl ClientApp {
                                 }
                             }
                         }
-                    })?;
+                    }) {
+                        if server_ansi_update_open {
+                            let _ =
+                                end_server_ansi_update(terminal.backend_mut());
+                        }
+                        return Err(err);
+                    }
                     if frame.as_ref().is_some_and(|fd| fd.ansi.is_some()) {
                         if let Some(prev) = last_drawn_mouse_select.take() {
                             if mouse_select.is_none() {
@@ -1689,8 +1732,14 @@ impl ClientApp {
                             }
                         }
                     }
-                    last_draw_time = Instant::now();
+                    if server_ansi_update_open {
+                        end_server_ansi_update(terminal.backend_mut())?;
+                    }
                     last_drawn_counter = current_counter;
+                    if server_frame_new {
+                        last_ansi_frame =
+                            Some((active_socket_name, current_counter));
+                    }
                     last_overlay_rect = current_overlay_rect;
                 }
 
@@ -4243,6 +4292,10 @@ impl ClientApp {
                         }
                         _ => {}
                     }
+                    // Input modes and overlays are client-side state. Redraw once
+                    // after an event changes them, rather than refreshing every
+                    // 16 ms while the terminal is otherwise idle.
+                    last_drawn_counter = 0;
                 }
             }
             Ok(())
@@ -5386,11 +5439,13 @@ fn status_banner_for_mode(
     }
 }
 
-/// A server ANSI frame writes directly to the terminal, bypassing Ratatui's
-/// overlay buffer. Defer it until the overlay closes so pane output cannot
-/// paint over a chooser or prompt between UI draws.
-fn should_write_server_ansi(has_overlay: bool, has_prompt: bool) -> bool {
-    !has_overlay && !has_prompt
+/// Server ANSI writes directly to the terminal, bypassing Ratatui's buffer.
+/// Overlays/prompts still redraw on top in the same frame (`AlwaysUpdate` via
+/// `begin_floating_panel` / prompt row), so pane output can keep flowing while a
+/// chooser is open. Deferring ANSI made live pane output appear frozen until the
+/// overlay closed, then jump forward in one burst.
+fn should_write_server_ansi(_has_overlay: bool, _has_prompt: bool) -> bool {
+    true
 }
 
 enum ClipboardCopyResult {
@@ -6310,10 +6365,17 @@ mod tests {
     }
 
     #[test]
-    fn server_ansi_is_deferred_while_an_overlay_is_visible() {
+    fn server_ansi_keeps_painting_while_overlay_or_prompt_is_visible() {
         assert!(should_write_server_ansi(false, false));
-        assert!(!should_write_server_ansi(true, false));
-        assert!(!should_write_server_ansi(false, true));
+        assert!(
+            should_write_server_ansi(true, false),
+            "overlay must not freeze pane ANSI (Prefix+t / chooser)"
+        );
+        assert!(
+            should_write_server_ansi(false, true),
+            "prompt must not freeze pane ANSI"
+        );
+        assert!(should_write_server_ansi(true, true));
     }
 
     #[test]
@@ -6879,9 +6941,31 @@ mod tests {
                     force_repaint: true,
                 },
             );
+            // Per-cell CUP inserts CSI between glyphs, so strip CSI before matching.
+            let visible: String = {
+                let mut out = String::new();
+                let mut chars = ansi.chars().peekable();
+                while let Some(ch) = chars.next() {
+                    if ch == '\x1b' {
+                        if chars.peek() == Some(&'[') {
+                            chars.next();
+                            for c in chars.by_ref() {
+                                if c.is_ascii_alphabetic() || c == '~' {
+                                    break;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    if ch >= ' ' {
+                        out.push(ch);
+                    }
+                }
+                out
+            };
             assert!(
-                ansi.contains(text),
-                "ANSI paint should include {text:?}, got: {ansi:?}"
+                visible.contains(text),
+                "ANSI paint should include {text:?}, visible={visible:?}, raw={ansi:?}"
             );
         }
 
