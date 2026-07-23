@@ -345,6 +345,12 @@ impl SocketClient {
         self.send_line(&format!("RESIZE {}x{}", size.rows, size.cols));
     }
 
+    /// Request a complete pane repaint after a client-side overlay has covered
+    /// server-rendered content. Incremental frames cannot restore that region.
+    pub fn refresh_display(&self) {
+        self.send_line("REFRESH_FRAME");
+    }
+
     pub fn set_hide_borders(&self, hide: bool) {
         self.send_line(&format!(
             "HIDE_BORDERS {}",

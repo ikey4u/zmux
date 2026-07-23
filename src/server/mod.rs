@@ -1,10 +1,17 @@
 use std::{
     collections::HashMap,
     io::{self, Write},
-    sync::{atomic::Ordering, Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     thread,
     time::{Duration, Instant},
 };
+
+/// Makes client-requested full repaints distinct from an otherwise identical
+/// incremental frame so the polling client cannot deduplicate them away.
+static OVERLAY_RESTORE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 use crate::{
     client::FrameData,
@@ -655,7 +662,7 @@ where
     log_server("entering main loop");
     let mut pending_yank: Option<String> = None;
     // Per-connection geometry tracking: only do a destructive full-screen clear when
-    // the layout actually changes, otherwise repaint all panes in place (no flicker).
+    // the layout actually changes. Steady-state frames are incremental.
     let mut last_layout_fp: Option<u64> = None;
     loop {
         let line = match recv_line(&mut reader) {
@@ -737,6 +744,23 @@ where
                     new_size,
                 );
             }
+        } else if line == "REFRESH_FRAME" {
+            let size = size_arc.lock().map(|s| *s).unwrap_or(Size::new(24, 80));
+            if let Ok(s) = state.lock() {
+                // A floating overlay is drawn only by the client. Once it closes,
+                // the next frame must contain every pane so its covered rectangle
+                // is restored instead of replaying a ping-only incremental frame.
+                refresh_latest_frame(&latest_frame, &s, size);
+                if let Ok(mut latest) = latest_frame.lock() {
+                    if let Some(frame) = latest.as_mut() {
+                        frame.frame_type = format!(
+                            "overlay-restore-{}",
+                            OVERLAY_RESTORE_SEQUENCE
+                                .fetch_add(1, Ordering::Relaxed,)
+                        );
+                    }
+                }
+            }
         } else if line.starts_with("OPTION ") {
             let rest = &line["OPTION ".len()..];
             let mut parts = rest.split_whitespace();
@@ -761,7 +785,7 @@ where
             mark_data_ready();
         } else if line == "FRAME?" {
             let yank_ref = pending_yank.take();
-            let json = {
+            let generated = {
                 let mut s = match state.lock() {
                     Ok(s) => s,
                     Err(_) => break,
@@ -799,18 +823,34 @@ where
                         sz,
                         FrameAnsiOptions {
                             clear_display,
-                            force_repaint: true,
+                            force_repaint: false,
                         },
                     )
                 }
             };
-            if !json.contains("\"exit\":true") {
-                if let Ok(fd) = serde_json::from_str::<FrameData>(&json) {
-                    if let Ok(mut frame) = latest_frame.lock() {
-                        *frame = Some(fd);
+            let json = if generated.contains("\"exit\":true") {
+                generated
+            } else if let Ok(mut generated_frame) =
+                serde_json::from_str::<FrameData>(&generated)
+            {
+                // The render loop may already have consumed the dirty flag and
+                // published its incremental paint. Do not replace that frame with
+                // an empty poll response, or an update can be lost between polls.
+                if generated_frame.ansi.as_deref().is_some_and(str::is_empty) {
+                    if let Some(latest) =
+                        latest_frame.lock().ok().and_then(|frame| frame.clone())
+                    {
+                        generated_frame = latest;
                     }
                 }
-            }
+                generated_frame.yank_text = yank_ref;
+                if let Ok(mut frame) = latest_frame.lock() {
+                    *frame = Some(generated_frame.clone());
+                }
+                serde_json::to_string(&generated_frame).unwrap_or(generated)
+            } else {
+                generated
+            };
             if send_frame(&mut write_stream, &json).is_err() {
                 break;
             }
@@ -1408,6 +1448,10 @@ fn render_loop(
                 s.hide_borders,
                 FrameAnsiOptions {
                     clear_display,
+                    // Dirty-only: force_repaint every frame erase+paints all panes and
+                    // causes visible flicker / white flecks while typing or when a
+                    // sibling pane (e.g. ping) is scrolling. Per-row clipping +
+                    // selective CUP below keep cross-pane wrap from coming back.
                     force_repaint: false,
                 },
             );
@@ -2015,7 +2059,11 @@ fn cmd_split_window(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
 
         let new_pane = match spawn_pane(SpawnOptions {
             pane_id,
-            rows: (rows / 2).max(1),
+            rows: if direction == SplitDirection::Vertical {
+                (rows / 2).max(1)
+            } else {
+                rows
+            },
             cols: if direction == SplitDirection::Horizontal {
                 (cols / 2).max(1)
             } else {
@@ -2778,32 +2826,32 @@ mod tests {
     }
 
     #[test]
-    fn pane_repaint_erases_inner_to_prevent_ghosts() -> io::Result<()> {
-        // Regression for stale "ghost" cells: every repaint must erase its inner
-        // rect before repainting, because the content pass advances by display width
-        // and can leave wide-char spacer cells (and shrinking-line leftovers)
-        // untouched. The erase pass positions the cursor at each inner row start, the
-        // same spot the content pass uses, so each inner row is positioned twice.
+    fn pane_dirty_repaint_does_not_erase_inner_first() -> io::Result<()> {
+        // Erasing the inner rect before every dirty paint flashes blank/default
+        // cells when synchronized updates are not atomic. Content rows overwrite
+        // in place across the full width instead.
         let sz = Size::new(24, 80);
         let mut state = Server::new();
         make_session(&mut state, "0", sz)?;
 
         let win = &state.sessions[0].windows[0];
-        set_all_render_dirty(&win.root, false);
+        set_all_render_dirty(&win.root, true);
         let ansi = serialize_frame_ansi(
             win,
             frame_ansi_area(sz),
             false,
             FrameAnsiOptions {
                 clear_display: false,
-                force_repaint: true,
+                force_repaint: false,
             },
         );
-        // Inner origin for an 80x24 bordered pane is screen col 2, row 3 (1-based).
+        // A full erase pass would CUP to every inner row twice (erase + content).
+        // In-place paint cups once per row at the inner origin.
         let inner_row0_goto = "\x1b[3;2H";
-        assert!(
-            ansi.matches(inner_row0_goto).count() >= 2,
-            "pane inner must be erased before repaint (erase pass + content pass), \
+        assert_eq!(
+            ansi.matches(inner_row0_goto).count(),
+            1,
+            "dirty paint must not erase-then-paint (expected one row-start cup), \
              got count {} in: {ansi:?}",
             ansi.matches(inner_row0_goto).count()
         );
@@ -2828,8 +2876,13 @@ mod tests {
             },
         );
         assert!(
-            full.contains("\x1b[K"),
-            "clear_display frame must emit the screen clear"
+            !full.contains("\x1b[K"),
+            "clear_display must not EL (would wipe sibling panes on the same row)"
+        );
+        // Space-fill clear starts at the ansi area origin (row 2, col 1 in 1-based).
+        assert!(
+            full.contains("\x1b[2;1H"),
+            "clear_display frame must space-fill the pane area, got {full:?}"
         );
         Ok(())
     }
@@ -2979,6 +3032,138 @@ mod tests {
             state.sessions[0].windows[0].root,
             LayoutNode::Leaf(_)
         ));
+        Ok(())
+    }
+
+    /// Right-pane paint must stay inside its content rect. If we emit more
+    /// columns than fit from `inner.x` to the terminal edge, the host wraps to
+    /// column 0 and wipes the left pane (the "ls corrupts ping" failure mode).
+    #[test]
+    fn horizontal_split_ansi_does_not_wrap_into_left_pane() -> io::Result<()> {
+        let sz = Size::new(24, 80);
+        let mut state = Server::new();
+        make_session(&mut state, "0", sz)?;
+        let mut split = ParsedCommand::parse("split-window -h");
+        cmd_split_window(&mut state, &split.remove(0), sz);
+
+        let win = &state.sessions[0].windows[0];
+        let LayoutNode::Split { children, .. } = &win.root else {
+            panic!("expected horizontal split");
+        };
+        let (left, right) = match (&children[0], &children[1]) {
+            (LayoutNode::Leaf(l), LayoutNode::Leaf(r)) => (l, r),
+            _ => panic!("expected two leaves"),
+        };
+        // Each pane must be roughly half — not still full-width.
+        assert!(
+            right.last_cols < 50,
+            "right pane still full-width? cols={}",
+            right.last_cols
+        );
+        assert!(
+            left.last_cols < 50,
+            "left pane still full-width? cols={}",
+            left.last_cols
+        );
+
+        // Fill the right pane with a dense row (ls-like) so any over-paint wraps.
+        {
+            let line = "X".repeat(right.last_cols as usize);
+            let mut payload = String::new();
+            for _ in 0..right.last_rows {
+                payload.push_str(&line);
+                payload.push('\n');
+            }
+            if let Ok(mut parser) = right.parser.lock() {
+                parser.process(payload.as_bytes());
+            }
+            right.mark_render_dirty();
+        }
+
+        let area = frame_ansi_area(sz);
+        let ansi = serialize_frame_ansi(
+            win,
+            area,
+            false,
+            FrameAnsiOptions {
+                clear_display: false,
+                force_repaint: true,
+            },
+        );
+
+        // Host wrap at the physical line end wipes column 0 of the next row
+        // (the left pane). Also ensure right-pane 'X' fill never lands left of
+        // the split gap.
+        let term_cols = sz.cols as usize;
+        let rects = crate::layout::compute_rects(
+            &win.root,
+            area,
+            crate::layout::BORDER_SIZE,
+        );
+        let right_rect = *rects.get(&right.id).expect("right rect");
+        let left_limit = right_rect.x as usize;
+
+        let mut col = 0usize;
+        let mut row = 0usize;
+        let mut screen: Vec<Vec<char>> =
+            vec![vec![' '; term_cols]; sz.rows as usize];
+        let mut chars = ansi.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' {
+                if chars.peek() == Some(&'[') {
+                    chars.next();
+                    let mut params = String::new();
+                    let mut final_byte = ' ';
+                    for c in chars.by_ref() {
+                        if c.is_ascii_alphabetic() || c == '~' {
+                            final_byte = c;
+                            break;
+                        }
+                        params.push(c);
+                    }
+                    if final_byte == 'H' || final_byte == 'f' {
+                        let mut parts = params.split(';');
+                        let r: usize =
+                            parts.next().unwrap_or("1").parse().unwrap_or(1);
+                        let c: usize =
+                            parts.next().unwrap_or("1").parse().unwrap_or(1);
+                        row = r.saturating_sub(1);
+                        col = c.saturating_sub(1);
+                    }
+                }
+                continue;
+            }
+            if ch == '\n' {
+                row = row.saturating_add(1);
+                col = 0;
+                continue;
+            }
+            if ch == '\r' {
+                col = 0;
+                continue;
+            }
+            if ch < ' ' {
+                continue;
+            }
+            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+            assert!(
+                col + w <= term_cols,
+                "glyph {ch:?} at ({row},{col}) width {w} wraps past term_cols={term_cols}"
+            );
+            if row < screen.len() && col < term_cols {
+                screen[row][col] = ch;
+            }
+            col += w;
+        }
+
+        for (r, line) in screen.iter().enumerate() {
+            for (c, ch) in line.iter().enumerate().take(left_limit) {
+                assert_ne!(
+                    *ch, 'X',
+                    "right-pane content leaked into left pane at ({r},{c})"
+                );
+            }
+        }
         Ok(())
     }
 

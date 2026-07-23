@@ -189,7 +189,7 @@ fn child_rect(
     let mut offset = 0u16;
     for (i, &pct) in sizes.iter().enumerate().take(count) {
         let dim = if i == count - 1 {
-            available.saturating_sub(offset)
+            total_dim.saturating_sub(offset)
         } else {
             (available as u32 * pct as u32 / total_pct as u32) as u16
         };

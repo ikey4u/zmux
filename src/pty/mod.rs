@@ -78,6 +78,12 @@ pub fn spawn_pane(opts: SpawnOptions<'_>) -> io::Result<Pane> {
     cmd.env("COLORTERM", "truecolor");
     cmd.env("ZMUX", "1");
     cmd.env("ZMUX_PANE", format!("%{}", opts.pane_id));
+    // Override host COLUMNS/LINES. Many tools (GNU ls, eza, some prompts) prefer
+    // these over TIOCGWINSZ; inheriting the outer terminal width makes columnar
+    // output paint as if the pane were full-screen, which then wraps into the
+    // neighbouring pane.
+    cmd.env("COLUMNS", opts.cols.to_string());
+    cmd.env("LINES", opts.rows.to_string());
 
     for (k, v) in &opts.env {
         cmd.env(k, v);

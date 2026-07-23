@@ -349,7 +349,15 @@ fn write_ansi_bg(f: &mut Formatter<'_>, code: AnsiCode) -> fmt::Result {
 }
 
 pub fn vte_goto(x: u16, y: u16, out: &mut String) {
+    // Reset SGR after the cup so callers that re-init `current_styles` to
+    // DEFAULT_STYLES stay in sync with the host terminal.
     let _ = write!(out, "\x1b[{};{}H\x1b[m", y + 1, x + 1);
+}
+
+/// Move the cursor without resetting SGR. Used for per-cell cups inside a row
+/// so style diff state stays valid while still preventing host wrap.
+pub fn vte_cup(x: u16, y: u16, out: &mut String) {
+    let _ = write!(out, "\x1b[{};{}H", y + 1, x + 1);
 }
 
 pub fn write_style_diff(
