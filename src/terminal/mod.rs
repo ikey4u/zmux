@@ -605,7 +605,16 @@ fn cell_to_view(cell: &Cell) -> Option<TerminalCell> {
         return None;
     }
     let mut text = String::new();
-    text.push(cell.c);
+    // The terminal grid can retain a horizontal tab in the cell where the tab
+    // originated. Re-emitting that C0 control character moves the host cursor
+    // to the next tab stop without overwriting the skipped columns, leaving
+    // stale characters beside tab-indented output such as `git status`.
+    //
+    // Grid snapshots must contain drawable cells only. The parser has already
+    // represented the tab's cursor movement with the following blank cells, so
+    // render its origin as a normal space and never replay terminal controls.
+    let base = if cell.c.is_control() { ' ' } else { cell.c };
+    text.push(base);
     if let Some(chars) = cell.zerowidth() {
         text.extend(chars.iter().copied());
     }
@@ -614,7 +623,7 @@ fn cell_to_view(cell: &Cell) -> Option<TerminalCell> {
         text.push(' ');
     }
     let width = UnicodeWidthStr::width(text.as_str())
-        .max(cell.c.width().unwrap_or(1))
+        .max(base.width().unwrap_or(1))
         .max(1) as u16;
     Some(TerminalCell {
         text,
@@ -741,6 +750,47 @@ mod tests {
 
         assert_eq!(first_row_text(&term), "abc中");
         assert!(term.row_wrapped(0));
+    }
+
+    #[test]
+    fn git_status_scrolling_keeps_tab_indentation_blank() {
+        let mut term = AlacrittyTermState::new(8, 100, 1000);
+        let output = concat!(
+            "On branch main\r\n",
+            "Changes not staged for commit:\r\n",
+            "  (use \"git add <file>...\" to update)\r\n",
+            "  (use \"git restore <file>...\" to discard)\r\n",
+            "\t\x1b[31mmodified:   one\x1b[m\r\n",
+            "\t\x1b[31mmodified:   two\x1b[m\r\n",
+            "\t\x1b[31mmodified:   three\x1b[m\r\n",
+            "\r\n",
+            "Untracked files:\r\n",
+            "  (use \"git add <file>...\" to include)\r\n",
+            "\t\x1b[31muntracked/\x1b[m\r\n",
+            "\r\n",
+            "no changes added to commit\r\n",
+        );
+        term.process(output.as_bytes());
+
+        let mut checked_tabbed_row = false;
+        for row in term.visible_rows() {
+            let text: String = row
+                .into_iter()
+                .map(|cell| cell.map(|cell| cell.text).unwrap_or(" ".into()))
+                .collect();
+            if text.contains("modified:") || text.contains("untracked/") {
+                checked_tabbed_row = true;
+                assert_eq!(
+                    &text[..8],
+                    "        ",
+                    "a tab-indented git status row retained old cells: {text:?}"
+                );
+            }
+        }
+        assert!(
+            checked_tabbed_row,
+            "test output must leave a tab-indented status row visible"
+        );
     }
 
     #[test]
