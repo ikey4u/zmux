@@ -634,11 +634,15 @@ pub fn write_server_ansi<W: Write>(
 /// Start an atomic server-ANSI paint. Call [`end_server_ansi_update`] after any
 /// ratatui overlay that must appear in the same presentation.
 pub fn begin_server_ansi_update<W: Write>(writer: &mut W) -> io::Result<()> {
-    // Hide the cursor for the whole paint. Server ANSI issues many CUPs (row
-    // starts, borders, wide-glyph resync). If the cursor stays visible, each
-    // hop shows up as a flashing white fleck — especially on every keystroke.
-    writer.write_all(b"\x1b[?25l")?;
-    writer.write_all(b"\x1b[?2026h")
+    // Start the synchronized update before hiding the cursor. Terminals that
+    // support BSU can then present the hide, pane paint, cursor restore, and
+    // final position atomically. Hiding first makes an active pane's cursor
+    // visibly blink whenever a busy sibling pane publishes a frame.
+    //
+    // On terminals without BSU support the cursor is still hidden during all
+    // row-start and wide-glyph CUPs, preserving the white-fleck protection.
+    writer.write_all(b"\x1b[?2026h")?;
+    writer.write_all(b"\x1b[?25l")
 }
 
 /// Write a decoded server ANSI payload into an open synchronized update.
@@ -2457,8 +2461,8 @@ mod tests {
         let mut out = Vec::new();
         write_server_ansi(&mut out, &b64).unwrap();
         assert!(
-            out.starts_with(b"\x1b[?25l\x1b[?2026h"),
-            "expected hide-cursor + BSU prefix, got {out:?}"
+            out.starts_with(b"\x1b[?2026h\x1b[?25l"),
+            "cursor hide must be buffered inside the synchronized update, got {out:?}"
         );
         assert!(
             out.ends_with(b"\x1b[?2026l"),
