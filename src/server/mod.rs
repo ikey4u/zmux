@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io::{self, Write},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -9,9 +9,68 @@ use std::{
     time::{Duration, Instant},
 };
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+
 /// Makes client-requested full repaints distinct from an otherwise identical
 /// incremental frame so the polling client cannot deduplicate them away.
 static OVERLAY_RESTORE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+const FRAME_HISTORY_ENTRIES: usize = 512;
+const FRAME_HISTORY_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Default)]
+struct FrameStore {
+    latest: Option<FrameData>,
+    sequence: u64,
+    ansi_history: VecDeque<(u64, Vec<u8>)>,
+    ansi_history_bytes: usize,
+    history_floor: u64,
+}
+
+impl FrameStore {
+    fn publish(&mut self, frame: FrameData) {
+        self.sequence = self.sequence.wrapping_add(1);
+        if let Some(encoded) = frame.ansi.as_deref() {
+            if let Ok(bytes) = STANDARD.decode(encoded) {
+                if !bytes.is_empty() {
+                    self.ansi_history_bytes += bytes.len();
+                    self.ansi_history.push_back((self.sequence, bytes));
+                }
+            }
+        }
+        while self.ansi_history.len() > FRAME_HISTORY_ENTRIES
+            || self.ansi_history_bytes > FRAME_HISTORY_BYTES
+        {
+            let Some((sequence, bytes)) = self.ansi_history.pop_front() else {
+                break;
+            };
+            self.history_floor = sequence;
+            self.ansi_history_bytes =
+                self.ansi_history_bytes.saturating_sub(bytes.len());
+        }
+        self.latest = Some(frame);
+    }
+
+    fn frame_since(&self, sequence: u64) -> (Option<FrameData>, u64, bool) {
+        let mut frame = self.latest.clone();
+        let missed_history = sequence < self.history_floor;
+        if let Some(frame) = frame.as_mut() {
+            let mut ansi = Vec::new();
+            for (_, bytes) in self
+                .ansi_history
+                .iter()
+                .filter(|(published, _)| *published > sequence)
+            {
+                ansi.extend_from_slice(bytes);
+            }
+            // Never replay `latest.ansi` when there are no new publications.
+            // Each frame connection receives only deltas newer than its own
+            // acknowledged sequence.
+            frame.ansi = Some(STANDARD.encode(ansi));
+        }
+        (frame, self.sequence, missed_history)
+    }
+}
 
 use crate::{
     client::FrameData,
@@ -58,7 +117,7 @@ pub enum SessionTreeEntry {
 
 pub struct InProcessServer {
     state: Arc<Mutex<Server>>,
-    latest_frame: Arc<Mutex<Option<FrameData>>>,
+    latest_frame: Arc<Mutex<FrameStore>>,
     size: Arc<Mutex<Size>>,
 }
 
@@ -70,8 +129,7 @@ impl InProcessServer {
         start_dir: Option<String>,
     ) -> io::Result<Self> {
         let state = Arc::new(Mutex::new(Server::new()));
-        let latest_frame: Arc<Mutex<Option<FrameData>>> =
-            Arc::new(Mutex::new(None));
+        let latest_frame = Arc::new(Mutex::new(FrameStore::default()));
         let size_arc = Arc::new(Mutex::new(size));
 
         {
@@ -104,7 +162,7 @@ impl InProcessServer {
     }
 
     pub fn latest_frame(&self) -> Option<FrameData> {
-        self.latest_frame.lock().ok()?.clone()
+        self.latest_frame.lock().ok()?.latest.clone()
     }
 
     pub fn send_input(&self, bytes: &[u8]) {
@@ -558,7 +616,7 @@ pub fn install_server_panic_hook() {
 fn handle_client<S>(
     stream: S,
     state: Arc<Mutex<Server>>,
-    latest_frame: Arc<Mutex<Option<FrameData>>>,
+    latest_frame: Arc<Mutex<FrameStore>>,
     size_arc: Arc<Mutex<Size>>,
 ) -> io::Result<()>
 where
@@ -648,6 +706,8 @@ where
     log_server(&format!("size line: {:?}", sz_line));
     let (rows, cols) = parse_size_line(&sz_line).unwrap_or((24, 80));
     let new_size = Size::new(rows, cols);
+    let mut last_frame_sequence =
+        latest_frame.lock().map(|store| store.sequence).unwrap_or(0);
     {
         if let Ok(mut sz) = size_arc.lock() {
             *sz = new_size;
@@ -661,9 +721,6 @@ where
 
     log_server("entering main loop");
     let mut pending_yank: Option<String> = None;
-    // Per-connection geometry tracking: only do a destructive full-screen clear when
-    // the layout actually changes. Steady-state frames are incremental.
-    let mut last_layout_fp: Option<u64> = None;
     loop {
         let line = match recv_line(&mut reader) {
             Ok(l) if l.is_empty() => {
@@ -752,7 +809,7 @@ where
                 // is restored instead of replaying a ping-only incremental frame.
                 refresh_latest_frame(&latest_frame, &s, size);
                 if let Ok(mut latest) = latest_frame.lock() {
-                    if let Some(frame) = latest.as_mut() {
+                    if let Some(frame) = latest.latest.as_mut() {
                         frame.frame_type = format!(
                             "overlay-restore-{}",
                             OVERLAY_RESTORE_SEQUENCE
@@ -785,76 +842,72 @@ where
             mark_data_ready();
         } else if line == "FRAME?" {
             let yank_ref = pending_yank.take();
-            let generated = {
-                let mut s = match state.lock() {
-                    Ok(s) => s,
-                    Err(_) => break,
-                };
-                let sz =
-                    size_arc.lock().map(|s| *s).unwrap_or(Size::new(24, 80));
-                flush_sync_for_display_updates(&mut s);
-                reap_dead_panes(&mut s, sz);
-                if server_is_empty(&s) {
+            // Keep every ANSI delta published since this frame connection's last
+            // poll. A single shared "latest frame" loses nvim updates whenever a
+            // cursor-only frame or a busy sibling pane (for example `ping`)
+            // publishes before the client polls again.
+            let (mut frame, mut published_sequence, missed_history) =
+                latest_frame
+                    .lock()
+                    .map(|store| store.frame_since(last_frame_sequence))
+                    .unwrap_or((None, last_frame_sequence, false));
+            if missed_history {
+                let size = size_arc
+                    .lock()
+                    .map(|size| *size)
+                    .unwrap_or(Size::new(24, 80));
+                if let Ok(state) = state.lock() {
+                    let baseline = latest_frame
+                        .lock()
+                        .map(|store| store.sequence)
+                        .unwrap_or(last_frame_sequence);
+                    refresh_latest_frame(&latest_frame, &state, size);
+                    last_frame_sequence = baseline;
+                }
+                (frame, published_sequence, _) = latest_frame
+                    .lock()
+                    .map(|store| store.frame_since(last_frame_sequence))
+                    .unwrap_or((None, last_frame_sequence, false));
+            }
+            if frame.is_none() {
+                let is_empty = state
+                    .lock()
+                    .map(|state| server_is_empty(&state))
+                    .unwrap_or(true);
+                if is_empty {
                     log_server("all sessions empty, sending exit frame");
-                    "{\"type\":\"frame\",\"exit\":true,\"layout\":{\"type\":\"leaf\",\"id\":0,\"rows\":1,\"cols\":1,\"cursor_row\":0,\"cursor_col\":0,\"hide_cursor\":true,\"alternate_screen\":false,\"mouse_mode\":0,\"in_copy_mode\":false,\"cursor_shape\":255,\"active\":false,\"rows_v2\":[]}}".to_string()
-                } else {
-                    let session = match s.active_session() {
-                        Some(s) => s,
-                        None => continue,
-                    };
-                    let win =
-                        match session.windows.get(session.active_window_idx) {
-                            Some(w) => w,
-                            None => continue,
-                        };
-                    let layout_fp = layout_fingerprint(
-                        win,
-                        frame_ansi_area(sz),
-                        s.hide_borders,
-                    );
-                    let clear_display = last_layout_fp != Some(layout_fp);
-                    last_layout_fp = Some(layout_fp);
-                    build_frame_json(
-                        session,
-                        win,
-                        frame_layout_area(sz),
-                        yank_ref.as_deref(),
-                        s.hide_borders,
-                        sz,
-                        FrameAnsiOptions {
-                            clear_display,
-                            force_repaint: false,
-                        },
-                    )
-                }
-            };
-            let json = if generated.contains("\"exit\":true") {
-                generated
-            } else if let Ok(mut generated_frame) =
-                serde_json::from_str::<FrameData>(&generated)
-            {
-                // The render loop may already have consumed the dirty flag and
-                // published its incremental paint. Do not replace that frame with
-                // an empty poll response, or an update can be lost between polls.
-                if generated_frame.ansi.as_deref().is_some_and(str::is_empty) {
-                    if let Some(latest) =
-                        latest_frame.lock().ok().and_then(|frame| frame.clone())
-                    {
-                        generated_frame = latest;
+                    let json = "{\"type\":\"frame\",\"exit\":true,\"layout\":{\"type\":\"leaf\",\"id\":0,\"rows\":1,\"cols\":1,\"cursor_row\":0,\"cursor_col\":0,\"hide_cursor\":true,\"alternate_screen\":false,\"mouse_mode\":0,\"in_copy_mode\":false,\"cursor_shape\":255,\"active\":false,\"rows_v2\":[]}}";
+                    if send_frame(&mut write_stream, json).is_err() {
+                        break;
                     }
+                    break;
                 }
-                generated_frame.yank_text = yank_ref;
-                if let Ok(mut frame) = latest_frame.lock() {
-                    *frame = Some(generated_frame.clone());
+                // ATTACH normally publishes a full frame before the first poll.
+                // Cover the startup race with a one-time full publication; steady
+                // state polls never serialize pane output themselves.
+                let size = size_arc
+                    .lock()
+                    .map(|size| *size)
+                    .unwrap_or(Size::new(24, 80));
+                if let Ok(state) = state.lock() {
+                    refresh_latest_frame(&latest_frame, &state, size);
                 }
-                serde_json::to_string(&generated_frame).unwrap_or(generated)
-            } else {
-                generated
+                (frame, published_sequence, _) = latest_frame
+                    .lock()
+                    .map(|store| store.frame_since(last_frame_sequence))
+                    .unwrap_or((None, last_frame_sequence, false));
+            }
+            let Some(mut frame) = frame else {
+                log_server("no frame available after startup refresh");
+                break;
             };
+            frame.yank_text = yank_ref;
+            let json = serde_json::to_string(&frame).unwrap_or_default();
             if send_frame(&mut write_stream, &json).is_err() {
                 break;
             }
-            if json.contains("\"exit\":true") {
+            last_frame_sequence = published_sequence;
+            if frame.exit {
                 log_server("sent exit frame, closing connection");
                 break;
             }
@@ -1069,7 +1122,7 @@ fn handle_copy_nav(state: &Arc<Mutex<Server>>, dir: &str) {
 
 fn schedule_delayed_frame_refresh(
     state: &Arc<Mutex<Server>>,
-    latest_frame: &Arc<Mutex<Option<FrameData>>>,
+    latest_frame: &Arc<Mutex<FrameStore>>,
     size_arc: &Arc<Mutex<Size>>,
     target_size: Size,
 ) {
@@ -1089,7 +1142,7 @@ fn schedule_delayed_frame_refresh(
 }
 
 fn refresh_latest_frame(
-    latest_frame: &Arc<Mutex<Option<FrameData>>>,
+    latest_frame: &Arc<Mutex<FrameStore>>,
     state: &Server,
     size: Size,
 ) {
@@ -1113,7 +1166,7 @@ fn refresh_latest_frame(
     );
     if let Ok(fd) = serde_json::from_str::<FrameData>(&json) {
         if let Ok(mut frame) = latest_frame.lock() {
-            *frame = Some(fd);
+            frame.publish(fd);
         }
     }
 }
@@ -1343,7 +1396,7 @@ fn flush_sync_for_display_in_layout(node: &mut LayoutNode, flushed: &mut bool) {
 
 fn render_loop(
     state: Arc<Mutex<Server>>,
-    latest_frame: Arc<Mutex<Option<FrameData>>>,
+    latest_frame: Arc<Mutex<FrameStore>>,
     size: Arc<Mutex<Size>>,
     socket_name: Option<String>,
 ) {
@@ -1464,7 +1517,7 @@ fn render_loop(
 
         if let Ok(fd) = serde_json::from_str::<FrameData>(&frame_json) {
             if let Ok(mut frame) = latest_frame.lock() {
-                *frame = Some(fd);
+                frame.publish(fd);
             }
         }
     }
@@ -2638,6 +2691,13 @@ fn json_escape_status(s: &str, out: &mut String) {
 mod tests {
     use super::*;
 
+    fn test_frame() -> FrameData {
+        serde_json::from_str(
+            r#"{"type":"frame","layout":{"type":"leaf","id":1,"rows":1,"cols":1,"cursor_row":0,"cursor_col":0,"hide_cursor":false,"alternate_screen":false,"mouse_mode":0,"in_copy_mode":false,"cursor_shape":0,"active":true,"rows_v2":[]},"ansi":""}"#,
+        )
+        .unwrap()
+    }
+
     fn active_pane_size(state: &Server) -> (u16, u16) {
         let session = &state.sessions[state.active_session_idx];
         let win = &session.windows[session.active_window_idx];
@@ -2893,18 +2953,56 @@ mod tests {
         let resized = Size::new(30, 180);
         let mut state = Server::new();
         make_session(&mut state, "0", initial)?;
-        let latest_frame: Arc<Mutex<Option<FrameData>>> =
-            Arc::new(Mutex::new(None));
+        let latest_frame = Arc::new(Mutex::new(FrameStore::default()));
 
         refresh_latest_frame(&latest_frame, &state, initial);
-        let first = latest_frame.lock().unwrap().clone().unwrap();
+        let first = latest_frame.lock().unwrap().latest.clone().unwrap();
         assert_eq!(active_frame_size(&first.layout), Some((47, 178)));
 
         resize_all_panes(&mut state, resized);
         refresh_latest_frame(&latest_frame, &state, resized);
-        let second = latest_frame.lock().unwrap().clone().unwrap();
+        let second = latest_frame.lock().unwrap().latest.clone().unwrap();
         assert_eq!(active_frame_size(&second.layout), Some((27, 178)));
         Ok(())
+    }
+
+    #[test]
+    fn frame_store_merges_all_unread_ansi_deltas() {
+        let mut store = FrameStore::default();
+        let mut first = test_frame();
+        first.ansi = Some(STANDARD.encode(b"nvim-update"));
+        store.publish(first);
+
+        let mut sibling = test_frame();
+        sibling.ansi = Some(STANDARD.encode(b"ping-update"));
+        store.publish(sibling);
+
+        // Cursor-only output often produces a frame with no dirty rows. It must
+        // not replace either unread content update.
+        store.publish(test_frame());
+
+        let (frame, sequence, missed) = store.frame_since(0);
+        let ansi = STANDARD
+            .decode(frame.unwrap().ansi.unwrap())
+            .expect("merged ANSI must remain valid base64");
+        assert_eq!(ansi, b"nvim-updateping-update");
+        assert_eq!(sequence, 3);
+        assert!(!missed);
+    }
+
+    #[test]
+    fn frame_store_does_not_replay_last_delta_after_ack() {
+        let mut store = FrameStore::default();
+        let mut frame = test_frame();
+        frame.ansi = Some(STANDARD.encode(b"one-update"));
+        store.publish(frame);
+
+        let (_, sequence, _) = store.frame_since(0);
+        let (frame, _, _) = store.frame_since(sequence);
+        let ansi = STANDARD
+            .decode(frame.unwrap().ansi.unwrap())
+            .expect("empty ANSI must remain valid base64");
+        assert!(ansi.is_empty());
     }
 
     #[test]

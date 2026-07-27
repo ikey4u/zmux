@@ -1,7 +1,7 @@
 use std::{
     io::{self, BufReader, Write},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         mpsc, Arc, Mutex,
     },
     thread,
@@ -40,11 +40,26 @@ enum ControlWrite {
 
 pub struct SocketClient {
     socket_name: String,
-    latest_frame: Arc<Mutex<Option<FrameData>>>,
+    frame_slot: Arc<Mutex<FrameSlot>>,
     write_stream: Arc<Mutex<Box<dyn Write + Send>>>,
     control_tx: mpsc::Sender<ControlWrite>,
-    frame_counter: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
+}
+
+struct FrameSlot {
+    frame: Option<FrameData>,
+    counter: u64,
+}
+
+impl FrameSlot {
+    fn publish(&mut self, frame: FrameData) {
+        self.frame = Some(frame);
+        self.counter = self.counter.wrapping_add(1);
+    }
+
+    fn snapshot(&self) -> (Option<FrameData>, u64) {
+        (self.frame.clone(), self.counter)
+    }
 }
 
 fn exit_frame() -> FrameData {
@@ -73,13 +88,10 @@ fn exit_frame() -> FrameData {
     }
 }
 
-fn store_exit_frame(
-    latest_frame: &Arc<Mutex<Option<FrameData>>>,
-    reason: &str,
-) {
+fn store_exit_frame(frame_slot: &Arc<Mutex<FrameSlot>>, reason: &str) {
     log_socket(reason);
-    if let Ok(mut frame) = latest_frame.lock() {
-        *frame = Some(exit_frame());
+    if let Ok(mut slot) = frame_slot.lock() {
+        slot.publish(exit_frame());
     }
 }
 
@@ -151,8 +163,10 @@ impl SocketClient {
         log_socket("opened control connection");
         log_socket("connection established, starting poll thread");
 
-        let latest_frame: Arc<Mutex<Option<FrameData>>> =
-            Arc::new(Mutex::new(Some(first_frame)));
+        let frame_slot = Arc::new(Mutex::new(FrameSlot {
+            frame: Some(first_frame),
+            counter: 1,
+        }));
         let write_arc: Arc<Mutex<Box<dyn Write + Send>>> =
             Arc::new(Mutex::new(Box::new(control_stream)));
         let frame_write_arc: Arc<Mutex<Box<dyn Write + Send>>> =
@@ -171,12 +185,10 @@ impl SocketClient {
                 }
             }
         });
-        let frame_counter: Arc<AtomicU64> = Arc::new(AtomicU64::new(1));
         let shutdown: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
-        let frame_arc = Arc::clone(&latest_frame);
+        let frame_slot_poll = Arc::clone(&frame_slot);
         let ws_poll = Arc::clone(&frame_write_arc);
-        let counter_arc = Arc::clone(&frame_counter);
         let shutdown_poll = Arc::clone(&shutdown);
 
         thread::spawn(move || {
@@ -191,7 +203,7 @@ impl SocketClient {
                         Ok(ws) => ws,
                         Err(_) => {
                             store_exit_frame(
-                                &frame_arc,
+                                &frame_slot_poll,
                                 "poll thread lost write stream lock",
                             );
                             break;
@@ -200,7 +212,7 @@ impl SocketClient {
                     if ws.write_all(b"FRAME?\n").is_err() || ws.flush().is_err()
                     {
                         store_exit_frame(
-                            &frame_arc,
+                            &frame_slot_poll,
                             "poll thread failed to request frame",
                         );
                         break;
@@ -222,17 +234,16 @@ impl SocketClient {
                             if fd.exit {
                                 log_socket("poll thread received exit frame");
                             }
-                            if let Ok(mut f) = frame_arc.lock() {
+                            if let Ok(mut slot) = frame_slot_poll.lock() {
                                 if fd.yank_text.is_none() {
-                                    if let Some(prev) = f.as_ref() {
+                                    if let Some(prev) = slot.frame.as_ref() {
                                         if prev.yank_text.is_some() {
                                             fd.yank_text =
                                                 prev.yank_text.clone();
                                         }
                                     }
                                 }
-                                *f = Some(fd);
-                                counter_arc.fetch_add(1, Ordering::Relaxed);
+                                slot.publish(fd);
                             }
                         }
                     }
@@ -247,7 +258,7 @@ impl SocketClient {
                             continue;
                         }
                         store_exit_frame(
-                            &frame_arc,
+                            &frame_slot_poll,
                             &format!(
                                 "poll thread recv_frame failed, treating as exit: {}",
                                 e
@@ -262,10 +273,9 @@ impl SocketClient {
 
         Ok(Self {
             socket_name: socket_name.to_string(),
-            latest_frame,
+            frame_slot,
             write_stream: write_arc,
             control_tx,
-            frame_counter,
             shutdown,
         })
     }
@@ -277,11 +287,18 @@ impl SocketClient {
     }
 
     pub fn latest_frame(&self) -> Option<FrameData> {
-        self.latest_frame.lock().ok()?.clone()
+        self.frame_slot.lock().ok()?.frame.clone()
     }
 
-    pub fn frame_counter(&self) -> u64 {
-        self.frame_counter.load(Ordering::Relaxed)
+    /// Return a frame and its generation under one lock. The renderer must use
+    /// this instead of reading the frame and counter separately, otherwise a
+    /// freshly published counter can be paired with the previous frame and the
+    /// real update gets skipped until the next input event.
+    pub fn frame_snapshot(&self) -> (Option<FrameData>, u64) {
+        self.frame_slot
+            .lock()
+            .map(|slot| slot.snapshot())
+            .unwrap_or((None, 0))
     }
     pub fn send_input(&self, bytes: &[u8]) {
         if bytes.is_empty() {
@@ -408,28 +425,36 @@ impl SocketClient {
     }
 
     pub fn active_window_name(&self) -> String {
-        self.latest_frame
+        self.frame_slot
             .lock()
             .ok()
-            .and_then(|f| {
-                f.as_ref().and_then(|fd| fd.status.as_ref()).and_then(|st| {
-                    st.windows.iter().find(|w| w.active).map(|w| w.name.clone())
-                })
+            .and_then(|slot| {
+                slot.frame
+                    .as_ref()
+                    .and_then(|fd| fd.status.as_ref())
+                    .and_then(|st| {
+                        st.windows
+                            .iter()
+                            .find(|w| w.active)
+                            .map(|w| w.name.clone())
+                    })
             })
             .unwrap_or_default()
     }
 
     pub fn session_name(&self) -> String {
-        self.latest_frame
+        self.frame_slot
             .lock()
             .ok()
-            .and_then(|f| {
-                f.as_ref().and_then(|fd| fd.status.as_ref()).map(|st| {
-                    st.left
-                        .trim_start_matches('[')
-                        .trim_end_matches(']')
-                        .to_string()
-                })
+            .and_then(|slot| {
+                slot.frame.as_ref().and_then(|fd| fd.status.as_ref()).map(
+                    |st| {
+                        st.left
+                            .trim_start_matches('[')
+                            .trim_end_matches(']')
+                            .to_string()
+                    },
+                )
             })
             .unwrap_or_default()
     }
@@ -625,6 +650,24 @@ fn cleanup_killed_socket(socket_name: &str) {
 
 #[cfg(windows)]
 fn cleanup_killed_socket(_socket_name: &str) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_slot_publishes_frame_and_generation_together() {
+        let mut slot = FrameSlot {
+            frame: None,
+            counter: 7,
+        };
+        slot.publish(exit_frame());
+
+        let (frame, counter) = slot.snapshot();
+        assert_eq!(counter, 8);
+        assert!(frame.is_some_and(|frame| frame.exit));
+    }
+}
 
 impl Drop for SocketClient {
     fn drop(&mut self) {
