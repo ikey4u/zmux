@@ -52,6 +52,9 @@ pub struct Pane {
     pub bell_pending: Arc<AtomicBool>,
     pub copy_state: Option<CopyModeState>,
     pub output_ring: Arc<Mutex<VecDeque<u8>>>,
+    /// Complete OSC 52 sequences emitted by the pane, waiting to be relayed to
+    /// the attached terminal.
+    pub pending_osc52: Arc<Mutex<VecDeque<Vec<u8>>>>,
     pub reported_cwd: Arc<Mutex<Option<String>>>,
     pub start_dir: Option<String>,
     /// Set when PTY output arrives; cleared when server ANSI repaints this pane.

@@ -150,6 +150,40 @@ Each tab is backed by an independent server. Sessions, windows, and panes are is
 
 ---
 
+### Remote Clipboard (OSC 52)
+
+When zmux runs on a remote Linux server over SSH, it cannot directly call the
+clipboard on the client machine. Instead, zmux sends copied text to the
+terminal emulator running on the SSH client using the OSC 52 escape sequence.
+That terminal emulator must support OSC 52. For example, WezTerm supports it;
+macOS Terminal.app does not. See the [OSC 52 terminal compatibility
+list](https://can-i-use-terminal.github.io/features/osc52copy.html) for other
+supported terminals.
+
+This OSC 52 path does not require Linux graphical clipboard tools such as
+`xsel`, `xclip`, `wl-copy`, or a display server. You may still install and use
+them for other clipboard workflows on the remote host.
+
+Programs running inside a pane, including Neovim, emit their own terminal
+output. zmux relays valid OSC 52 sequences from that output to the attached
+terminal. Make sure the remote host runs a zmux version with this support and
+restart the remote zmux server after upgrading.
+
+For Neovim on the remote Linux host, configure the OSC 52 clipboard provider
+early in `~/.config/nvim/init.lua`:
+
+```lua
+vim.g.clipboard = "osc52"
+vim.opt.clipboard:append("unnamedplus")
+```
+
+Restart Neovim after changing the setting. `unnamedplus` makes ordinary `y`
+use the `+` register; `vim.g.clipboard = "osc52"` is what makes that register
+send its copied text through the terminal. You can verify the active provider
+with `:checkhealth clipboard` and test explicitly with `"+y`.
+
+---
+
 ### Keys Passed Through to the Shell
 
 New panes and windows inherit the current working directory by default. Splits
