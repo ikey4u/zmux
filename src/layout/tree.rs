@@ -297,6 +297,7 @@ pub fn pane_path_in_direction(
     dir: NavDir,
     total_area: crate::types::Rect,
     border_size: u16,
+    pane_mru: &[PaneId],
 ) -> Vec<usize> {
     use crate::layout::rect::compute_rects;
 
@@ -318,9 +319,12 @@ pub fn pane_path_in_direction(
 
     let ids = collect_pane_ids(node);
     let mut best_id: Option<crate::types::PaneId> = None;
-    // 评分：(主轴距离, -次轴重叠量)，越小越好
-    let mut best_primary = i32::MAX;
-    let mut best_overlap = i32::MIN;
+    // Stable spatial score, smallest first:
+    // 1. nearest pane on the requested axis
+    // 2. candidates overlapping the current pane on the other axis
+    // 3. most recently focused pane (makes crossing a one-to-many split reversible)
+    // 4. closest center, then greatest overlap and screen order
+    let mut best_score: Option<(i32, u8, usize, i32, i32, i32, PaneId)> = None;
 
     for &id in &ids {
         if id == cur_pane.id {
@@ -337,7 +341,7 @@ pub fn pane_path_in_direction(
         let r_bottom = r.y as i32 + r.height as i32 - 1;
 
         // 严格方向判断：候选 pane 的近端边界必须超过当前 pane 的远端边界
-        let (primary_dist, overlap) = match dir {
+        let (primary_dist, overlap, center_dist, screen_order) = match dir {
             NavDir::Right => {
                 if r_left <= cur_right {
                     continue;
@@ -345,7 +349,12 @@ pub fn pane_path_in_direction(
                 let dist = r_left - cur_right;
                 // 垂直方向重叠
                 let ov = overlap_1d(cur_top, cur_bottom, r_top, r_bottom);
-                (dist, ov)
+                (
+                    dist,
+                    ov,
+                    ((cur_top + cur_bottom) - (r_top + r_bottom)).abs(),
+                    r_top,
+                )
             }
             NavDir::Left => {
                 if r_right >= cur_left {
@@ -353,7 +362,12 @@ pub fn pane_path_in_direction(
                 }
                 let dist = cur_left - r_right;
                 let ov = overlap_1d(cur_top, cur_bottom, r_top, r_bottom);
-                (dist, ov)
+                (
+                    dist,
+                    ov,
+                    ((cur_top + cur_bottom) - (r_top + r_bottom)).abs(),
+                    r_top,
+                )
             }
             NavDir::Down => {
                 if r_top <= cur_bottom {
@@ -361,7 +375,12 @@ pub fn pane_path_in_direction(
                 }
                 let dist = r_top - cur_bottom;
                 let ov = overlap_1d(cur_left, cur_right, r_left, r_right);
-                (dist, ov)
+                (
+                    dist,
+                    ov,
+                    ((cur_left + cur_right) - (r_left + r_right)).abs(),
+                    r_left,
+                )
             }
             NavDir::Up => {
                 if r_bottom >= cur_top {
@@ -369,17 +388,30 @@ pub fn pane_path_in_direction(
                 }
                 let dist = cur_top - r_bottom;
                 let ov = overlap_1d(cur_left, cur_right, r_left, r_right);
-                (dist, ov)
+                (
+                    dist,
+                    ov,
+                    ((cur_left + cur_right) - (r_left + r_right)).abs(),
+                    r_left,
+                )
             }
         };
 
-        // 优先选：1) 主轴距离最小  2) 同距离时次轴重叠最大
-        let better = primary_dist < best_primary
-            || (primary_dist == best_primary && overlap > best_overlap);
-
-        if better {
-            best_primary = primary_dist;
-            best_overlap = overlap;
+        let mru_rank = pane_mru
+            .iter()
+            .position(|pane_id| *pane_id == id)
+            .unwrap_or(usize::MAX);
+        let score = (
+            primary_dist,
+            u8::from(overlap == 0),
+            mru_rank,
+            center_dist,
+            -overlap,
+            screen_order,
+            id,
+        );
+        if best_score.is_none_or(|best| score < best) {
+            best_score = Some(score);
             best_id = Some(id);
         }
     }
