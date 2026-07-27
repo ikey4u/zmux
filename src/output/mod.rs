@@ -690,6 +690,29 @@ fn write_child_node(
     }
 }
 
+fn relay_pending_osc52(node: &LayoutNode, out: &mut String) {
+    match node {
+        LayoutNode::Split { children, .. } => {
+            for child in children {
+                relay_pending_osc52(child, out);
+            }
+        }
+        LayoutNode::Leaf(pane) => {
+            let Ok(mut pending) = pane.pending_osc52.lock() else {
+                return;
+            };
+            while let Some(sequence) = pending.pop_front() {
+                // OSC 52 is ASCII control data. The tracker only enqueues
+                // validated sequences, so this conversion is infallible in
+                // practice; discard anything unexpected instead of emitting it.
+                if let Ok(sequence) = std::str::from_utf8(&sequence) {
+                    out.push_str(sequence);
+                }
+            }
+        }
+    }
+}
+
 pub fn layout_fingerprint(win: &Window, area: Rect, hide_borders: bool) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     let mut hasher = DefaultHasher::new();
@@ -768,6 +791,7 @@ pub fn serialize_frame_ansi(
             crate::layout::find_pane_by_id(&win.root, zoom.zoomed_pane_id)
         {
             write_pane(pane, true, area, hide_borders, &mut out, &opts);
+            relay_pending_osc52(&win.root, &mut out);
             return out;
         }
     }
@@ -779,6 +803,7 @@ pub fn serialize_frame_ansi(
         &mut out,
         &opts,
     );
+    relay_pending_osc52(&win.root, &mut out);
     out
 }
 
