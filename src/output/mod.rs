@@ -30,11 +30,9 @@ pub struct FrameAnsiOptions {
     /// since otherwise per-pane repaints fully overwrite their own cells. Doing this
     /// every frame causes a full-screen blank flash (flicker).
     pub clear_display: bool,
-    /// Repaint every pane regardless of its dirty flag. The client frame transport is a
-    /// lossy single-slot pull: the server may overwrite an unsent frame, so an
-    /// incremental (dirty-only) frame can be dropped and its update lost, making other
-    /// panes' text vanish. Forcing a full repaint each frame keeps every pane correct
-    /// without the destructive clear above.
+    /// Repaint every pane regardless of its dirty flag. Used for attach, resize,
+    /// and overlay restoration where the client needs a complete snapshot without
+    /// relying on incremental dirty state.
     pub force_repaint: bool,
 }
 
@@ -217,12 +215,15 @@ fn write_terminal_row(
     y: u16,
     pane_default_fg: Option<AnsiCode>,
     pane_default_bg: Option<AnsiCode>,
+    anchor_each_cell: bool,
     out: &mut String,
 ) {
-    // Anchor every cell to its logical grid column. A terminal font can disagree
-    // with alacritty's cell width (not only for PUA/CJK glyphs); streaming after
-    // one such disagreement shifts all later `ls` columns on that row.
-    // Cursor visibility and frame batching address paint flicker separately.
+    // Ordinary shell output is anchored at every grid column so host-side
+    // width disagreement or automatic wrapping cannot carry text across a
+    // pane boundary. Alternate-screen TUIs stream matching-width cells to
+    // avoid turning every nvim redraw into thousands of CUP sequences; they
+    // re-anchor after a glyph whose host display width may disagree with the
+    // Alacritty grid (most commonly a Nerd Font PUA glyph).
     vte_goto(x, y, out);
     let mut current_styles = DEFAULT_STYLES;
     let paint_end = row_paint_end(cells, cols);
@@ -233,9 +234,11 @@ fn write_terminal_row(
     );
     let mut active_bg = AnsiCode::Reset;
     let mut col = 0u16;
+    let mut resync_next_cell = false;
     while col < cols {
-        if col > 0 {
+        if col > 0 && (anchor_each_cell || resync_next_cell) {
             vte_cup(x + col, y, out);
+            resync_next_cell = false;
         }
         if paint_end.is_none_or(|end| col > end) {
             write_style_diff(&mut current_styles, reset_pad, out);
@@ -266,6 +269,7 @@ fn write_terminal_row(
             );
             write_style_diff(&mut current_styles, new_styles, out);
             out.push_str(&cell.text);
+            resync_next_cell = clip_w != advance;
             col = col.saturating_add(advance);
         } else {
             let new_styles = adjust_styles_for_custom_bg_fg(
@@ -372,21 +376,28 @@ fn layout_color_str(name: &str, fg: bool) -> Color {
     }
 }
 
+fn claim_render_dirty(
+    dirty: &std::sync::atomic::AtomicBool,
+    force_repaint: bool,
+) -> bool {
+    // Claim the current dirty generation before taking the parser snapshot.
+    // PTY output that arrives while this paint is in progress sets the flag
+    // again and must remain pending for the next render loop.
+    let was_dirty = dirty.swap(false, Ordering::AcqRel);
+    force_repaint || was_dirty
+}
+
 fn pane_paint_pending(pane: &Pane, opts: &FrameAnsiOptions) -> bool {
-    if opts.clear_display
-        || opts.force_repaint
-        || pane.render_dirty.load(Ordering::Relaxed)
-    {
+    if claim_render_dirty(
+        &pane.render_dirty,
+        opts.clear_display || opts.force_repaint,
+    ) {
         return true;
     }
     pane.parser
         .lock()
         .ok()
         .is_some_and(|parser| parser.has_pending_sync_paint())
-}
-
-fn finish_pane_paint(pane: &Pane) {
-    pane.render_dirty.store(false, Ordering::Relaxed);
 }
 
 fn write_scrollbar(content: Rect, ratio: f32, out: &mut String) {
@@ -465,13 +476,11 @@ fn write_pane(
             if redraw_border {
                 write_border(area, is_active, out);
             }
-            finish_pane_paint(pane);
             return;
         }
         if redraw_border {
             write_border(area, is_active, out);
         }
-        finish_pane_paint(pane);
         return;
     }
     let snapshot = match pane.parser.lock() {
@@ -482,12 +491,13 @@ fn write_pane(
                     parser.pane_default_fg(),
                     parser.pane_default_bg(),
                 ),
+                parser.alternate_screen(),
                 parser.visible_rows(),
             ))
         }
         Err(_) => None,
     };
-    let Some(((pane_fg, pane_bg), rows)) = snapshot else {
+    let Some(((pane_fg, pane_bg), alternate_screen, rows)) = snapshot else {
         if redraw_border {
             write_border(area, is_active, out);
         }
@@ -502,13 +512,13 @@ fn write_pane(
             inner.y + row_idx as u16,
             pane_fg,
             pane_bg,
+            !alternate_screen,
             out,
         );
     }
     if redraw_border {
         write_border(area, is_active, out);
     }
-    finish_pane_paint(pane);
 }
 
 fn fill_gap(gap: Rect, out: &mut String) {
@@ -821,10 +831,7 @@ pub fn encode_ansi_base64(ansi: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    };
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use alacritty_terminal::{
         term::cell::Flags,
@@ -840,7 +847,7 @@ mod tests {
         term.process(b"\x1b[42mABC\x1b[49m   ");
         let mut out = String::new();
         let cells = term.visible_rows().into_iter().next().unwrap_or_default();
-        write_terminal_row(&cells, 4, 0, 0, None, None, &mut out);
+        write_terminal_row(&cells, 4, 0, 0, None, None, false, &mut out);
         assert!(
             out.starts_with("\x1b[1;1H\x1b[m"),
             "line should reset SGR at start, got: {out:?}"
@@ -915,7 +922,7 @@ mod tests {
             }),
             None,
         ];
-        write_terminal_row(&cells, 3, 0, 0, None, None, &mut out);
+        write_terminal_row(&cells, 3, 0, 0, None, None, false, &mut out);
         assert_eq!(row_paint_end(&cells, 3), Some(2));
         assert!(
             out.contains("\x1b[42m"),
@@ -931,7 +938,9 @@ mod tests {
         let rows = term.visible_rows();
         let mut out = String::new();
         for (idx, cells) in rows.iter().take(2).enumerate() {
-            write_terminal_row(cells, 40, 0, idx as u16, None, None, &mut out);
+            write_terminal_row(
+                cells, 40, 0, idx as u16, None, None, false, &mut out,
+            );
         }
         assert_eq!(row_paint_end(&rows[0], 40), Some(39));
         let green_count = out.matches("\x1b[48;5;22m").count();
@@ -957,7 +966,7 @@ mod tests {
         );
         assert_eq!(row_paint_end(&cells, 20), Some(19));
         let mut out = String::new();
-        write_terminal_row(&cells, 20, 0, 0, None, None, &mut out);
+        write_terminal_row(&cells, 20, 0, 0, None, None, false, &mut out);
         assert!(
             out.contains("\x1b[48;5;22m"),
             "EL fill should paint green through EOL, got: {out:?}"
@@ -974,7 +983,7 @@ mod tests {
         term.process(b"\x1b[48;5;22m+ line one\x1b[m\n\n");
         let rows = term.visible_rows();
         let mut out = String::new();
-        write_terminal_row(&rows[1], 30, 0, 1, None, None, &mut out);
+        write_terminal_row(&rows[1], 30, 0, 1, None, None, false, &mut out);
         assert!(
             !out.contains("\x1b[48;5;22m"),
             "blank line should not inherit diff green, got: {out:?}"
@@ -1001,7 +1010,7 @@ mod tests {
                 width: 1,
             }),
         ];
-        write_terminal_row(&cells, 3, 0, 0, None, None, &mut out);
+        write_terminal_row(&cells, 3, 0, 0, None, None, false, &mut out);
         let green_start = out.find("\x1b[42m").expect("green bg");
         let x_pos = out.find('X').expect("X");
         let plus_pos = out.find('+').expect("plus");
@@ -1016,23 +1025,25 @@ mod tests {
 
     #[test]
     fn clear_display_paints_even_when_render_dirty_is_false() {
-        let dirty = Arc::new(AtomicBool::new(false));
-        let opts = FrameAnsiOptions {
-            clear_display: true,
-            force_repaint: false,
-        };
-        assert!(opts.clear_display || dirty.load(Ordering::Relaxed));
+        let dirty = AtomicBool::new(false);
+        assert!(claim_render_dirty(&dirty, true));
+        assert!(!dirty.load(Ordering::Relaxed));
     }
 
     #[test]
-    fn render_dirty_gates_incremental_repaint() {
-        let dirty = Arc::new(AtomicBool::new(false));
-        let opts = FrameAnsiOptions::default();
-        assert!(!opts.clear_display && !dirty.load(Ordering::Relaxed));
+    fn dirty_output_arriving_during_paint_remains_pending() {
+        let dirty = AtomicBool::new(false);
+        assert!(!claim_render_dirty(&dirty, false));
+
         dirty.store(true, Ordering::Relaxed);
-        assert!(opts.clear_display || dirty.load(Ordering::Relaxed));
-        dirty.store(false, Ordering::Relaxed);
-        assert!(!opts.clear_display && !dirty.load(Ordering::Relaxed));
+        assert!(claim_render_dirty(&dirty, false));
+        assert!(!dirty.load(Ordering::Relaxed));
+
+        // Simulate PTY output arriving after the renderer claimed the previous
+        // dirty generation but before it finished writing the ANSI payload.
+        dirty.store(true, Ordering::Release);
+        assert!(dirty.load(Ordering::Acquire));
+        assert!(claim_render_dirty(&dirty, false));
     }
 
     /// A wide character (CJK) sitting in the last content column must not be
@@ -1063,18 +1074,17 @@ mod tests {
         // glyph at x = 6 would spill into x = 7 (the pane's right border / gap),
         // so the row must not contain the wide glyph at all.
         let mut out = String::new();
-        write_terminal_row(&cells, 2, 5, 0, None, None, &mut out);
+        write_terminal_row(&cells, 2, 5, 0, None, None, false, &mut out);
         assert!(
             !out.contains('中'),
             "wide char painted in last column overflows pane width: {out:?}"
         );
     }
 
-    /// Every grid column gets an absolute CUP, even when normal CJK width agrees
-    /// with the host. This keeps columnar output aligned after any earlier width
-    /// disagreement in the same row.
+    /// Normal CJK width agrees with the terminal grid, so it can stream without
+    /// a per-cell CUP. This keeps full-screen applications fast.
     #[test]
-    fn write_terminal_row_cups_each_grid_column() {
+    fn write_terminal_row_streams_when_grid_width_matches_display_width() {
         let cells = vec![
             Some(TerminalCell {
                 text: "中".to_string(),
@@ -1093,7 +1103,7 @@ mod tests {
             }),
         ];
         let mut out = String::new();
-        write_terminal_row(&cells, 3, 10, 5, None, None, &mut out);
+        write_terminal_row(&cells, 3, 10, 5, None, None, false, &mut out);
         assert!(
             out.contains("\x1b[6;11H\x1b[m"),
             "row start cup+reset missing: {out:?}"
@@ -1102,15 +1112,47 @@ mod tests {
             out.contains('中') && out.contains('A'),
             "both glyphs must paint: {out:?}"
         );
-        assert_eq!(
-            out.matches("\x1b[6;13H").count(),
-            1,
-            "expected CUP at the grid column of A: {out:?}"
+        assert!(
+            !out.contains("\x1b[6;13H"),
+            "matching-width cells should stream without a per-cell CUP: {out:?}"
+        );
+    }
+
+    /// Shell rows are re-anchored at every grid column. This prevents a glyph
+    /// width mismatch or host-side automatic wrap in one pane from carrying
+    /// later `ls` output across the split into its neighbour.
+    #[test]
+    fn write_terminal_row_anchors_every_shell_grid_column() {
+        let cells = vec![
+            Some(TerminalCell {
+                text: "A".to_string(),
+                fg: Color::Named(NamedColor::Foreground),
+                bg: Color::Named(NamedColor::Background),
+                flags: Flags::empty(),
+                width: 1,
+            }),
+            Some(TerminalCell {
+                text: "B".to_string(),
+                fg: Color::Named(NamedColor::Foreground),
+                bg: Color::Named(NamedColor::Background),
+                flags: Flags::empty(),
+                width: 1,
+            }),
+        ];
+        let mut out = String::new();
+        write_terminal_row(&cells, 3, 10, 5, None, None, true, &mut out);
+        assert!(
+            out.contains("\x1b[6;12H"),
+            "second shell cell must have an absolute position: {out:?}"
+        );
+        assert!(
+            out.contains("\x1b[6;13H"),
+            "trailing shell padding must stay inside the pane: {out:?}"
         );
     }
 
     /// PUA icons often claim cell.width=1 while the host draws them double-wide.
-    /// After such a glyph, re-CUP to the next grid column so the stream cannot wrap.
+    /// Re-CUP only after such a glyph so later cells stay aligned.
     #[test]
     fn write_terminal_row_resyncs_cup_after_underreported_pua() {
         let icon = char::from_u32(0xE0A0).unwrap();
@@ -1138,7 +1180,7 @@ mod tests {
             }),
         ];
         let mut out = String::new();
-        write_terminal_row(&cells, 3, 10, 5, None, None, &mut out);
+        write_terminal_row(&cells, 3, 10, 5, None, None, false, &mut out);
         // After icon at x=10 (advance 1), next grid col is 11 → 1-based CUP 12.
         assert!(
             out.contains("\x1b[6;12H"),
@@ -1171,7 +1213,7 @@ mod tests {
             }),
         ];
         let mut out = String::new();
-        write_terminal_row(&cells, 2, 10, 3, None, None, &mut out);
+        write_terminal_row(&cells, 2, 10, 3, None, None, false, &mut out);
         assert!(
             !out.contains('中'),
             "under-reported wide glyph at last column must be clipped: {out:?}"
@@ -1206,7 +1248,7 @@ mod tests {
             }),
         ];
         let mut out = String::new();
-        write_terminal_row(&cells, 2, 0, 0, None, None, &mut out);
+        write_terminal_row(&cells, 2, 0, 0, None, None, false, &mut out);
         assert!(
             out.contains('B'),
             "PUA must not consume the next grid cell: {out:?}"

@@ -1297,8 +1297,8 @@ impl ClientApp {
         let mut last_overlay_rect: Option<ratatui::layout::Rect> = None;
         let run_result: io::Result<()> = (|| {
             loop {
-                let frame = tabs.active_client().latest_frame();
-                let current_counter = tabs.active_client().frame_counter();
+                let (frame, current_counter) =
+                    tabs.active_client().frame_snapshot();
                 let active_socket_name = tabs.active_socket_name();
                 if matches!(
                     copy_mode_sync_suppress_frame,
