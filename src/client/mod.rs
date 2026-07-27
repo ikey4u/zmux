@@ -2409,7 +2409,7 @@ impl ClientApp {
                                                                 .count()
                                                         ),
                                                         ClipboardCopyResult::Osc52 => format!(
-                                                            "copied {} chars via OSC 52",
+                                                            "sent {} chars via OSC 52",
                                                             text.chars()
                                                                 .count()
                                                         ),
@@ -4567,7 +4567,7 @@ fn copy_text_and_notify(
                 format!("copied {} chars", text.chars().count())
             }
             ClipboardCopyResult::Osc52 => {
-                format!("copied {} chars via OSC 52", text.chars().count())
+                format!("sent {} chars via OSC 52", text.chars().count())
             }
             ClipboardCopyResult::Unavailable => format!(
                 "yanked {} chars (clipboard unavailable)",

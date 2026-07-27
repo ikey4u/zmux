@@ -18,6 +18,7 @@ use crate::{
     types::{Pane, PaneId},
 };
 
+mod osc52;
 mod osc7;
 mod term_queries;
 
@@ -113,6 +114,8 @@ pub fn spawn_pane(opts: SpawnOptions<'_>) -> io::Result<Pane> {
     let bell_pending: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let output_ring: Arc<Mutex<VecDeque<u8>>> =
         Arc::new(Mutex::new(VecDeque::new()));
+    let pending_osc52: Arc<Mutex<VecDeque<Vec<u8>>>> =
+        Arc::new(Mutex::new(VecDeque::new()));
     let dead: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let render_dirty: Arc<AtomicBool> = Arc::new(AtomicBool::new(true));
     let reported_cwd: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -127,6 +130,7 @@ pub fn spawn_pane(opts: SpawnOptions<'_>) -> io::Result<Pane> {
         Arc::clone(&cursor_shape),
         Arc::clone(&bell_pending),
         Arc::clone(&output_ring),
+        Arc::clone(&pending_osc52),
         Arc::clone(&dead),
         Arc::clone(&render_dirty),
         Arc::clone(&reported_cwd),
@@ -151,6 +155,7 @@ pub fn spawn_pane(opts: SpawnOptions<'_>) -> io::Result<Pane> {
         bell_pending,
         copy_state: None,
         output_ring,
+        pending_osc52,
         reported_cwd,
         start_dir: opts.start_dir.map(|s| s.to_string()),
         render_dirty,
@@ -365,6 +370,7 @@ fn start_reader_thread(
     cursor_shape: Arc<AtomicU8>,
     bell_pending: Arc<AtomicBool>,
     output_ring: Arc<Mutex<VecDeque<u8>>>,
+    pending_osc52: Arc<Mutex<VecDeque<Vec<u8>>>>,
     dead_flag: Arc<AtomicBool>,
     render_dirty: Arc<AtomicBool>,
     reported_cwd: Arc<Mutex<Option<String>>>,
@@ -374,6 +380,7 @@ fn start_reader_thread(
         let mut buf = [0u8; 65536];
         let mut cursor_tracker = CursorShapeTracker::default();
         let mut cwd_tracker = osc7::CwdTracker::default();
+        let mut osc52_tracker = osc52::Osc52Tracker::default();
         let mut color_tracker =
             crate::terminal::osc_colors::OscColorTracker::default();
         let mut query_tracker = term_queries::TermQueryTracker::default();
@@ -422,6 +429,7 @@ fn start_reader_thread(
                     }
                     cursor_tracker.process(data, &cursor_shape);
                     cwd_tracker.process(data, &reported_cwd);
+                    osc52_tracker.process(data, &pending_osc52);
                     color_tracker.process(data, &parser);
                     query_tracker.process(data, &parser, &pty_writer);
                     data_version.fetch_add(1, Ordering::Relaxed);
