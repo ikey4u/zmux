@@ -280,19 +280,22 @@ pub fn restore_mouse_selection_ansi<W: io::Write>(
     layout_area: Rect,
     hide_borders: bool,
 ) -> io::Result<()> {
-    let Some((rows_v2, content_area)) =
-        active_pane_rows_v2(&fd.layout, layout_area, hide_borders)
-    else {
-        return Ok(());
-    };
-    write_rows_v2_rect_ansi(
+    // Repaint every affected row, including unselected text and trailing blank
+    // cells. The highlight layer is anchored per grid cell, so restoring only
+    // the logical selection rectangle can leave cyan cells behind when the
+    // host terminal and rows_v2 disagree about a glyph's display width.
+    let empty_col = start_col.min(end_col);
+    write_active_pane_selection_ansi(
         writer,
-        rows_v2,
-        content_area,
+        fd,
+        layout_area,
+        hide_borders,
         start_row,
-        start_col,
         end_row,
-        end_col,
+        start_row,
+        empty_col,
+        start_row,
+        empty_col,
     )
 }
 
@@ -354,10 +357,9 @@ pub fn write_active_pane_layout_ansi<W: io::Write>(
 ///
 /// Painting the full width of each affected row from the authoritative layout data —
 /// instead of overlaying only the selected glyphs — prevents earlier text on the line
-/// from being swallowed. Because the background text and the highlight are produced in
-/// one pass from the same source and advance through the row identically to the way the
-/// server paints it, every glyph stays at its exact column and the selection cannot
-/// drift sideways.
+/// from being swallowed. Every glyph and padding cell is anchored to its logical grid
+/// column, matching ordinary pane rendering even when the host terminal disagrees about
+/// a Nerd Font or wide glyph's display width.
 #[allow(clippy::too_many_arguments)]
 pub fn write_active_pane_selection_ansi<W: io::Write>(
     writer: &mut W,
@@ -372,7 +374,7 @@ pub fn write_active_pane_selection_ansi<W: io::Write>(
     sel_end_col: u16,
 ) -> io::Result<()> {
     use crate::output::{
-        vte_goto, write_style_diff, CharacterStyles, RESET_STYLES,
+        vte_cup, vte_goto, write_style_diff, CharacterStyles, RESET_STYLES,
     };
 
     let Some((rows_v2, content_area)) =
@@ -422,6 +424,13 @@ pub fn write_active_pane_selection_ansi<W: io::Write>(
         };
 
         vte_goto(content_area.x, y, &mut buf);
+        // Clear the complete logical row before repainting it. Rewriting a
+        // highlighted cell with a normal space is not sufficient on every
+        // terminal after a width disagreement has moved the physical cursor;
+        // ECH clears the exact pane columns without advancing or wrapping.
+        buf.push_str("\x1b[");
+        buf.push_str(&max_cols.to_string());
+        buf.push('X');
         // vte_goto emits `\x1b[m`, so the physical terminal is at default style.
         let mut current = RESET_STYLES;
         let mut col = 0usize;
@@ -434,6 +443,9 @@ pub fn write_active_pane_selection_ansi<W: io::Write>(
             for ch in run.text.chars() {
                 if col >= max_cols {
                     break;
+                }
+                if col > 0 {
+                    vte_cup(content_area.x + col as u16, y, &mut buf);
                 }
                 let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
                 // A wide glyph that does not fit in the remaining columns would
@@ -456,6 +468,9 @@ pub fn write_active_pane_selection_ansi<W: io::Write>(
         // `rows_v2` normally spans the full width, but guard against short rows so
         // stale highlight cells from a previous, wider selection get cleared.
         while col < max_cols {
+            if col > 0 {
+                vte_cup(content_area.x + col as u16, y, &mut buf);
+            }
             let abs_col = content_area.x + col as u16;
             let selected =
                 hl_begin < hl_end && abs_col >= hl_begin && abs_col < hl_end;
@@ -2976,6 +2991,73 @@ mod tests {
             .map(|c| (c.1, c.2))
             .collect();
         assert_eq!(highlighted, vec![(2, 'C')]);
+    }
+
+    #[test]
+    fn selection_overlay_anchors_every_grid_cell() {
+        // A host terminal may draw a Nerd Font PUA glyph wider than rows_v2
+        // reports. The following cell must still be moved back to its logical
+        // column so the highlight cannot drift outside the selection bounds.
+        let icon = char::from_u32(0xE0A0).unwrap();
+        let fd = active_leaf_frame(
+            3,
+            vec![row_from_runs(vec![cellrun(&format!("{icon}B"), "default")])],
+        );
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 3,
+            height: 1,
+        };
+        let mut out = Vec::new();
+        write_active_pane_selection_ansi(
+            &mut out, &fd, area, true, 0, 0, 0, 0, 0, 2,
+        )
+        .unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("\x1b[1;2H"),
+            "the cell after a PUA glyph must be absolutely positioned: {out:?}"
+        );
+        assert!(
+            out.contains("\x1b[1;3H"),
+            "trailing padding must also be absolutely positioned: {out:?}"
+        );
+    }
+
+    #[test]
+    fn selection_restore_repaints_full_rows_and_trailing_blanks() {
+        // Restoring only the selected rectangle leaves any highlight that
+        // drifted because of a host-width disagreement untouched. Clearing a
+        // selection must repaint the complete affected row, including padding.
+        let fd = active_leaf_frame(
+            4,
+            vec![row_from_runs(vec![cellrun("AB", "default")])],
+        );
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 1,
+        };
+        let mut out = Vec::new();
+        restore_mouse_selection_ansi(&mut out, &fd, 0, 1, 0, 2, area, true)
+            .unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("\x1b[4X"),
+            "restore must erase the complete row without wrapping: {out:?}"
+        );
+        let cells = decode_selection_ansi(&out);
+        assert_eq!(
+            row_cells(&cells, 0),
+            vec![
+                (0, 'A', false),
+                (1, 'B', false),
+                (2, ' ', false),
+                (3, ' ', false),
+            ]
+        );
     }
 
     #[test]
