@@ -2306,6 +2306,7 @@ fn cmd_select_pane(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
             if let Ok(pane_id) = id_str.parse::<usize>() {
                 if let Some(path) = find_pane_path(&win.root, pane_id) {
                     win.active_pane_path = path;
+                    record_pane_focus(win, pane_id);
                 }
             }
         }
@@ -2329,12 +2330,28 @@ fn cmd_select_pane(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
     if let Some(d) = dir {
         let border_size: u16 = if hide_borders { 0 } else { BORDER_SIZE };
         let path = win.active_pane_path.clone();
-        let new_path =
-            pane_path_in_direction(&win.root, &path, d, area, border_size);
+        let new_path = pane_path_in_direction(
+            &win.root,
+            &path,
+            d,
+            area,
+            border_size,
+            &win.pane_mru,
+        );
         if new_path != path {
+            let pane_id =
+                crate::layout::active_pane(&win.root, &new_path).map(|p| p.id);
             win.active_pane_path = new_path;
+            if let Some(pane_id) = pane_id {
+                record_pane_focus(win, pane_id);
+            }
         }
     }
+}
+
+fn record_pane_focus(win: &mut Window, pane_id: PaneId) {
+    win.pane_mru.retain(|id| *id != pane_id);
+    win.pane_mru.insert(0, pane_id);
 }
 
 fn cmd_resize_pane(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
@@ -2963,6 +2980,64 @@ mod tests {
         refresh_latest_frame(&latest_frame, &state, resized);
         let second = latest_frame.lock().unwrap().latest.clone().unwrap();
         assert_eq!(active_frame_size(&second.layout), Some((27, 178)));
+        Ok(())
+    }
+
+    #[test]
+    fn directional_navigation_returns_to_recent_pane_across_nested_split(
+    ) -> io::Result<()> {
+        let sz = Size::new(24, 80);
+        let mut state = Server::new();
+        make_session(&mut state, "0", sz)?;
+
+        let mut split = ParsedCommand::parse("split-window -h");
+        cmd_split_window(&mut state, &split.remove(0), sz);
+        let mut split = ParsedCommand::parse("split-window -v");
+        cmd_split_window(&mut state, &split.remove(0), sz);
+
+        let pane_ids =
+            crate::layout::collect_pane_ids(&state.sessions[0].windows[0].root);
+        assert_eq!(pane_ids.len(), 3);
+        let left = pane_ids[0];
+        let right_top = pane_ids[1];
+        let right_bottom = pane_ids[2];
+        let active_id = |state: &Server| {
+            let win = &state.sessions[0].windows[0];
+            crate::layout::active_pane(&win.root, &win.active_pane_path)
+                .unwrap()
+                .id
+        };
+        let select = |state: &mut Server, flag: &str| {
+            let mut commands =
+                ParsedCommand::parse(&format!("select-pane {flag}"));
+            cmd_select_pane(state, &commands.remove(0), sz);
+        };
+
+        assert_eq!(active_id(&state), right_bottom);
+        select(&mut state, "-L");
+        assert_eq!(active_id(&state), left);
+        select(&mut state, "-R");
+        assert_eq!(
+            active_id(&state),
+            right_bottom,
+            "moving back across a one-to-many split should return to the pane \
+             that focus came from"
+        );
+
+        select(&mut state, "-U");
+        assert_eq!(active_id(&state), right_top);
+        select(&mut state, "-L");
+        assert_eq!(active_id(&state), left);
+        select(&mut state, "-R");
+        assert_eq!(
+            active_id(&state),
+            right_top,
+            "MRU tie-breaking must track the latest top/bottom pane"
+        );
+        select(&mut state, "-D");
+        assert_eq!(active_id(&state), right_bottom);
+        select(&mut state, "-U");
+        assert_eq!(active_id(&state), right_top);
         Ok(())
     }
 

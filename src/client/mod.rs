@@ -3983,8 +3983,25 @@ impl ClientApp {
                                                     frame.as_ref().is_some_and(
                                                         |fd| fd.ansi.is_some(),
                                                     );
+                                                let pane_area =
+                                                    frame.as_ref().map(|fd| {
+                                                        active_pane_content_rect(
+                                                            fd,
+                                                            server_frame_area(
+                                                                cols, rows,
+                                                            ),
+                                                            hide_borders,
+                                                        )
+                                                    });
+                                                let completed_selection =
+                                                    finalize_mouse_selection(
+                                                        mouse_select.take(),
+                                                        mouse_drag_origin,
+                                                        mouse,
+                                                        pane_area,
+                                                    );
                                                 if let Some(sel) =
-                                                    mouse_select.take()
+                                                    completed_selection
                                                 {
                                                     if let Some(ref fd) = frame
                                                     {
@@ -4224,7 +4241,24 @@ impl ClientApp {
                                             frame.as_ref().is_some_and(|fd| {
                                                 fd.ansi.is_some()
                                             });
-                                        if let Some(sel) = mouse_select.take() {
+                                        let pane_area =
+                                            frame.as_ref().map(|fd| {
+                                                active_pane_content_rect(
+                                                    fd,
+                                                    server_frame_area(
+                                                        cols, rows,
+                                                    ),
+                                                    hide_borders,
+                                                )
+                                            });
+                                        let completed_selection =
+                                            finalize_mouse_selection(
+                                                mouse_select.take(),
+                                                mouse_drag_origin,
+                                                mouse,
+                                                pane_area,
+                                            );
+                                        if let Some(sel) = completed_selection {
                                             if let Some(ref fd) = frame {
                                                 if selection_is_caret(&sel) {
                                                     if mouse.modifiers.contains(
@@ -4598,6 +4632,49 @@ fn mouse_selection_from_drag(
             .min(pa.x + pa.width),
         end_row: mouse.row.max(pa.y).min(pa.y + pa.height.saturating_sub(1)),
     }
+}
+
+fn finalize_mouse_selection(
+    current: Option<MouseSelection>,
+    origin: Option<MouseDragOrigin>,
+    mouse: MouseEvent,
+    pane_area: Option<ratatui::layout::Rect>,
+) -> Option<MouseSelection> {
+    let Some(origin) = origin else {
+        // Double-click word selection has no drag origin and is already final.
+        return current;
+    };
+    if origin.row == mouse.row
+        && origin.col == mouse.column
+        && current.as_ref().is_none_or(selection_is_caret)
+    {
+        // Preserve CopyMode's caret selection; Normal mode represents the same
+        // no-motion click as None.
+        return current;
+    }
+
+    // Some terminals can coalesce a fast drag into Down -> Up without an
+    // intermediate Drag event. Build the selection here if necessary, and
+    // always use the Up coordinates so the final part of a drag is not lost.
+    let mut selection = current.unwrap_or(MouseSelection {
+        start_col: origin.col,
+        start_row: origin.row,
+        end_col: origin.col,
+        end_row: origin.row,
+    });
+    if let Some(pa) = pane_area {
+        selection.end_col = mouse
+            .column
+            .saturating_add(1)
+            .max(pa.x)
+            .min(pa.x + pa.width);
+        selection.end_row =
+            mouse.row.max(pa.y).min(pa.y + pa.height.saturating_sub(1));
+    } else {
+        selection.end_col = mouse.column.saturating_add(1);
+        selection.end_row = mouse.row;
+    }
+    Some(selection)
 }
 
 struct PaneContentRow {
@@ -6534,6 +6611,35 @@ mod tests {
     }
 
     #[test]
+    fn mouse_up_completes_selection_when_drag_event_was_coalesced() {
+        use crossterm::event::{
+            KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        };
+
+        let origin = MouseDragOrigin { row: 4, col: 8 };
+        let mouse_up = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 73,
+            row: 4,
+            modifiers: KeyModifiers::empty(),
+        };
+        let pane_area = ratatui::layout::Rect {
+            x: 1,
+            y: 1,
+            width: 100,
+            height: 20,
+        };
+        let selection = finalize_mouse_selection(
+            None,
+            Some(origin),
+            mouse_up,
+            Some(pane_area),
+        )
+        .expect("Down -> Up movement must still produce a selection");
+        assert_eq!(selection.normalized_bounds(), (4, 8, 4, 74));
+    }
+
+    #[test]
     fn mouse_copy_joins_copy_mode_wrapped_rows() {
         let fd = test_frame(vec![
             test_row("abcdef", Some(0)),
@@ -6874,7 +6980,7 @@ mod tests {
         };
 
         const PANE_ROWS: u16 = 8;
-        const PANE_COLS: u16 = 40;
+        const PANE_COLS: u16 = 128;
 
         fn terminal_size() -> (u16, u16) {
             // Tab bar + pane + status bar.
@@ -7014,6 +7120,30 @@ mod tests {
                 "sync_copy_text",
                 "rows_v2 must match ANSI after sync flush; \
                  without write_leaf flush this returns empty while the screen shows text"
+            );
+        }
+
+        #[test]
+        fn mouse_copy_reads_indented_colored_git_status_row() {
+            let pane = silent_test_pane().expect("test pane");
+            let text =
+                "both modified:   apps/box-desktop/src/rust/tenga-bridge/src/lib.rs";
+            feed_pane(&pane, format!("\x1b[31m\t{text}\x1b[m").as_bytes());
+            let win = test_window(pane);
+            let fd = build_frame_data(&win);
+            let (term_cols, term_rows) = terminal_size();
+            let layout_area = server_layout_area(term_cols, term_rows);
+            let (_, content_area) =
+                find_active_pane_content(&fd.layout, layout_area, true);
+            let sel = MouseSelection {
+                start_col: content_area.x + 8,
+                start_row: content_area.y,
+                end_col: content_area.x + 8 + text.len() as u16,
+                end_row: content_area.y,
+            };
+            assert_eq!(
+                extract_text_from_frame_in_area(&fd, &sel, layout_area, true,),
+                text
             );
         }
     }
