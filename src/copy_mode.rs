@@ -35,7 +35,7 @@ pub struct CopyRenderView {
 }
 
 pub fn enter(pane: &mut Pane) -> bool {
-    let (snapshot_source, snapshot) = match snapshot_for_copy_mode(pane, None) {
+    let (snapshot_source, snapshot) = match snapshot_for_copy_mode(pane) {
         Some(snapshot) => snapshot,
         None => return false,
     };
@@ -50,51 +50,13 @@ pub fn enter(pane: &mut Pane) -> bool {
 
 fn snapshot_for_copy_mode(
     pane: &Pane,
-    _preferred_source: Option<CopySnapshotSource>,
 ) -> Option<(CopySnapshotSource, PaneTextSnapshot)> {
-    let parser = pane.parser.lock().ok();
-    let alternate_screen = parser
-        .as_ref()
-        .map(|p| p.alternate_screen())
-        .unwrap_or(false);
-    let scroll_on_erase_history = parser
-        .as_ref()
-        .map(|p| p.scroll_on_erase_history())
-        .unwrap_or(false);
-    let snapshot = if alternate_screen || scroll_on_erase_history {
-        parser.as_ref().map(|p| snapshot_from_parser(p))
-    } else {
-        snapshot_from_output_ring(pane)
-            .or_else(|| parser.as_ref().map(|p| snapshot_from_parser(p)))
-    };
-    snapshot.map(|s| (CopySnapshotSource::Parser, s))
-}
-
-fn snapshot_from_output_ring(pane: &Pane) -> Option<PaneTextSnapshot> {
-    let ring_data: Vec<u8> = pane
-        .output_ring
-        .lock()
-        .ok()
-        .map(|ring| ring.iter().copied().collect())?;
-    if ring_data.is_empty() {
-        return None;
-    }
-    Some(snapshot_from_output_bytes(
-        &ring_data,
-        pane.last_rows,
-        pane.last_cols,
-    ))
-}
-
-fn snapshot_from_output_bytes(
-    bytes: &[u8],
-    rows: u16,
-    cols: u16,
-) -> PaneTextSnapshot {
-    let mut tmp_parser =
-        AlacrittyTermState::new(rows.max(1), cols.max(1), 2000);
-    tmp_parser.process(bytes);
-    snapshot_from_parser(&tmp_parser)
+    // The live parser is the only geometry-aware, sequence-complete source of
+    // terminal history. Replaying `output_ring` is unsafe after its byte cap
+    // evicts the beginning of an ANSI or alternate-screen session: a fresh
+    // parser then interprets old TUI drawing as primary-screen scrollback.
+    let parser = pane.parser.lock().ok()?;
+    Some((CopySnapshotSource::Parser, snapshot_from_parser(&parser)))
 }
 
 fn snapshot_from_parser(parser: &AlacrittyTermState) -> PaneTextSnapshot {
@@ -347,14 +309,12 @@ pub fn exit(pane: &mut Pane) {
 }
 
 pub fn refresh_layout(pane: &mut Pane) {
-    let Some(preferred_source) =
-        pane.copy_state.as_ref().map(|state| state.snapshot_source)
-    else {
+    if pane.copy_state.is_none() {
         return;
-    };
+    }
     let width = pane.last_cols.max(1) as usize;
     let height = pane.last_rows.max(1) as usize;
-    let snapshot = snapshot_for_copy_mode(pane, Some(preferred_source));
+    let snapshot = snapshot_for_copy_mode(pane);
     let Some(state) = pane.copy_state.as_mut() else {
         return;
     };
@@ -1595,6 +1555,8 @@ enum StyleKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::pty::{spawn_pane, SpawnOptions};
     use crate::types::{
         history::{PaneTextSnapshot, SnapshotLine},
         SelectionMode,
@@ -1702,13 +1664,99 @@ mod tests {
     }
 
     #[test]
-    fn output_replay_preserves_zsh_missing_newline_output() {
+    fn parser_snapshot_preserves_zsh_missing_newline_output() {
         let bytes = b"$ bash test.sh\r\n{\"code\":10008,\"msg\":\"access denied\"}\x1b[1m\x1b[7m%\x1b[27m\x1b[1m\x1b[0m                                                                               \r \r\r\x1b[0m\x1b[27m\x1b[24m\x1b[J$ ";
-        let snapshot = snapshot_from_output_bytes(bytes, 5, 80);
+        let mut parser = AlacrittyTermState::new(5, 80, 2000);
+        parser.process(bytes);
+        let snapshot = snapshot_from_parser(&parser);
         assert!(snapshot
             .lines
             .iter()
             .any(|line| line.text.contains("access denied")));
+    }
+
+    #[test]
+    fn parser_snapshot_excludes_exited_alternate_screen_content() {
+        let mut parser = AlacrittyTermState::new(6, 80, 2000);
+        parser.process(b"primary history\r\nshell$ ");
+        parser.process(b"\x1b[?1049h\x1b[2J\x1b[HOLD_GITUI_MENU\x1b[?1049l");
+        parser.process(b"current command");
+
+        let copied_history = snapshot_from_parser(&parser)
+            .lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            copied_history.contains("primary history")
+                && copied_history.contains("shell$ current command"),
+            "live parser lost its restored primary screen: {copied_history:?}"
+        );
+        assert!(
+            !copied_history.contains("OLD_GITUI_MENU"),
+            "exited alternate-screen content leaked into primary history: \
+             {copied_history:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_mode_ignores_truncated_alternate_screen_output_ring(
+    ) -> std::io::Result<()> {
+        let mut pane = spawn_pane(SpawnOptions {
+            pane_id: 1,
+            rows: 6,
+            cols: 80,
+            command: Some("/bin/cat"),
+            start_dir: None,
+            env: vec![],
+            scroll_on_erase_in_display: false,
+        })?;
+
+        if let Ok(mut parser) = pane.parser.lock() {
+            *parser = AlacrittyTermState::new(6, 80, 2000);
+            parser.process(b"authoritative history\r\ncurrent shell$ ");
+        }
+        if let Ok(mut ring) = pane.output_ring.lock() {
+            ring.clear();
+            // This is the tail of an alternate-screen session after the ring
+            // has evicted its `CSI ?1049h` entry sequence. Replaying it in a
+            // fresh parser paints the old TUI into primary scrollback.
+            ring.extend(
+                b"\x1b[2J\x1b[HOLD_GITUI_MENU\x1b[?1049l\
+                  truncated ring shell$ ",
+            );
+        }
+
+        let entered = enter(&mut pane);
+        let copied_history = pane
+            .copy_state
+            .as_ref()
+            .map(|state| {
+                state
+                    .snapshot
+                    .lines
+                    .iter()
+                    .map(|line| line.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        let _ = pane.child.kill();
+
+        assert!(entered, "copy mode should use the available live parser");
+        assert!(
+            copied_history.contains("authoritative history")
+                && copied_history.contains("current shell$"),
+            "copy mode lost live parser history: {copied_history:?}"
+        );
+        assert!(
+            !copied_history.contains("OLD_GITUI_MENU")
+                && !copied_history.contains("truncated ring shell$"),
+            "copy mode replayed a truncated raw output ring: {copied_history:?}"
+        );
+        Ok(())
     }
 
     #[test]
