@@ -87,7 +87,7 @@ use crate::{
     types::{
         events::{mark_data_ready, PTY_DATA_READY},
         layout::{LayoutNode, Rect, SplitDirection},
-        options::{SessionOptions, WindowOptions},
+        options::{SessionOptions, WindowOptions, MAX_HISTORY_LIMIT},
         session::{PaneId, Server, Session, Size, Window},
     },
 };
@@ -1378,12 +1378,16 @@ fn flush_sync_for_display_updates(state: &mut Server) -> bool {
 fn flush_sync_for_display_in_layout(node: &mut LayoutNode, flushed: &mut bool) {
     match node {
         LayoutNode::Leaf(pane) => {
-            if let Ok(mut parser) = pane.parser.lock() {
-                if parser.flush_sync_for_display() {
-                    pane.render_dirty
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                    *flushed = true;
-                }
+            let did_flush = pane
+                .parser
+                .lock()
+                .map(|mut parser| parser.flush_sync_for_display())
+                .unwrap_or(false);
+            if did_flush {
+                crate::pty::persist_pending_history(pane);
+                pane.render_dirty
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                *flushed = true;
             }
         }
         LayoutNode::Split { children, .. } => {
@@ -1659,6 +1663,7 @@ fn create_initial_session(
         pane_id,
         rows,
         cols,
+        history_limit: state.options.history_limit,
         command: None,
         start_dir: start_dir.as_deref(),
         env: vec![],
@@ -1759,10 +1764,38 @@ fn set_scroll_on_erase_in_display_node(node: &mut LayoutNode, enabled: bool) {
     }
 }
 
+fn set_history_limit(state: &mut Server, history_limit: usize) {
+    state.options.history_limit = history_limit;
+    state.force_clear_display = true;
+    for session in &mut state.sessions {
+        for win in &mut session.windows {
+            set_history_limit_node(&mut win.root, history_limit);
+        }
+    }
+}
+
+fn set_history_limit_node(node: &mut LayoutNode, history_limit: usize) {
+    match node {
+        LayoutNode::Leaf(pane) => {
+            if let Ok(mut parser) = pane.parser.lock() {
+                parser.set_scrollback_limit(history_limit);
+            }
+            crate::pty::persist_pending_history(pane);
+            crate::copy_mode::refresh_layout(pane);
+            pane.mark_render_dirty();
+        }
+        LayoutNode::Split { children, .. } => {
+            for child in children {
+                set_history_limit_node(child, history_limit);
+            }
+        }
+    }
+}
+
 fn options_json(state: &Server) -> String {
     format!(
-        "{{\"scroll_on_erase_in_display\":{}}}",
-        state.options.scroll_on_erase_in_display
+        "{{\"scroll_on_erase_in_display\":{},\"history_limit\":{}}}",
+        state.options.scroll_on_erase_in_display, state.options.history_limit
     )
 }
 
@@ -1868,6 +1901,16 @@ fn dispatch_command_output(
             cmd_clear_pane(state);
             String::new()
         }
+        "set-option" | "set" => cmd_set_option(state, cmd),
+        "show-options" | "show" => format!(
+            "history-limit {}\nscroll-on-erase-in-display {}",
+            state.options.history_limit,
+            if state.options.scroll_on_erase_in_display {
+                "on"
+            } else {
+                "off"
+            }
+        ),
         "copy-mode" => {
             with_active_pane_mut(state, |pane| {
                 crate::copy_mode::enter(pane);
@@ -1877,6 +1920,35 @@ fn dispatch_command_output(
             String::new()
         }
         _ => String::new(),
+    }
+}
+
+fn cmd_set_option(state: &mut Server, cmd: &ParsedCommand) -> String {
+    let Some(name) = cmd.args.first().map(String::as_str) else {
+        return "set-option: missing option name".to_string();
+    };
+    let Some(value) = cmd.args.get(1).map(String::as_str) else {
+        return format!("set-option: missing value for {name}");
+    };
+
+    match name {
+        "history-limit" | "history_limit" => {
+            let Ok(history_limit) = value.parse::<usize>() else {
+                return format!(
+                    "set-option: history-limit must be an integer from 0 to \
+                     {MAX_HISTORY_LIMIT}"
+                );
+            };
+            if history_limit > MAX_HISTORY_LIMIT {
+                return format!(
+                    "set-option: history-limit must be between 0 and \
+                     {MAX_HISTORY_LIMIT}"
+                );
+            }
+            set_history_limit(state, history_limit);
+            format!("history-limit: {history_limit}")
+        }
+        _ => format!("set-option: unknown option {name}"),
     }
 }
 
@@ -1949,6 +2021,7 @@ fn make_session_with_start_dir(
         pane_id,
         rows,
         cols,
+        history_limit: state.options.history_limit,
         command: None,
         start_dir: start_dir.as_deref(),
         env: vec![],
@@ -2071,6 +2144,7 @@ fn cmd_split_window(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
         SplitDirection::Vertical
     };
     let scroll_on_erase_in_display = state.options.scroll_on_erase_in_display;
+    let history_limit = state.options.history_limit;
 
     {
         let session = match active_session_mut(state) {
@@ -2122,6 +2196,7 @@ fn cmd_split_window(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
             } else {
                 cols
             },
+            history_limit,
             command: None,
             start_dir: start_dir.as_deref(),
             env: vec![],
@@ -2156,6 +2231,7 @@ fn cmd_split_window(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
 
 fn cmd_new_window(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
     let scroll_on_erase_in_display = state.options.scroll_on_erase_in_display;
+    let history_limit = state.options.history_limit;
     {
         let session = match active_session_mut(state) {
             Some(s) => s,
@@ -2171,6 +2247,7 @@ fn cmd_new_window(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
             pane_id,
             rows,
             cols,
+            history_limit,
             command: None,
             start_dir: start_dir.as_deref(),
             env: vec![],
@@ -2670,16 +2747,19 @@ fn shift_split_sizes(
 fn cmd_clear_pane(state: &mut Server) {
     with_active_pane_mut(state, |pane| {
         pane.copy_state = None;
-        if let Ok(mut ring) = pane.output_ring.lock() {
-            ring.clear();
-        }
+        let _history_guard = pane
+            .history_serial
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pane.history_writer.clear();
         if let Ok(mut parser) = pane.parser.lock() {
             let scroll_on_erase_in_display =
                 parser.scroll_on_erase_in_display();
+            let history_limit = parser.scrollback_limit();
             *parser = crate::terminal::AlacrittyTermState::new(
                 pane.last_rows,
                 pane.last_cols,
-                2000,
+                history_limit,
             );
             parser.set_scroll_on_erase_in_display(scroll_on_erase_in_display);
             if scroll_on_erase_in_display {
@@ -2723,6 +2803,17 @@ mod tests {
         (pane.last_rows, pane.last_cols)
     }
 
+    fn active_pane_history_limit(state: &Server) -> usize {
+        let session = &state.sessions[state.active_session_idx];
+        let win = &session.windows[session.active_window_idx];
+        let pane = crate::layout::active_pane(&win.root, &win.active_pane_path)
+            .unwrap();
+        pane.parser
+            .lock()
+            .map(|parser| parser.scrollback_limit())
+            .unwrap_or_default()
+    }
+
     fn active_frame_size(
         layout: &crate::client::LayoutJson,
     ) -> Option<(u16, u16)> {
@@ -2744,6 +2835,100 @@ mod tests {
         make_session(&mut state, "0", sz)?;
         resize_all_panes(&mut state, sz);
         assert!(state.force_clear_display);
+        Ok(())
+    }
+
+    #[test]
+    fn history_limit_applies_to_existing_and_new_panes() -> io::Result<()> {
+        let sz = Size::new(24, 80);
+        let mut state = Server::new();
+        state.options.history_limit = 17;
+        make_session(&mut state, "0", sz)?;
+        assert_eq!(active_pane_history_limit(&state), 17);
+
+        let cmd =
+            ParsedCommand::parse("set-option -g history-limit 23").remove(0);
+        assert_eq!(cmd_set_option(&mut state, &cmd), "history-limit: 23");
+        assert_eq!(state.options.history_limit, 23);
+        assert_eq!(active_pane_history_limit(&state), 23);
+
+        let split = ParsedCommand::parse("split-window -h").remove(0);
+        cmd_split_window(&mut state, &split, sz);
+        let win = &state.sessions[0].windows[0];
+        for pane_id in crate::layout::collect_pane_ids(&win.root) {
+            let pane =
+                crate::layout::find_pane_by_id(&win.root, pane_id).unwrap();
+            assert_eq!(
+                pane.parser
+                    .lock()
+                    .map(|parser| parser.scrollback_limit())
+                    .unwrap_or_default(),
+                23
+            );
+        }
+
+        let new_window = ParsedCommand::parse("new-window").remove(0);
+        cmd_new_window(&mut state, &new_window, sz);
+        assert_eq!(active_pane_history_limit(&state), 23);
+
+        let new_session =
+            ParsedCommand::parse("new-session -s history-test").remove(0);
+        cmd_new_session(&mut state, &new_session, sz);
+        assert_eq!(active_pane_history_limit(&state), 23);
+
+        let invalid =
+            ParsedCommand::parse("set-option -g history-limit 100001")
+                .remove(0);
+        assert!(cmd_set_option(&mut state, &invalid).contains("between 0"));
+        assert_eq!(state.options.history_limit, 23);
+        kill_all_panes(&mut state);
+        Ok(())
+    }
+
+    #[test]
+    fn clear_pane_preserves_its_history_limit() -> io::Result<()> {
+        let sz = Size::new(24, 80);
+        let mut state = Server::new();
+        make_session(&mut state, "0", sz)?;
+        {
+            let session = state.active_session_mut().unwrap();
+            let win = session.active_window_mut().unwrap();
+            let pane = crate::layout::active_pane_mut(
+                &mut win.root,
+                &win.active_pane_path,
+            )
+            .unwrap();
+            pane.parser.lock().unwrap().set_scrollback_limit(29);
+            *pane.history.lock().unwrap() =
+                crate::history_store::PaneHistory::for_test(
+                    std::env::temp_dir().join(format!(
+                        "zmux-server-clear-history-test-{}",
+                        std::process::id()
+                    )),
+                    100,
+                );
+            pane.history
+                .lock()
+                .unwrap()
+                .append(&crate::types::SnapshotLine {
+                    text: "archived".to_string(),
+                    terminated: true,
+                    styles: Vec::new(),
+                })
+                .unwrap();
+        }
+
+        cmd_clear_pane(&mut state);
+        assert_eq!(active_pane_history_limit(&state), 29);
+        {
+            let session = state.active_session().unwrap();
+            let win = session.active_window().unwrap();
+            let pane =
+                crate::layout::active_pane(&win.root, &win.active_pane_path)
+                    .unwrap();
+            assert!(pane.history.lock().unwrap().is_empty());
+        }
+        kill_all_panes(&mut state);
         Ok(())
     }
 
@@ -2922,15 +3107,48 @@ mod tests {
                 force_repaint: false,
             },
         );
-        // A full erase pass would CUP to every inner row twice (erase + content).
-        // In-place paint cups once per row at the inner origin.
-        let inner_row0_goto = "\x1b[3;2H";
+        // A full erase pass would vte_goto every inner row twice (erase + content).
+        // In-place paint does one reset-goto per row; a trailing wrap-cancel CUP
+        // (no SGR reset) is not an erase.
+        let inner_row0_goto = "\x1b[3;2H\x1b[m";
         assert_eq!(
             ansi.matches(inner_row0_goto).count(),
             1,
             "dirty paint must not erase-then-paint (expected one row-start cup), \
              got count {} in: {ansi:?}",
             ansi.matches(inner_row0_goto).count()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dirty_incremental_paint_restores_vertical_borders() -> io::Result<()> {
+        // Incremental dirty frames used to skip borders. A host-width mismatch
+        // or last-column wrap then left stray cells just past the right edge
+        // for the rest of the session.
+        let sz = Size::new(24, 80);
+        let mut state = Server::new();
+        make_session(&mut state, "0", sz)?;
+
+        let win = &state.sessions[0].windows[0];
+        set_all_render_dirty(&win.root, true);
+        let ansi = serialize_frame_ansi(
+            win,
+            frame_ansi_area(sz),
+            false,
+            FrameAnsiOptions {
+                clear_display: false,
+                force_repaint: false,
+            },
+        );
+        assert!(
+            ansi.contains("\x1b[3;80H") && ansi.contains('│'),
+            "dirty incremental paint must restore the right border column, got {ansi:?}"
+        );
+        assert_eq!(
+            corner_count(&ansi),
+            0,
+            "incremental paint should not redraw full-frame corners"
         );
         Ok(())
     }

@@ -15,7 +15,9 @@ use crossterm::{
         PushKeyboardEnhancementFlags,
     },
     execute,
-    terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{
+        self, DisableLineWrap, EnterAlternateScreen, LeaveAlternateScreen,
+    },
 };
 use ratatui::Terminal;
 
@@ -1257,6 +1259,7 @@ impl ClientApp {
         execute!(
             stdout,
             EnterAlternateScreen,
+            DisableLineWrap,
             cursor::Hide,
             EnableBracketedPaste,
             EnableMouseCapture
@@ -5449,6 +5452,14 @@ fn run_command_notice(server: &SocketClient, cmd: &str) -> Option<String> {
             format!("start dir: {}", path)
         });
     }
+    if matches!(
+        cmd.split_whitespace().next(),
+        Some("set-option" | "set" | "show-options" | "show")
+    ) {
+        let output = server.run_command_with_output(cmd);
+        let message = output.trim();
+        return (!message.is_empty()).then(|| message.to_string());
+    }
     server.run_command(cmd);
     None
 }
@@ -7006,6 +7017,7 @@ mod tests {
                 pane_id: 1,
                 rows: PANE_ROWS,
                 cols: PANE_COLS,
+                history_limit: 2_000,
                 command,
                 start_dir: None,
                 env: vec![],
@@ -7121,6 +7133,32 @@ mod tests {
                 "rows_v2 must match ANSI after sync flush; \
                  without write_leaf flush this returns empty while the screen shows text"
             );
+        }
+
+        #[test]
+        fn large_synchronized_output_is_not_painted_mid_replay() {
+            let pane = silent_test_pane().expect("test pane");
+            let mut partial = b"\x1b[?2026;25h".to_vec();
+            partial.resize(partial.len() + 5_000, b'x');
+            feed_pane(&pane, &partial);
+            let win = test_window(pane);
+
+            let intermediate = serialize_frame_ansi(
+                &win,
+                frame_ansi_area(server_size()),
+                true,
+                FrameAnsiOptions {
+                    clear_display: false,
+                    force_repaint: true,
+                },
+            );
+            assert!(!intermediate.contains("xxxx"));
+
+            let pane =
+                crate::layout::active_pane(&win.root, &win.active_pane_path)
+                    .unwrap();
+            feed_pane(pane, b"\x1b[?2026;25l");
+            assert_ansi_paints(&win, "xxxx");
         }
 
         #[test]
