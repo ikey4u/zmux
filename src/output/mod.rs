@@ -65,17 +65,54 @@ fn write_border(area: Rect, active: bool, out: &mut String) {
         let _ = write!(out, "{style}─");
     }
     let _ = write!(out, "{style}┐");
+    // `┐` often sits on the physical last column. Park the cursor so a host
+    // with autowrap still on cannot wrap it onto the next row.
+    vte_cup(left, top, out);
     vte_goto(left, bottom, out);
     let _ = write!(out, "{style}└");
     for _ in (left + 1)..right {
         let _ = write!(out, "{style}─");
     }
     let _ = write!(out, "{style}┘");
+    vte_cup(left, bottom, out);
+    write_vertical_borders(area, active, out);
+}
+
+/// Restore left/right `│` columns. Incremental dirty paints used to skip
+/// borders entirely, so a glyph the host draws wider than the grid (or a
+/// last-column wrap) left stray cells just past the right edge forever.
+fn write_vertical_borders(area: Rect, active: bool, out: &mut String) {
+    if area.width < 2 || area.height < 2 {
+        return;
+    }
+    let left = area.x;
+    let right = area.x + area.width - 1;
+    let top = area.y;
+    let bottom = area.y + area.height - 1;
+    let style = border_styles(active);
     for y in (top + 1)..bottom {
         vte_goto(left, y, out);
         let _ = write!(out, "{style}│");
         vte_goto(right, y, out);
         let _ = write!(out, "{style}│");
+        vte_cup(left, y, out);
+    }
+}
+
+fn write_pane_borders(
+    area: Rect,
+    is_active: bool,
+    has_border: bool,
+    redraw_full: bool,
+    out: &mut String,
+) {
+    if !has_border {
+        return;
+    }
+    if redraw_full {
+        write_border(area, is_active, out);
+    } else {
+        write_vertical_borders(area, is_active, out);
     }
 }
 
@@ -282,6 +319,11 @@ fn write_terminal_row(
             col += 1;
         }
     }
+    // If the last cell sat on the physical last column, cancel wrap-pending
+    // before the next row (or the pane border) is painted.
+    if cols > 0 {
+        vte_cup(x, y, out);
+    }
 }
 
 fn write_copy_row(
@@ -306,7 +348,7 @@ fn write_copy_row(
         );
         for ch in run.text.chars() {
             if col >= cols {
-                return;
+                break;
             }
             if col > 0 {
                 vte_cup(x + col, y, out);
@@ -322,6 +364,9 @@ fn write_copy_row(
             out.push(ch);
             col = col.saturating_add(w);
         }
+        if col >= cols {
+            break;
+        }
     }
     while col < cols {
         let pad = adjust_styles_for_custom_bg_fg(
@@ -335,6 +380,9 @@ fn write_copy_row(
         write_style_diff(&mut current_styles, pad, out);
         out.push(' ');
         col += 1;
+    }
+    if cols > 0 {
+        vte_cup(x, y, out);
     }
 }
 
@@ -388,16 +436,23 @@ fn claim_render_dirty(
 }
 
 fn pane_paint_pending(pane: &Pane, opts: &FrameAnsiOptions) -> bool {
-    if claim_render_dirty(
+    let sync_still_active =
+        pane.parser.lock().ok().is_some_and(|mut parser| {
+            if parser.sync_update_active() {
+                parser.flush_sync_for_display();
+            }
+            parser.sync_update_active()
+        });
+    if sync_still_active {
+        // Keep render_dirty set so ESU (or the timeout) paints the completed
+        // frame. Incremental sync replay may already have updated the internal
+        // grid, but exposing it here would reintroduce TUI flicker.
+        return false;
+    }
+    claim_render_dirty(
         &pane.render_dirty,
         opts.clear_display || opts.force_repaint,
-    ) {
-        return true;
-    }
-    pane.parser
-        .lock()
-        .ok()
-        .is_some_and(|parser| parser.has_pending_sync_paint())
+    )
 }
 
 fn write_scrollbar(content: Rect, ratio: f32, out: &mut String) {
@@ -473,14 +528,10 @@ fn write_pane(
             if let Some(ratio) = copy_view.scroll_ratio {
                 write_scrollbar(inner, ratio, out);
             }
-            if redraw_border {
-                write_border(area, is_active, out);
-            }
+            write_pane_borders(area, is_active, has_border, redraw_border, out);
             return;
         }
-        if redraw_border {
-            write_border(area, is_active, out);
-        }
+        write_pane_borders(area, is_active, has_border, redraw_border, out);
         return;
     }
     let snapshot = match pane.parser.lock() {
@@ -498,9 +549,7 @@ fn write_pane(
         Err(_) => None,
     };
     let Some(((pane_fg, pane_bg), alternate_screen, rows)) = snapshot else {
-        if redraw_border {
-            write_border(area, is_active, out);
-        }
+        write_pane_borders(area, is_active, has_border, redraw_border, out);
         return;
     };
     for row_idx in 0..inner.height as usize {
@@ -516,9 +565,7 @@ fn write_pane(
             out,
         );
     }
-    if redraw_border {
-        write_border(area, is_active, out);
-    }
+    write_pane_borders(area, is_active, has_border, redraw_border, out);
 }
 
 fn fill_gap(gap: Rect, out: &mut String) {
@@ -972,7 +1019,7 @@ mod tests {
             "EL fill should paint green through EOL, got: {out:?}"
         );
         assert!(
-            out.ends_with(' '),
+            out.contains(' '),
             "row should be padded to pane width, got: {out:?}"
         );
     }
@@ -1254,5 +1301,40 @@ mod tests {
             "PUA must not consume the next grid cell: {out:?}"
         );
         assert!(out.contains(icon), "PUA icon should still paint: {out:?}");
+    }
+
+    #[test]
+    fn write_terminal_row_parks_cursor_after_last_cell() {
+        let cells = vec![Some(TerminalCell {
+            text: "A".to_string(),
+            fg: Color::Named(NamedColor::Foreground),
+            bg: Color::Named(NamedColor::Background),
+            flags: Flags::empty(),
+            width: 1,
+        })];
+        let mut out = String::new();
+        write_terminal_row(&cells, 1, 79, 5, None, None, false, &mut out);
+        assert!(
+            out.ends_with("\x1b[6;80H"),
+            "must CUP away from a last-column write so autowrap cannot spill, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn write_border_parks_cursor_after_right_edge_glyphs() {
+        let mut out = String::new();
+        write_border(Rect::new(0, 0, 80, 5), true, &mut out);
+        assert!(
+            out.contains("┐\x1b[1;1H"),
+            "top-right corner must not leave wrap-pending on the last column: {out:?}"
+        );
+        assert!(
+            out.contains("┘\x1b[5;1H"),
+            "bottom-right corner must not leave wrap-pending on the last column: {out:?}"
+        );
+        assert!(
+            out.contains("│\x1b[2;1H"),
+            "right vertical must park after the last-column glyph: {out:?}"
+        );
     }
 }

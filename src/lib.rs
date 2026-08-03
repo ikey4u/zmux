@@ -2,6 +2,7 @@ pub mod client;
 pub mod commands;
 pub mod config;
 pub mod copy_mode;
+pub mod history_store;
 pub mod ipc;
 pub mod layout;
 pub mod output;

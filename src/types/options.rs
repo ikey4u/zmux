@@ -2,6 +2,9 @@ use std::collections::HashMap;
 
 use super::mode::KeyBinding;
 
+pub const DEFAULT_HISTORY_LIMIT: usize = 2_000;
+pub const MAX_HISTORY_LIMIT: usize = 100_000;
+
 #[derive(Clone)]
 pub struct GlobalOptions {
     pub default_shell: String,
@@ -28,7 +31,7 @@ impl Default for GlobalOptions {
     fn default() -> Self {
         Self {
             default_shell: String::new(),
-            history_limit: 2000,
+            history_limit: DEFAULT_HISTORY_LIMIT,
             escape_time_ms: 500,
             repeat_time_ms: 500,
             status_interval: 15,
@@ -58,7 +61,16 @@ impl Default for GlobalOptions {
 
 #[cfg(test)]
 mod tests {
-    use super::GlobalOptions;
+    use super::{GlobalOptions, DEFAULT_HISTORY_LIMIT};
+
+    #[test]
+    fn history_limit_uses_a_practical_default() {
+        assert_eq!(
+            GlobalOptions::default().history_limit,
+            DEFAULT_HISTORY_LIMIT
+        );
+        assert_eq!(DEFAULT_HISTORY_LIMIT, 2_000);
+    }
 
     #[test]
     fn scroll_on_erase_is_disabled_by_default() {

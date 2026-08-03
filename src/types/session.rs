@@ -15,6 +15,7 @@ use super::{
     mode::{CopyModeState, Mode},
     options::{GlobalOptions, SessionOptions, WindowOptions},
 };
+use crate::history_store::{PaneHistory, PaneHistoryWriter};
 use crate::terminal::AlacrittyTermState;
 
 pub type SessionId = usize;
@@ -40,6 +41,13 @@ pub struct Pane {
     pub writer: crate::pty::PtyWriter,
     pub child: Box<dyn portable_pty::Child>,
     pub parser: Arc<Mutex<AlacrittyTermState>>,
+    /// Disk-backed history older than the parser's in-memory scrollback.
+    pub history: Arc<Mutex<PaneHistory>>,
+    /// Bounded write-behind worker for cold history.
+    pub history_writer: PaneHistoryWriter,
+    /// Serializes cold-history drains so concurrent resize/render paths cannot
+    /// append newer rows ahead of an older PTY batch.
+    pub history_serial: Arc<Mutex<()>>,
     pub last_rows: u16,
     pub last_cols: u16,
     pub title: String,
@@ -51,7 +59,6 @@ pub struct Pane {
     pub cursor_shape: Arc<AtomicU8>,
     pub bell_pending: Arc<AtomicBool>,
     pub copy_state: Option<CopyModeState>,
-    pub output_ring: Arc<Mutex<VecDeque<u8>>>,
     /// Complete OSC 52 sequences emitted by the pane, waiting to be relayed to
     /// the attached terminal.
     pub pending_osc52: Arc<Mutex<VecDeque<Vec<u8>>>>,
@@ -65,6 +72,19 @@ impl Pane {
     pub fn mark_render_dirty(&self) {
         self.render_dirty
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Drop for Pane {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _history_guard = self
+            .history_serial
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.history_writer.shutdown_and_discard();
     }
 }
 

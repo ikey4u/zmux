@@ -122,6 +122,8 @@ Each tab is backed by an independent server. Sessions, windows, and panes are is
 | `split-window -v` | Split vertically |
 | `zoom-pane` | Maximize or restore the current pane |
 | `clear-pane` | Completely clear the current pane output history |
+| `set-option -g history-limit <lines>` | Set the in-memory scrollback limit for existing and future panes (`0`–`100000`) |
+| `show-options` | Show the current server options |
 | `set-pane-start-dir` | Save the current pane's current directory as the working directory for future splits |
 
 ---
@@ -138,7 +140,7 @@ Each tab is backed by an independent server. Sessions, windows, and panes are is
 | `e` | Move forward to the end of the current or next word |
 | `0` / `Home` | Move to the beginning of the line |
 | `$` / `End` | Move to the end of the line |
-| `g` / `G` | Jump to the top or bottom |
+| `g` / `G` | Jump to the top of the currently loaded history window or to the bottom. Move/page upward again to load the next older disk page |
 | `Ctrl+b` / `PageUp` | Scroll up one page |
 | `Ctrl+f` / `PageDown` | Scroll down one page |
 | `/` / `?` | Search forward or backward |
@@ -147,6 +149,41 @@ Each tab is backed by an independent server. Sessions, windows, and panes are is
 | `V` | Start line selection |
 | `Ctrl+v` | Start rectangular selection |
 | `Enter` / `y` | Copy the current selection and exit copy mode |
+
+Each pane keeps 2,000 lines of parsed scrollback in memory by default. Once the
+hot history reaches that watermark, completed primary-screen lines are moved to
+one private shared SQLite database instead of being discarded. Records are
+isolated by an opaque pane-instance key, so panes, sessions, and independent
+zmux servers cannot read one another's history. The cold tier retains up to
+1,000,000 logical lines per pane and their colours; copy mode rewraps them to
+the pane's current width. Alternate-screen redraws from programs such as Neovim
+and gitui are never archived. SQLite writes use a bounded per-pane write-behind
+worker, so ordinary disk transactions do not stall rendering and a storage
+failure cannot create an unbounded in-memory retry queue.
+
+Copy mode initially loads the newest 1,000 cold lines alongside the in-memory
+history. Moving or paging upward at the top loads older pages on demand, so a
+long-running pane does not materialize its entire history at once. The copy
+snapshot remains stable while live output continues; resizing only rewraps the
+loaded snapshot. Search operates on the pages currently loaded into copy mode.
+`clear-pane`, terminal saved-history clears, and terminal resets clear both
+tiers. Closing a pane removes only its records; the shared `zmux.sqlite3` file
+remains in zmux's private state directory. SQLite WAL mode may also create
+`zmux.sqlite3-wal` and `zmux.sqlite3-shm` sidecar files in that same directory.
+A later run reclaims
+records and legacy per-pane database files left by a crashed server on platforms
+where zmux can reliably check process liveness. On other platforms cleanup is
+conservative and may retain orphaned records rather than risk removing a live
+server's history. The cold tier is scrollback rather than a session backup. If
+the private state directory or disk becomes unavailable, the pane continues with
+its configured in-memory history (2,000 lines by default).
+
+Use `Prefix + :`, then `set-option -g history-limit <lines>` to change the hot
+in-memory watermark for the current server (`0`–`100000`). Lowering it moves
+eligible older lines to the cold tier. A single unfinished soft-wrapped logical
+line can temporarily use a bounded internal burst area above the watermark. If
+a program keeps one line open beyond that safety bound, zmux drops the oldest
+part of that line rather than allowing memory to grow without limit.
 
 ---
 
