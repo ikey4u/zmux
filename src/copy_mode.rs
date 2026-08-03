@@ -34,12 +34,49 @@ pub struct CopyRenderView {
     pub scroll_ratio: Option<f32>,
 }
 
+const INITIAL_COLD_HISTORY_LINES: usize = 1_000;
+const COLD_HISTORY_PAGE_LINES: usize = 1_000;
+
 pub fn enter(pane: &mut Pane) -> bool {
-    let (snapshot_source, snapshot) = match snapshot_for_copy_mode(pane) {
+    let history_serial = std::sync::Arc::clone(&pane.history_serial);
+    let _history_guard = history_serial
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    crate::pty::persist_pending_history_serialized(pane);
+    pane.history_writer.flush();
+    let (snapshot_source, mut snapshot) = match snapshot_for_copy_mode(pane) {
         Some(snapshot) => snapshot,
         None => return false,
     };
+    let (cold, cold_exhausted) = pane
+        .history
+        .lock()
+        .ok()
+        .and_then(|history| {
+            let cold = history.tail(INITIAL_COLD_HISTORY_LINES).ok()?;
+            let exhausted = match cold.first() {
+                None => true,
+                Some(line) => history
+                    .before(line.id, 1)
+                    .map(|older| older.is_empty())
+                    .unwrap_or(false),
+            };
+            Some((cold, exhausted))
+        })
+        .unwrap_or_else(|| (Vec::new(), true));
+    let cold_loaded = cold.len();
+    let cold_oldest = cold.first().map(|line| line.id);
+    drop(_history_guard);
+    snapshot.cursor_line = snapshot.cursor_line.saturating_add(cold_loaded);
+    let mut lines = Vec::with_capacity(cold_loaded + snapshot.lines.len());
+    lines.extend(cold.into_iter().map(|line| line.into_snapshot_line()));
+    lines.append(&mut snapshot.lines);
+    snapshot.lines = lines;
+
     let mut state = CopyModeState::new_with_source(snapshot, snapshot_source);
+    state.cold_loaded = cold_loaded;
+    state.cold_oldest = cold_oldest;
+    state.cold_exhausted = cold_exhausted;
     let height = pane.last_rows.max(1) as usize;
     rebuild_wrapped(&mut state, pane.last_cols as usize, height);
     state.scroll_top = state.wrapped.rows.len().saturating_sub(height);
@@ -52,9 +89,9 @@ fn snapshot_for_copy_mode(
     pane: &Pane,
 ) -> Option<(CopySnapshotSource, PaneTextSnapshot)> {
     // The live parser is the only geometry-aware, sequence-complete source of
-    // terminal history. Replaying `output_ring` is unsafe after its byte cap
-    // evicts the beginning of an ANSI or alternate-screen session: a fresh
-    // parser then interprets old TUI drawing as primary-screen scrollback.
+    // terminal history. Replaying a bounded raw-output tail is unsafe when it
+    // begins inside an ANSI or alternate-screen session: a fresh parser can
+    // interpret old TUI drawing as primary-screen scrollback.
     let parser = pane.parser.lock().ok()?;
     Some((CopySnapshotSource::Parser, snapshot_from_parser(&parser)))
 }
@@ -82,6 +119,29 @@ fn snapshot_from_parser(parser: &AlacrittyTermState) -> PaneTextSnapshot {
     compact_long_blank_runs(&mut physical_rows, &mut cursor_physical_row);
 
     snapshot_from_physical_rows(&physical_rows, cursor_physical_row, cursor_col)
+}
+
+/// Convert complete physical rows evicted by the terminal into the same
+/// logical-line representation used by copy mode.
+pub(crate) fn snapshot_lines_from_history_rows(
+    rows: &[crate::terminal::TerminalHistoryRow],
+) -> Vec<SnapshotLine> {
+    let physical_rows: Vec<_> = rows
+        .iter()
+        .filter_map(|row| snapshot_visible_row(&row.cells, 0))
+        .collect();
+    if physical_rows.is_empty() {
+        return Vec::new();
+    }
+
+    let mut snapshot =
+        snapshot_from_physical_rows(&physical_rows, physical_rows.len(), 0);
+    // Terminal capture only releases prefixes ending at a hard line boundary,
+    // so every resulting logical line has a newline after it in the stream.
+    for line in &mut snapshot.lines {
+        line.terminated = true;
+    }
+    snapshot.lines
 }
 
 fn compact_long_blank_runs(
@@ -220,7 +280,14 @@ fn snapshot_visible_row(
         // skipped; emitting a space here adds a spurious gap after every wide
         // character in copy mode.
     }
-    let trimmed = trim_screen_row(&row_text, min_width);
+    // Spaces at a soft-wrap boundary are internal logical-line characters,
+    // not terminal padding. Trimming them turns `abc   def` into `abc def`
+    // after the physical rows are joined.
+    let trimmed = if wrapped {
+        row_text
+    } else {
+        trim_screen_row(&row_text, min_width)
+    };
     // Trim styles to match the trimmed text length.
     let trimmed_char_len = trimmed.chars().count();
     row_styles.truncate(trimmed_char_len);
@@ -309,25 +376,188 @@ pub fn exit(pane: &mut Pane) {
 }
 
 pub fn refresh_layout(pane: &mut Pane) {
-    if pane.copy_state.is_none() {
-        return;
-    }
     let width = pane.last_cols.max(1) as usize;
     let height = pane.last_rows.max(1) as usize;
-    let snapshot = snapshot_for_copy_mode(pane);
     let Some(state) = pane.copy_state.as_mut() else {
         return;
     };
-    if let Some((snapshot_source, snapshot)) = snapshot {
-        state.snapshot_source = snapshot_source;
-        refresh_snapshot(state, snapshot, width, height);
+    // Copy mode is a frozen snapshot. Live PTY output continues into the hot
+    // parser and cold store, but resize only rewraps the snapshot the user is
+    // selecting from. This avoids cursor drift and unbounded catch-up reads.
+    rebuild_wrapped(state, width, height);
+    ensure_cursor_visible(state, height);
+}
+
+fn prepend_older_history(pane: &mut Pane) -> bool {
+    let (oldest, width, height) = match pane.copy_state.as_ref() {
+        Some(state) if !state.cold_exhausted => (
+            state.cold_oldest,
+            pane.last_cols.max(1) as usize,
+            pane.last_rows.max(1) as usize,
+        ),
+        _ => return false,
+    };
+    let Some(oldest) = oldest else {
+        return false;
+    };
+    let mut page = match pane.history.lock().ok().and_then(|history| {
+        history
+            .before(oldest, COLD_HISTORY_PAGE_LINES.saturating_add(1))
+            .ok()
+    }) {
+        Some(page) => page,
+        None => return false,
+    };
+    let exhausted = page.len() <= COLD_HISTORY_PAGE_LINES;
+    if !exhausted {
+        let extra = page.len() - COLD_HISTORY_PAGE_LINES;
+        page.drain(..extra);
+    }
+    if page.last().map(|line| line.id) != oldest.checked_sub(1) {
+        if let Some(state) = pane.copy_state.as_mut() {
+            state.cold_exhausted = true;
+        }
+        return false;
+    }
+    let Some(state) = pane.copy_state.as_mut() else {
+        return false;
+    };
+    if page.is_empty() {
+        state.cold_exhausted = true;
+        return false;
+    }
+    prepend_history_page(state, page, width, height, exhausted);
+    true
+}
+
+fn prepend_history_page(
+    state: &mut CopyModeState,
+    page: Vec<crate::history_store::StoredHistoryLine>,
+    width: usize,
+    height: usize,
+    exhausted: bool,
+) {
+    if page.is_empty() {
+        state.cold_exhausted = exhausted;
+        return;
+    }
+    rebuild_wrapped(state, width, height);
+    let old_wrapped_rows = state.wrapped.rows.len();
+    let old_scroll_top = state.scroll_top;
+    let added = page.len();
+    let oldest = page.first().map(|line| line.id);
+    let mut active_match = state.search_matches.get(state.search_idx).cloned();
+    if let Some(active) = active_match.as_mut() {
+        active.line = active.line.saturating_add(added);
+    }
+
+    let mut lines = Vec::with_capacity(added + state.snapshot.lines.len());
+    lines.extend(page.into_iter().map(|line| line.into_snapshot_line()));
+    lines.append(&mut state.snapshot.lines);
+    state.snapshot.lines = lines;
+    state.snapshot.cursor_line =
+        state.snapshot.cursor_line.saturating_add(added);
+    state.cursor.line = state.cursor.line.saturating_add(added);
+    if let Some(anchor) = state.anchor.as_mut() {
+        anchor.line = anchor.line.saturating_add(added);
+    }
+    state.cold_loaded = state.cold_loaded.saturating_add(added);
+    state.cold_oldest = oldest.or(state.cold_oldest);
+    state.cold_exhausted = exhausted;
+
+    if state.search_query.is_empty() {
+        for search_match in &mut state.search_matches {
+            search_match.line = search_match.line.saturating_add(added);
+        }
     } else {
-        rebuild_wrapped(state, width, height);
-        ensure_cursor_visible(state, height);
+        state.search_matches =
+            build_search_matches(&state.snapshot, &state.search_query);
+        state.search_idx = active_match
+            .as_ref()
+            .and_then(|active| {
+                state
+                    .search_matches
+                    .iter()
+                    .position(|candidate| candidate == active)
+            })
+            .unwrap_or_else(|| {
+                find_match_index(
+                    &state.search_matches,
+                    state.cursor,
+                    state.search_forward,
+                )
+            });
+    }
+
+    rebuild_wrapped(state, width, height);
+    let added_wrapped_rows =
+        state.wrapped.rows.len().saturating_sub(old_wrapped_rows);
+    let max_scroll = state.wrapped.rows.len().saturating_sub(height.max(1));
+    state.scroll_top = old_scroll_top
+        .saturating_add(added_wrapped_rows)
+        .min(max_scroll);
+}
+
+fn move_left_needs_older(pane: &Pane) -> bool {
+    pane.copy_state.as_ref().is_some_and(|state| {
+        !state.cold_exhausted && state.cursor.line == 0 && state.cursor.col == 0
+    })
+}
+
+fn move_up_needs_older(pane: &mut Pane) -> bool {
+    let width = pane.last_cols.max(1) as usize;
+    let height = pane.last_rows.max(1) as usize;
+    let Some(state) = pane.copy_state.as_mut() else {
+        return false;
+    };
+    if state.cold_exhausted {
+        return false;
+    }
+    rebuild_wrapped(state, width, height);
+    if state.selection_mode == SelectionMode::Line {
+        state.cursor.line == 0
+    } else {
+        current_display_position(state).0 == 0
     }
 }
 
+fn page_up_needs_older(pane: &mut Pane) -> bool {
+    let width = pane.last_cols.max(1) as usize;
+    let height = pane.last_rows.max(1) as usize;
+    let Some(state) = pane.copy_state.as_mut() else {
+        return false;
+    };
+    if state.cold_exhausted {
+        return false;
+    }
+    rebuild_wrapped(state, width, height);
+    current_display_position(state).0 < height.max(1)
+}
+
+fn scroll_up_needs_older(pane: &mut Pane, lines: usize) -> bool {
+    let width = pane.last_cols.max(1) as usize;
+    let height = pane.last_rows.max(1) as usize;
+    let Some(state) = pane.copy_state.as_mut() else {
+        return false;
+    };
+    if state.cold_exhausted {
+        return false;
+    }
+    rebuild_wrapped(state, width, height);
+    state.scroll_top < lines
+}
+
+fn word_backward_needs_older(pane: &Pane) -> bool {
+    pane.copy_state.as_ref().is_some_and(|state| {
+        !state.cold_exhausted
+            && find_prev_word_start(&state.snapshot, state.cursor).is_none()
+    })
+}
+
 pub fn move_left(pane: &mut Pane) {
+    if move_left_needs_older(pane) {
+        prepend_older_history(pane);
+    }
     with_state(pane, |state, width, height| {
         if state.cursor.col > 0 {
             state.cursor.col -= 1;
@@ -358,6 +588,9 @@ pub fn move_right(pane: &mut Pane) {
 }
 
 pub fn move_up(pane: &mut Pane) {
+    if move_up_needs_older(pane) {
+        prepend_older_history(pane);
+    }
     with_state(pane, |state, _, height| {
         move_vertical(state, -1, height);
     });
@@ -413,6 +646,9 @@ fn move_by_display_row(state: &mut CopyModeState, delta: isize) {
 }
 
 pub fn page_up(pane: &mut Pane) {
+    if page_up_needs_older(pane) {
+        prepend_older_history(pane);
+    }
     with_state(pane, |state, width, height| {
         rebuild_wrapped(state, width, height);
         let (row_idx, _) = current_display_position(state);
@@ -439,6 +675,9 @@ pub fn scroll_up(pane: &mut Pane, lines: usize) -> CopyScrollResult {
     let entering = pane.copy_state.is_none();
     if entering && !enter(pane) {
         return CopyScrollResult::Unavailable;
+    }
+    if scroll_up_needs_older(pane, lines) {
+        prepend_older_history(pane);
     }
     let width = pane.last_cols.max(1) as usize;
     let height = pane.last_rows.max(1) as usize;
@@ -495,6 +734,9 @@ impl CopyScrollResult {
 
 pub fn scroll_ratio(pane: &Pane) -> Option<f32> {
     let state = pane.copy_state.as_ref()?;
+    if !state.cold_exhausted {
+        return None;
+    }
     let height = pane.last_rows.max(1) as usize;
     let total = state.wrapped.rows.len();
     if total <= height {
@@ -504,6 +746,8 @@ pub fn scroll_ratio(pane: &Pane) -> Option<f32> {
     Some(state.scroll_top as f32 / max_scroll as f32)
 }
 
+/// Move to the top of the currently resident copy window. Older persistent
+/// pages stay lazy and are loaded by an additional upward move/page/scroll.
 pub fn move_to_top(pane: &mut Pane) {
     with_state(pane, |state, width, height| {
         state.cursor = CopyPoint { line: 0, col: 0 };
@@ -546,6 +790,9 @@ pub fn move_to_line_end(pane: &mut Pane) {
 }
 
 pub fn move_word_backward(pane: &mut Pane) {
+    if word_backward_needs_older(pane) {
+        prepend_older_history(pane);
+    }
     with_state(pane, |state, width, height| {
         state.cursor = find_prev_word_start(&state.snapshot, state.cursor)
             .unwrap_or(CopyPoint { line: 0, col: 0 });
@@ -641,7 +888,7 @@ pub fn render_view(pane: &Pane) -> Option<CopyRenderView> {
         rows.push(render_row(state, row, active_match));
     }
     let total_rows = state.wrapped.rows.len();
-    let scroll_ratio = if total_rows > height {
+    let scroll_ratio = if state.cold_exhausted && total_rows > height {
         let max_scroll = total_rows - height;
         Some(state.scroll_top as f32 / max_scroll as f32)
     } else {
@@ -713,6 +960,7 @@ fn step_search(pane: &mut Pane, forward: bool) -> bool {
     true
 }
 
+#[cfg(test)]
 fn refresh_snapshot(
     state: &mut CopyModeState,
     snapshot: PaneTextSnapshot,
@@ -1580,6 +1828,15 @@ mod tests {
         }
     }
 
+    fn stored(id: u64, text: &str) -> crate::history_store::StoredHistoryLine {
+        crate::history_store::StoredHistoryLine {
+            id,
+            text: text.to_string(),
+            terminated: true,
+            styles: Vec::new(),
+        }
+    }
+
     #[test]
     fn next_word_start_skips_spaces_and_blank_lines() {
         let snapshot = snapshot(&["alpha  beta", "/usr/bin", "", "tail"]);
@@ -1652,6 +1909,24 @@ mod tests {
     }
 
     #[test]
+    fn parser_snapshot_can_expose_more_than_two_thousand_lines() {
+        let mut parser = AlacrittyTermState::new(2, 24, 2_100);
+        let mut output = String::new();
+        for line in 0..2_050 {
+            output.push_str(&format!("history-{line:04}\r\n"));
+        }
+        parser.process(output.as_bytes());
+
+        let snapshot = snapshot_from_parser(&parser);
+        assert!(snapshot.lines.len() > 2_000);
+        assert_eq!(snapshot.lines[0].text, "history-0000");
+        assert!(snapshot
+            .lines
+            .iter()
+            .any(|line| line.text == "history-2049"));
+    }
+
+    #[test]
     fn parser_snapshot_trims_blank_tail_below_cursor() {
         let mut parser = AlacrittyTermState::new(5, 20, 10);
         parser.process(b"prompt\r\n$");
@@ -1698,65 +1973,6 @@ mod tests {
             "exited alternate-screen content leaked into primary history: \
              {copied_history:?}"
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn copy_mode_ignores_truncated_alternate_screen_output_ring(
-    ) -> std::io::Result<()> {
-        let mut pane = spawn_pane(SpawnOptions {
-            pane_id: 1,
-            rows: 6,
-            cols: 80,
-            command: Some("/bin/cat"),
-            start_dir: None,
-            env: vec![],
-            scroll_on_erase_in_display: false,
-        })?;
-
-        if let Ok(mut parser) = pane.parser.lock() {
-            *parser = AlacrittyTermState::new(6, 80, 2000);
-            parser.process(b"authoritative history\r\ncurrent shell$ ");
-        }
-        if let Ok(mut ring) = pane.output_ring.lock() {
-            ring.clear();
-            // This is the tail of an alternate-screen session after the ring
-            // has evicted its `CSI ?1049h` entry sequence. Replaying it in a
-            // fresh parser paints the old TUI into primary scrollback.
-            ring.extend(
-                b"\x1b[2J\x1b[HOLD_GITUI_MENU\x1b[?1049l\
-                  truncated ring shell$ ",
-            );
-        }
-
-        let entered = enter(&mut pane);
-        let copied_history = pane
-            .copy_state
-            .as_ref()
-            .map(|state| {
-                state
-                    .snapshot
-                    .lines
-                    .iter()
-                    .map(|line| line.text.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default();
-        let _ = pane.child.kill();
-
-        assert!(entered, "copy mode should use the available live parser");
-        assert!(
-            copied_history.contains("authoritative history")
-                && copied_history.contains("current shell$"),
-            "copy mode lost live parser history: {copied_history:?}"
-        );
-        assert!(
-            !copied_history.contains("OLD_GITUI_MENU")
-                && !copied_history.contains("truncated ring shell$"),
-            "copy mode replayed a truncated raw output ring: {copied_history:?}"
-        );
-        Ok(())
     }
 
     #[test]
@@ -1816,6 +2032,137 @@ mod tests {
             state.scroll_top,
             state.wrapped.rows.len().saturating_sub(8)
         );
+    }
+
+    #[test]
+    fn prepending_cold_history_rebases_points_search_and_viewport() {
+        let mut state =
+            CopyModeState::new(snapshot(&["cold", "hot needle", "tail"]));
+        state.cold_loaded = 1;
+        state.cold_oldest = Some(10);
+        state.cold_exhausted = false;
+        state.cursor = CopyPoint { line: 1, col: 4 };
+        state.anchor = Some(CopyPoint { line: 2, col: 1 });
+        state.search_query = "needle".to_string();
+        state.search_matches =
+            build_search_matches(&state.snapshot, &state.search_query);
+        state.search_idx = 0;
+        rebuild_wrapped(&mut state, 20, 2);
+        state.scroll_top = 1;
+
+        prepend_history_page(
+            &mut state,
+            vec![stored(8, "older needle"), stored(9, "older")],
+            20,
+            2,
+            true,
+        );
+
+        assert_eq!(state.cold_loaded, 3);
+        assert_eq!(state.cold_oldest, Some(8));
+        assert!(state.cold_exhausted);
+        assert_eq!(state.snapshot.cursor_line, 4);
+        assert_eq!(state.cursor, CopyPoint { line: 3, col: 4 });
+        assert_eq!(state.anchor, Some(CopyPoint { line: 4, col: 1 }));
+        assert_eq!(state.scroll_top, 3);
+        assert_eq!(state.search_matches.len(), 2);
+        assert_eq!(state.search_matches[state.search_idx].line, 3);
+        assert_eq!(state.snapshot.lines[0].text, "older needle");
+        assert_eq!(state.snapshot.lines[3].text, "hot needle");
+    }
+
+    #[test]
+    fn terminal_history_rows_use_copy_mode_logical_line_conversion() {
+        let mut parser = AlacrittyTermState::new(2, 4, 1);
+        parser.process(b"abcdefgh\r\nnext\r\ntail\r\n");
+        let rows = parser.take_history_rows();
+        let lines = snapshot_lines_from_history_rows(&rows);
+
+        assert!(!lines.is_empty());
+        assert_eq!(lines[0].text, "abcdefgh");
+        assert!(lines.iter().all(|line| line.terminated));
+    }
+
+    #[test]
+    fn soft_wrap_preserves_spaces_inside_logical_history_line() {
+        let mut parser = AlacrittyTermState::new(2, 5, 1);
+        parser.process(b"abc   def\r\nnext\r\ntail\r\nmore\r\nlast");
+        let cold =
+            snapshot_lines_from_history_rows(&parser.take_history_rows());
+        assert_eq!(cold[0].text, "abc   def");
+
+        let mut parser = AlacrittyTermState::new(3, 5, 100);
+        parser.process(b"abc   def\r\nnext");
+        let hot = snapshot_from_parser(&parser);
+        assert_eq!(hot.lines[0].text, "abc   def");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_mode_pages_older_disk_history_without_loading_it_all() {
+        let mut pane = spawn_pane(SpawnOptions {
+            pane_id: 1,
+            rows: 2,
+            cols: 24,
+            history_limit: 2,
+            command: Some("/bin/cat"),
+            start_dir: None,
+            env: vec![],
+            scroll_on_erase_in_display: false,
+        })
+        .unwrap();
+        let state_dir = std::env::temp_dir()
+            .join(format!("zmux-copy-history-test-{}", std::process::id()));
+        *pane.history.lock().unwrap() =
+            crate::history_store::PaneHistory::for_test(state_dir, 2_000);
+        let archived = (1..=1_005)
+            .map(|number| SnapshotLine {
+                text: format!("cold-{number:04}"),
+                terminated: true,
+                styles: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        pane.history
+            .lock()
+            .unwrap()
+            .append_batch(&archived)
+            .unwrap();
+        if let Ok(mut parser) = pane.parser.lock() {
+            *parser = AlacrittyTermState::new(2, 24, 2);
+            parser.process(b"hot-a\r\nhot-b");
+        }
+
+        assert!(enter(&mut pane));
+        let state = pane.copy_state.as_ref().unwrap();
+        assert_eq!(state.cold_loaded, INITIAL_COLD_HISTORY_LINES);
+        assert_eq!(state.snapshot.lines[0].text, "cold-0006");
+        assert!(!state.cold_exhausted);
+
+        move_to_top(&mut pane);
+        move_up(&mut pane);
+        let state = pane.copy_state.as_ref().unwrap();
+        assert_eq!(state.snapshot.lines[0].text, "cold-0001");
+        assert_eq!(state.snapshot.lines[state.cursor.line].text, "cold-0005");
+        assert!(state.cold_exhausted);
+        let state = pane.copy_state.as_mut().unwrap();
+        state.selection_mode = SelectionMode::Line;
+        state.anchor = Some(CopyPoint {
+            line: 1_004,
+            col: 0,
+        });
+        state.cursor = CopyPoint {
+            line: 1_005,
+            col: 0,
+        };
+        assert_eq!(yank_selection(&mut pane), "cold-1005\nhot-a");
+        pane.parser
+            .lock()
+            .unwrap()
+            .process(b"new-output-a\r\nnew-output-b\r\nnew-output-c");
+        pane.last_cols = 12;
+        refresh_layout(&mut pane);
+        assert_eq!(yank_selection(&mut pane), "cold-1005\nhot-a");
+        let _ = pane.child.kill();
     }
 
     #[test]

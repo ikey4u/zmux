@@ -5,7 +5,7 @@ use alacritty_terminal::{term::cell::Flags, vte::ansi::Color};
 use crate::{
     copy_mode::CopyRenderRow,
     layout::rect::BORDER_SIZE,
-    terminal::{color_name, AlacrittyTermState},
+    terminal::color_name,
     types::{LayoutNode, Pane, Rect, SplitDirection, Window},
 };
 
@@ -255,10 +255,7 @@ fn write_leaf(pane: &Pane, is_active: bool, out: &mut String) {
     // synchronized output before visible_rows(); without the same flush here
     // mouse copy reads stale/blank rows while the screen shows fresh content.
     parser.flush_sync_for_display();
-    let (cr, cc) = parser.cursor_position();
-    let hide_cursor = parser.hide_cursor();
-    let alt = parser.alternate_screen();
-    let mouse_mode = parser.mouse_mode();
+    let frame = parser.frame_snapshot();
 
     let _ = write!(
         out,
@@ -270,11 +267,11 @@ fn write_leaf(pane: &Pane, is_active: bool, out: &mut String) {
         pane.id,
         pane.last_rows,
         pane.last_cols,
-        cr,
-        cc,
-        hide_cursor,
-        alt,
-        mouse_mode,
+        frame.cursor_row,
+        frame.cursor_col,
+        frame.hide_cursor,
+        frame.alternate_screen,
+        frame.mouse_mode,
         cs,
         is_active,
     );
@@ -286,7 +283,7 @@ fn write_leaf(pane: &Pane, is_active: bool, out: &mut String) {
     }
 
     out.push_str("\"rows_v2\":");
-    write_rows_v2(&parser, pane.last_rows, pane.last_cols, out);
+    write_rows_v2(&frame.rows, pane.last_rows, pane.last_cols, out);
     out.push('}');
 }
 
@@ -299,7 +296,7 @@ struct Run {
 }
 
 fn write_rows_v2(
-    term: &AlacrittyTermState,
+    visible_rows: &[Vec<Option<crate::terminal::TerminalCell>>],
     rows: u16,
     cols: u16,
     out: &mut String,
@@ -310,7 +307,6 @@ fn write_rows_v2(
     const FLAG_UNDERLINE: u8 = 8;
     const FLAG_INVERSE: u8 = 16;
 
-    let visible_rows = term.visible_rows();
     let mut logical_line = 0usize;
     let mut logical_col = 0usize;
     out.push('[');
@@ -476,6 +472,7 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
+    use crate::terminal::AlacrittyTermState;
 
     #[test]
     fn terminal_rows_tag_soft_wraps_as_same_logical_line() {
@@ -509,13 +506,13 @@ mod tests {
         let mut term = AlacrittyTermState::new(3, 20, 2000);
         assert!(!term.process(b"\x1b[?2026hhello"));
         let mut without_flush = String::new();
-        write_rows_v2(&term, 3, 20, &mut without_flush);
+        write_rows_v2(&term.frame_snapshot().rows, 3, 20, &mut without_flush);
         assert!(!without_flush.contains("hello"));
 
         std::thread::sleep(std::time::Duration::from_millis(160));
         assert!(term.flush_sync_for_display());
         let mut with_flush = String::new();
-        write_rows_v2(&term, 3, 20, &mut with_flush);
+        write_rows_v2(&term.frame_snapshot().rows, 3, 20, &mut with_flush);
         assert!(with_flush.contains("hello"));
     }
 
@@ -523,7 +520,7 @@ mod tests {
         let mut term = AlacrittyTermState::new(rows, cols, 100);
         term.process(input);
         let mut out = String::new();
-        write_rows_v2(&term, rows, cols, &mut out);
+        write_rows_v2(&term.frame_snapshot().rows, rows, cols, &mut out);
         serde_json::from_str(&out).unwrap()
     }
 }

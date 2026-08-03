@@ -14,6 +14,7 @@ use std::{os::fd::AsRawFd, path::Path};
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 
 use crate::{
+    history_store::{PaneHistory, PaneHistoryWriter},
     terminal::AlacrittyTermState,
     types::{Pane, PaneId},
 };
@@ -33,6 +34,7 @@ pub struct SpawnOptions<'a> {
     pub pane_id: PaneId,
     pub rows: u16,
     pub cols: u16,
+    pub history_limit: usize,
     pub command: Option<&'a str>,
     pub start_dir: Option<&'a str>,
     pub env: Vec<(String, String)>,
@@ -105,15 +107,19 @@ pub fn spawn_pane(opts: SpawnOptions<'_>) -> io::Result<Pane> {
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?,
     ));
 
-    let mut term_state = AlacrittyTermState::new(opts.rows, opts.cols, 2000);
+    let mut term_state =
+        AlacrittyTermState::new(opts.rows, opts.cols, opts.history_limit);
     term_state.set_scroll_on_erase_in_display(opts.scroll_on_erase_in_display);
     let parser = Arc::new(Mutex::new(term_state));
+    let history = Arc::new(Mutex::new(
+        PaneHistory::new().unwrap_or_else(|_| PaneHistory::disabled()),
+    ));
+    let history_writer = PaneHistoryWriter::start(Arc::clone(&history));
+    let history_serial = Arc::new(Mutex::new(()));
     let data_version: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let cursor_shape: Arc<AtomicU8> =
         Arc::new(AtomicU8::new(CURSOR_SHAPE_UNSET));
     let bell_pending: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
-    let output_ring: Arc<Mutex<VecDeque<u8>>> =
-        Arc::new(Mutex::new(VecDeque::new()));
     let pending_osc52: Arc<Mutex<VecDeque<Vec<u8>>>> =
         Arc::new(Mutex::new(VecDeque::new()));
     let dead: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
@@ -126,10 +132,11 @@ pub fn spawn_pane(opts: SpawnOptions<'_>) -> io::Result<Pane> {
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?,
         opts.pane_id,
         Arc::clone(&parser),
+        history_writer.clone(),
+        Arc::clone(&history_serial),
         Arc::clone(&data_version),
         Arc::clone(&cursor_shape),
         Arc::clone(&bell_pending),
-        Arc::clone(&output_ring),
         Arc::clone(&pending_osc52),
         Arc::clone(&dead),
         Arc::clone(&render_dirty),
@@ -143,6 +150,9 @@ pub fn spawn_pane(opts: SpawnOptions<'_>) -> io::Result<Pane> {
         writer,
         child,
         parser,
+        history,
+        history_writer,
+        history_serial,
         last_rows: opts.rows,
         last_cols: opts.cols,
         title: String::new(),
@@ -154,7 +164,6 @@ pub fn spawn_pane(opts: SpawnOptions<'_>) -> io::Result<Pane> {
         cursor_shape,
         bell_pending,
         copy_state: None,
-        output_ring,
         pending_osc52,
         reported_cwd,
         start_dir: opts.start_dir.map(|s| s.to_string()),
@@ -366,10 +375,11 @@ fn start_reader_thread(
     mut reader: Box<dyn io::Read + Send>,
     _pane_id: PaneId,
     parser: Arc<Mutex<AlacrittyTermState>>,
+    history_writer: PaneHistoryWriter,
+    history_serial: Arc<Mutex<()>>,
     data_version: Arc<AtomicU64>,
     cursor_shape: Arc<AtomicU8>,
     bell_pending: Arc<AtomicBool>,
-    output_ring: Arc<Mutex<VecDeque<u8>>>,
     pending_osc52: Arc<Mutex<VecDeque<Vec<u8>>>>,
     dead_flag: Arc<AtomicBool>,
     render_dirty: Arc<AtomicBool>,
@@ -410,18 +420,20 @@ fn start_reader_thread(
                 }
                 Ok(n) => {
                     let data = &buf[..n];
-                    let should_render = parser
+                    let _history_guard = history_serial
                         .lock()
-                        .map(|mut p| p.process(data))
-                        .unwrap_or(true);
-                    if let Ok(mut ring) = output_ring.lock() {
-                        for &b in data {
-                            if ring.len() >= 2 * 1024 * 1024 {
-                                ring.pop_front();
-                            }
-                            ring.push_back(b);
-                        }
-                    }
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let (should_render, mut history_rows, clear_history) =
+                        parser
+                            .lock()
+                            .map(|mut parser| {
+                                let should_render = parser.process(data);
+                                let rows = parser.take_history_rows();
+                                let clear_history =
+                                    parser.take_history_clear_requested();
+                                (should_render, rows, clear_history)
+                            })
+                            .unwrap_or_else(|_| (true, Vec::new(), false));
                     for &b in data {
                         if b == 0x07 {
                             bell_pending.store(true, Ordering::Relaxed);
@@ -432,16 +444,66 @@ fn start_reader_thread(
                     osc52_tracker.process(data, &pending_osc52);
                     color_tracker.process(data, &parser);
                     query_tracker.process(data, &parser, &pty_writer);
+                    let mut post_query_rows = parser
+                        .lock()
+                        .map(|mut parser| parser.take_history_rows())
+                        .unwrap_or_default();
+                    history_rows.append(&mut post_query_rows);
                     data_version.fetch_add(1, Ordering::Relaxed);
                     render_dirty.store(true, Ordering::Relaxed);
                     crate::types::events::mark_data_ready();
                     if !should_render {
                         schedule_debounced_render(&render_debounce_seq);
                     }
+                    if clear_history {
+                        // The terminal capture split discarded only rows before
+                        // the exact clear boundary; preserve rows produced
+                        // afterward by clearing the durable tier first.
+                        history_writer.clear();
+                    }
+                    // The screen can repaint from the hot parser immediately;
+                    // cold-history I/O must not delay that notification.
+                    persist_history_rows(&history_writer, history_rows);
                 }
             }
         }
     });
+}
+
+/// Queue terminal rows captured outside the parser's hot scrollback. SQLite
+/// work happens on a bounded worker so a slow or failed disk cannot block PTY
+/// reads or grow an unbounded retry buffer.
+fn persist_history_rows(
+    history_writer: &PaneHistoryWriter,
+    rows: Vec<crate::terminal::TerminalHistoryRow>,
+) {
+    if rows.is_empty() {
+        return;
+    }
+
+    let lines = crate::copy_mode::snapshot_lines_from_history_rows(&rows);
+    history_writer.append(lines);
+}
+
+/// Flush rows captured by non-reader paths such as resize or synchronized
+/// output timeout handling.
+pub(crate) fn persist_pending_history(pane: &Pane) {
+    let _history_guard = pane
+        .history_serial
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    persist_pending_history_serialized(pane);
+}
+
+/// Drain captured rows while the caller holds `pane.history_serial` across a
+/// larger consistency window (for example parser snapshot + cold-tail read).
+pub(crate) fn persist_pending_history_serialized(pane: &Pane) {
+    let rows = pane
+        .parser
+        .lock()
+        .map(|mut parser| parser.take_history_rows())
+        .unwrap_or_default();
+    persist_history_rows(&pane.history_writer, rows);
 }
 
 const RENDER_DEBOUNCE_MS: u64 = 16;
@@ -578,6 +640,7 @@ pub fn resize_pane(pane: &mut Pane, rows: u16, cols: u16) -> io::Result<()> {
         p.resize(rows, cols);
         p.scrollback_bottom();
     }
+    persist_pending_history(pane);
     pane.last_rows = rows;
     pane.last_cols = cols;
     Ok(())
@@ -671,6 +734,137 @@ mod tests {
         assert_eq!(cursor_shape.load(Ordering::Relaxed), 5);
     }
 
+    #[test]
+    fn captured_terminal_rows_are_persisted_outside_the_parser_lock() {
+        let parser = Arc::new(Mutex::new(AlacrittyTermState::new(2, 20, 1)));
+        let state_dir = std::env::temp_dir()
+            .join(format!("zmux-pty-history-test-{}", std::process::id()));
+        let history =
+            Arc::new(Mutex::new(PaneHistory::for_test(state_dir, 100)));
+        let history_writer = PaneHistoryWriter::start(Arc::clone(&history));
+        let rows = {
+            let mut parser = parser.lock().unwrap();
+            parser.process(b"zero\r\none\r\ntwo\r\nthree");
+            parser.take_history_rows()
+        };
+
+        persist_history_rows(&history_writer, rows);
+        history_writer.flush();
+
+        let stored = history.lock().unwrap().tail(10).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].text, "zero");
+        assert!(parser.lock().unwrap().take_history_rows().is_empty());
+        history_writer.shutdown_and_discard();
+    }
+
+    #[test]
+    fn lowering_hot_limit_preserves_order_across_cold_and_hot_tiers() {
+        let parser = Arc::new(Mutex::new(AlacrittyTermState::new(2, 20, 6)));
+        let state_dir = std::env::temp_dir().join(format!(
+            "zmux-pty-lower-history-test-{}",
+            std::process::id()
+        ));
+        let history =
+            Arc::new(Mutex::new(PaneHistory::for_test(state_dir, 100)));
+        let history_writer = PaneHistoryWriter::start(Arc::clone(&history));
+
+        {
+            let mut parser = parser.lock().unwrap();
+            parser.process(
+                b"line-0\r\nline-1\r\nline-2\r\nline-3\r\nline-4\r\nline-5\r\nline-6\r\nline-7\r\nline-8\r\nline-9",
+            );
+            persist_history_rows(&history_writer, parser.take_history_rows());
+            parser.set_scrollback_limit(2);
+            persist_history_rows(&history_writer, parser.take_history_rows());
+        }
+        history_writer.flush();
+
+        let stored = history.lock().unwrap().tail(100).unwrap();
+        assert_eq!(
+            stored
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["line-0", "line-1", "line-2", "line-3", "line-4", "line-5"]
+        );
+        assert_eq!(parser.lock().unwrap().snapshot_rows().0.len(), 4);
+        history_writer.shutdown_and_discard();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_pane_uses_requested_history_limit() -> io::Result<()> {
+        let mut pane = spawn_pane(SpawnOptions {
+            pane_id: 1,
+            rows: 8,
+            cols: 20,
+            history_limit: 37,
+            command: Some("/bin/cat"),
+            start_dir: None,
+            env: vec![],
+            scroll_on_erase_in_display: false,
+        })?;
+        let actual = pane
+            .parser
+            .lock()
+            .map(|parser| parser.scrollback_limit())
+            .unwrap_or_default();
+        let _ = pane.child.kill();
+
+        assert_eq!(actual, 37);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_pane_stops_history_worker_and_cleans_shared_database_scope(
+    ) -> io::Result<()> {
+        let directory = std::env::temp_dir().join(format!(
+            "zmux-pane-drop-history-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        let pane = spawn_pane(SpawnOptions {
+            pane_id: 1,
+            rows: 8,
+            cols: 20,
+            history_limit: 2,
+            command: Some("/bin/cat"),
+            start_dir: None,
+            env: vec![],
+            scroll_on_erase_in_display: false,
+        })?;
+        *pane.history.lock().unwrap() =
+            PaneHistory::for_test(directory.clone(), 100);
+        pane.history_writer.append(vec![crate::types::SnapshotLine {
+            text: "archived".to_string(),
+            terminated: true,
+            styles: Vec::new(),
+        }]);
+        pane.history_writer.flush();
+        assert!(std::fs::read_dir(&directory)?.any(|entry| entry
+            .ok()
+            .is_some_and(|entry| entry
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "sqlite3"))));
+
+        drop(pane);
+
+        let database = directory.join("zmux.sqlite3");
+        assert!(database.exists());
+        let connection = rusqlite::Connection::open(database).unwrap();
+        let retained: i64 = connection
+            .query_row("SELECT COUNT(*) FROM history_lines", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(retained, 0);
+        let _ = std::fs::remove_dir_all(directory);
+        Ok(())
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_default_shell_emits_prompt() -> io::Result<()> {
@@ -679,6 +873,7 @@ mod tests {
             pane_id: 1,
             rows: 24,
             cols: 80,
+            history_limit: 2_000,
             command: None,
             start_dir: None,
             env: vec![],
@@ -737,6 +932,7 @@ mod tests {
             pane_id: 1,
             rows: 8,
             cols: 20,
+            history_limit: 2_000,
             command: Some("/bin/cat"),
             start_dir: None,
             env: vec![],

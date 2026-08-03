@@ -642,7 +642,11 @@ pub fn begin_server_ansi_update<W: Write>(writer: &mut W) -> io::Result<()> {
     // On terminals without BSU support the cursor is still hidden during all
     // row-start and wide-glyph CUPs, preserving the white-fleck protection.
     writer.write_all(b"\x1b[?2026h")?;
-    writer.write_all(b"\x1b[?25l")
+    writer.write_all(b"\x1b[?25l")?;
+    // DECAWM off: a glyph the host draws wider than the pane grid, or a write
+    // on the physical last column, must not wrap a stray cell past the right
+    // border. tmux/zellij keep wrap disabled on the client terminal too.
+    writer.write_all(b"\x1b[?7l")
 }
 
 /// Write a decoded server ANSI payload into an open synchronized update.
@@ -2461,8 +2465,8 @@ mod tests {
         let mut out = Vec::new();
         write_server_ansi(&mut out, &b64).unwrap();
         assert!(
-            out.starts_with(b"\x1b[?2026h\x1b[?25l"),
-            "cursor hide must be buffered inside the synchronized update, got {out:?}"
+            out.starts_with(b"\x1b[?2026h\x1b[?25l\x1b[?7l"),
+            "cursor hide and wrap-disable must be buffered inside the synchronized update, got {out:?}"
         );
         assert!(
             out.ends_with(b"\x1b[?2026l"),

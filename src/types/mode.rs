@@ -52,6 +52,12 @@ pub enum CopySnapshotSource {
 pub struct CopyModeState {
     pub snapshot: PaneTextSnapshot,
     pub snapshot_source: CopySnapshotSource,
+    /// Number of leading snapshot lines loaded from persistent history.
+    pub cold_loaded: usize,
+    /// Oldest persistent line id represented by the cold prefix.
+    pub cold_oldest: Option<u64>,
+    /// Whether there are no more persistent lines before `cold_oldest`.
+    pub cold_exhausted: bool,
     pub scroll_top: usize,
     pub cursor: CopyPoint,
     pub anchor: Option<CopyPoint>,
@@ -80,6 +86,9 @@ impl CopyModeState {
         Self {
             snapshot,
             snapshot_source,
+            cold_loaded: 0,
+            cold_oldest: None,
+            cold_exhausted: true,
             scroll_top: 0,
             cursor,
             anchor: None,
