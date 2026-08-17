@@ -879,6 +879,10 @@ impl AlacrittyTermState {
         }
     }
 
+    pub fn bracketed_paste(&self) -> bool {
+        self.term.mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
     fn current_frame_snapshot(&self) -> TerminalFrameSnapshot {
         let (cursor_row, cursor_col) = self.cursor_position();
         TerminalFrameSnapshot {

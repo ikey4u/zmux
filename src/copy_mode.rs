@@ -2109,6 +2109,7 @@ mod tests {
             start_dir: None,
             env: vec![],
             scroll_on_erase_in_display: false,
+            zmux_socket: None,
         })
         .unwrap();
         let state_dir = std::env::temp_dir()

@@ -11,7 +11,7 @@ use zmux::{
     name = "zmux",
     version = ZMUX_VERSION,
     about = "Cross-platform terminal multiplexer",
-    after_help = "Examples:\n  Start or attach to the default zmux server:\n    zmux\n\n  Start an isolated test instance without touching your current session:\n    zmux --clean -L test-scroll\n\n  Attach to all running servers as tabs:\n    zmux a\n\n  Attach only to the selected socket:\n    zmux -L test-scroll a --single\n\n  List sessions for that isolated test instance:\n    zmux -L test-scroll ls\n\n  Start in a specific working directory:\n    zmux -c /path/to/project\n\n  Open the runtime options panel inside zmux:\n    Prefix + O"
+    after_help = "Examples:\n  Start or attach to the default zmux server:\n    zmux\n\n  Start an isolated test instance without touching your current session:\n    zmux --clean -L test-scroll\n\n  Attach to all running servers as tabs:\n    zmux a\n\n  Attach only to the selected socket:\n    zmux -L test-scroll a --single\n\n  Attach a remote zmux over SSH as a client tab:\n    zmux ssh linux\n\n  Probe a running daemon's cloud protocol:\n    zmux cloud-probe --json\n\n  List sessions for that isolated test instance:\n    zmux -L test-scroll ls\n\n  Start in a specific working directory:\n    zmux -c /path/to/project\n\n  Open the runtime options panel inside zmux:\n    Prefix + O"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -59,6 +59,22 @@ enum Cmd {
     },
     #[command(name = "server")]
     Server,
+    #[command(name = "ssh", alias = "ssh-attach")]
+    Ssh {
+        #[arg(value_name = "HOST")]
+        host: String,
+    },
+    Mux {
+        #[arg(long)]
+        stdio: bool,
+        #[arg(long)]
+        start_if_missing: bool,
+    },
+    #[command(name = "cloud-probe")]
+    CloudProbe {
+        #[arg(long)]
+        json: bool,
+    },
     #[clap(external_subcommand)]
     External(Vec<String>),
 }
@@ -111,6 +127,23 @@ fn main() -> io::Result<()> {
         }
         Some(Cmd::KillServer { all, sockets }) => {
             run_kill_server(&socket, sockets, all)?;
+        }
+        Some(Cmd::Ssh { host }) => {
+            zmux::domain::ssh::run_cli(&host, &socket, cli.directory)?;
+        }
+        Some(Cmd::Mux {
+            stdio,
+            start_if_missing,
+        }) => {
+            if !stdio {
+                eprintln!("zmux mux currently supports only --stdio");
+                std::process::exit(2);
+            }
+            zmux::domain::mux::run_stdio(&socket, start_if_missing)?;
+        }
+        Some(Cmd::CloudProbe { json }) => {
+            let report = zmux::domain::probe::probe_socket(&socket);
+            zmux::domain::probe::print_probe(&report, json)?;
         }
         Some(Cmd::External(args)) => {
             eprintln!("unknown subcommand: {:?}", args);

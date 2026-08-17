@@ -25,6 +25,18 @@ pub struct FrameData {
     pub exit: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub yank_text: Option<String>,
+    #[serde(default)]
+    pub client_requests: Vec<ClientRequest>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ClientRequest {
+    DomainAttach {
+        request_id: String,
+        host: String,
+        pane_id: usize,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -60,6 +72,49 @@ pub enum LayoutJson {
         #[serde(default)]
         title: Option<String>,
     },
+    External {
+        id: usize,
+        slot_id: u64,
+        host: String,
+        remote_socket: String,
+        #[serde(default)]
+        state: String,
+        #[serde(default)]
+        generation: u64,
+        #[serde(default)]
+        rows: u16,
+        #[serde(default)]
+        cols: u16,
+        #[serde(default)]
+        active: bool,
+        #[serde(default)]
+        graft: Option<Box<LayoutJson>>,
+    },
+}
+
+impl LayoutJson {
+    pub fn graft(&self) -> Option<&LayoutJson> {
+        match self {
+            Self::External {
+                graft: Some(graft), ..
+            } => Some(graft.as_ref()),
+            _ => None,
+        }
+    }
+
+    pub fn slot_id(&self) -> Option<u64> {
+        match self {
+            Self::External { slot_id, .. } => Some(*slot_id),
+            _ => None,
+        }
+    }
+
+    pub fn host_alias(&self) -> Option<&str> {
+        match self {
+            Self::External { host, .. } => Some(host.as_str()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -541,6 +596,12 @@ fn active_pane_rows_v2<'a>(
             None
         }
         LayoutJson::Leaf { .. } => None,
+        LayoutJson::External {
+            graft: Some(g),
+            active: true,
+            ..
+        } => active_pane_rows_v2(g, area, false),
+        LayoutJson::External { .. } => None,
     }
 }
 
@@ -571,6 +632,12 @@ fn mark_layout_area_skip(
             }
         }
         LayoutJson::Leaf { .. } => {
+            mark_rect_skip(f, area);
+        }
+        LayoutJson::External { graft: Some(g), .. } => {
+            mark_layout_area_skip(f, g, area, hide_borders);
+        }
+        LayoutJson::External { .. } => {
             mark_rect_skip(f, area);
         }
     }
@@ -741,6 +808,12 @@ fn cursor_position_in_layout(
             })
         }
         LayoutJson::Leaf { .. } => None,
+        LayoutJson::External {
+            graft: Some(g),
+            active: true,
+            ..
+        } => cursor_position_in_layout(g, area, false),
+        LayoutJson::External { .. } => None,
     }
 }
 
@@ -786,6 +859,12 @@ fn collect_pane_geometry(
         LayoutJson::Leaf { id, rows, cols, .. } => {
             out.push((*id, *rows, *cols));
         }
+        LayoutJson::External { graft: Some(g), .. } => {
+            collect_pane_geometry(g, out)
+        }
+        LayoutJson::External { id, rows, cols, .. } => {
+            out.push((*id, *rows, *cols))
+        }
     }
 }
 
@@ -800,6 +879,12 @@ fn active_scroll_ratio_in_layout(layout: &LayoutJson) -> Option<f32> {
             ..
         } if *active => *scroll_ratio,
         LayoutJson::Leaf { .. } => None,
+        LayoutJson::External {
+            graft: Some(g),
+            active: true,
+            ..
+        } => active_scroll_ratio_in_layout(g),
+        LayoutJson::External { .. } => None,
     }
 }
 
@@ -814,6 +899,12 @@ fn active_in_copy_mode_in_layout(layout: &LayoutJson) -> bool {
             ..
         } if *active => *in_copy_mode,
         LayoutJson::Leaf { .. } => false,
+        LayoutJson::External {
+            graft: Some(g),
+            active: true,
+            ..
+        } => active_in_copy_mode_in_layout(g),
+        LayoutJson::External { .. } => false,
     }
 }
 
@@ -828,6 +919,12 @@ fn active_mouse_mode_in_layout(layout: &LayoutJson) -> u8 {
             active, mouse_mode, ..
         } if *active => *mouse_mode,
         LayoutJson::Leaf { .. } => 0,
+        LayoutJson::External {
+            graft: Some(g),
+            active: true,
+            ..
+        } => active_mouse_mode_in_layout(g),
+        LayoutJson::External { .. } => 0,
     }
 }
 
@@ -843,6 +940,12 @@ fn active_cursor_shape_in_layout(layout: &LayoutJson) -> Option<u8> {
             ..
         } if *active && !*hide_cursor => Some(*cursor_shape),
         LayoutJson::Leaf { .. } => None,
+        LayoutJson::External {
+            graft: Some(g),
+            active: true,
+            ..
+        } => active_cursor_shape_in_layout(g),
+        LayoutJson::External { .. } => None,
     }
 }
 
@@ -974,10 +1077,21 @@ fn render_layout_node(
                 hide_borders,
             );
         }
+        LayoutJson::External { graft: Some(g), .. } => {
+            render_layout_node(f, g, area, hide_borders);
+        }
+        LayoutJson::External { host, state, .. } => {
+            let label = format!("{host}: {state}");
+            f.render_widget(
+                Paragraph::new(label)
+                    .style(Style::default().fg(Color::DarkGray)),
+                area,
+            );
+        }
     }
 }
 
-fn split_layout_rects(
+pub(crate) fn split_layout_rects(
     area: Rect,
     direction: &str,
     sizes: &[u16],
@@ -2616,6 +2730,7 @@ mod tests {
             ansi: None,
             exit: false,
             yank_text: None,
+            client_requests: Vec::new(),
         };
 
         assert_eq!(active_cursor_shape(&fd), Some(4));
@@ -2713,6 +2828,7 @@ mod tests {
             ansi: None,
             exit: false,
             yank_text: None,
+            client_requests: Vec::new(),
         };
 
         assert_eq!(active_window_index(&fd), Some(1));
@@ -2742,6 +2858,7 @@ mod tests {
             ansi: None,
             exit: false,
             yank_text: None,
+            client_requests: Vec::new(),
         };
 
         assert_eq!(active_cursor_shape(&fd), None);
@@ -2790,6 +2907,7 @@ mod tests {
             ansi: None,
             exit: false,
             yank_text: None,
+            client_requests: Vec::new(),
         }
     }
 

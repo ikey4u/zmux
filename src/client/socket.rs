@@ -62,7 +62,7 @@ impl FrameSlot {
     }
 }
 
-fn exit_frame() -> FrameData {
+pub(crate) fn exit_frame() -> FrameData {
     FrameData {
         frame_type: "frame".to_string(),
         layout: LayoutJson::Leaf {
@@ -85,6 +85,7 @@ fn exit_frame() -> FrameData {
         ansi: None,
         exit: true,
         yank_text: None,
+        client_requests: Vec::new(),
     }
 }
 
@@ -280,7 +281,7 @@ impl SocketClient {
         })
     }
 
-    fn send_line(&self, line: &str) -> bool {
+    pub(crate) fn send_line(&self, line: &str) -> bool {
         self.control_tx
             .send(ControlWrite::Line(line.to_string()))
             .is_ok()
@@ -675,7 +676,7 @@ impl Drop for SocketClient {
     }
 }
 
-fn parse_session_tree_json(json: &str) -> Vec<SessionTreeEntry> {
+pub(crate) fn parse_session_tree_json(json: &str) -> Vec<SessionTreeEntry> {
     let items: Vec<serde_json::Value> = match serde_json::from_str(json) {
         Ok(v) => v,
         Err(_) => return Vec::new(),
