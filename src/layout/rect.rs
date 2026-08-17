@@ -24,6 +24,9 @@ fn fill_rects(
         LayoutNode::Leaf(p) => {
             map.insert(p.id, area);
         }
+        LayoutNode::External(slot) => {
+            map.insert(slot.id, area);
+        }
         LayoutNode::Split {
             direction,
             sizes,
@@ -114,7 +117,7 @@ fn collect_borders(
     borders: &mut Vec<BorderInfo>,
 ) {
     match node {
-        LayoutNode::Leaf(_) => {}
+        LayoutNode::Leaf(_) | LayoutNode::External(_) => {}
         LayoutNode::Split {
             direction,
             sizes,

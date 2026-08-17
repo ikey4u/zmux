@@ -33,6 +33,9 @@ fn write_layout_node(
         LayoutNode::Leaf(p) => {
             let _ = write!(out, "{}x{},{},{},{}", width, height, x, y, p.id);
         }
+        LayoutNode::External(slot) => {
+            let _ = write!(out, "{}x{},{},{},{}", width, height, x, y, slot.id);
+        }
         LayoutNode::Split {
             direction,
             sizes,

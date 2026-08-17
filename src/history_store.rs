@@ -1162,8 +1162,9 @@ fn missing_env(name: &str) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::fs::File;
+
+    use super::*;
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 
