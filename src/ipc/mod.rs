@@ -3,6 +3,7 @@ use std::{io, time::Duration};
 pub mod protocol;
 #[cfg(unix)]
 pub mod unix;
+pub mod v2;
 #[cfg(windows)]
 pub mod windows;
 

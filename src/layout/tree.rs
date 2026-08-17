@@ -1,13 +1,58 @@
-use crate::types::{LayoutNode, Pane, PaneId, SplitDirection};
+use crate::types::{ExternalSlot, LayoutNode, Pane, PaneId, SplitDirection};
 
 pub fn first_leaf_path(node: &LayoutNode) -> Vec<usize> {
     match node {
-        LayoutNode::Leaf(_) => vec![],
+        LayoutNode::Leaf(_) | LayoutNode::External(_) => vec![],
         LayoutNode::Split { children, .. } => {
             let mut path = vec![0];
             path.extend(first_leaf_path(&children[0]));
             path
         }
+    }
+}
+
+pub fn node_id(node: &LayoutNode) -> Option<PaneId> {
+    match node {
+        LayoutNode::Leaf(p) => Some(p.id),
+        LayoutNode::External(slot) => Some(slot.id),
+        LayoutNode::Split { .. } => None,
+    }
+}
+
+pub fn active_node_id(node: &LayoutNode, path: &[usize]) -> Option<PaneId> {
+    match (node, path) {
+        (LayoutNode::Leaf(p), []) => Some(p.id),
+        (LayoutNode::External(slot), []) => Some(slot.id),
+        (LayoutNode::Split { children, .. }, [idx, rest @ ..]) => {
+            children.get(*idx).and_then(|c| active_node_id(c, rest))
+        }
+        _ => None,
+    }
+}
+
+pub fn find_external_mut(
+    node: &mut LayoutNode,
+    slot_id: u64,
+) -> Option<&mut ExternalSlot> {
+    match node {
+        LayoutNode::External(slot) if slot.slot_id == slot_id => Some(slot),
+        LayoutNode::Split { children, .. } => children
+            .iter_mut()
+            .find_map(|c| find_external_mut(c, slot_id)),
+        _ => None,
+    }
+}
+
+pub fn find_external_by_pane_id(
+    node: &LayoutNode,
+    pane_id: PaneId,
+) -> Option<&ExternalSlot> {
+    match node {
+        LayoutNode::External(slot) if slot.id == pane_id => Some(slot),
+        LayoutNode::Split { children, .. } => children
+            .iter()
+            .find_map(|c| find_external_by_pane_id(c, pane_id)),
+        _ => None,
     }
 }
 
@@ -17,6 +62,7 @@ pub fn active_pane<'a>(
 ) -> Option<&'a Pane> {
     match (node, path) {
         (LayoutNode::Leaf(p), []) => Some(p),
+        (LayoutNode::External(_), []) => None,
         (LayoutNode::Split { children, .. }, [idx, rest @ ..]) => {
             children.get(*idx).and_then(|c| active_pane(c, rest))
         }
@@ -30,6 +76,7 @@ pub fn active_pane_mut<'a>(
 ) -> Option<&'a mut Pane> {
     match (node, path) {
         (LayoutNode::Leaf(p), []) => Some(p),
+        (LayoutNode::External(_), []) => None,
         (LayoutNode::Split { children, .. }, [idx, rest @ ..]) => children
             .get_mut(*idx)
             .and_then(|c| active_pane_mut(c, rest)),
@@ -46,6 +93,7 @@ pub fn find_pane_by_id(node: &LayoutNode, id: PaneId) -> Option<&Pane> {
                 None
             }
         }
+        LayoutNode::External(_) => None,
         LayoutNode::Split { children, .. } => {
             children.iter().find_map(|c| find_pane_by_id(c, id))
         }
@@ -64,6 +112,7 @@ pub fn find_pane_by_id_mut(
                 None
             }
         }
+        LayoutNode::External(_) => None,
         LayoutNode::Split { children, .. } => {
             children.iter_mut().find_map(|c| find_pane_by_id_mut(c, id))
         }
@@ -74,6 +123,13 @@ pub fn find_pane_path(node: &LayoutNode, id: PaneId) -> Option<Vec<usize>> {
     match node {
         LayoutNode::Leaf(p) => {
             if p.id == id {
+                Some(vec![])
+            } else {
+                None
+            }
+        }
+        LayoutNode::External(slot) => {
+            if slot.id == id {
                 Some(vec![])
             } else {
                 None
@@ -94,6 +150,7 @@ pub fn find_pane_path(node: &LayoutNode, id: PaneId) -> Option<Vec<usize>> {
 pub fn collect_pane_ids(node: &LayoutNode) -> Vec<PaneId> {
     match node {
         LayoutNode::Leaf(p) => vec![p.id],
+        LayoutNode::External(slot) => vec![slot.id],
         LayoutNode::Split { children, .. } => {
             children.iter().flat_map(|c| collect_pane_ids(c)).collect()
         }
@@ -102,7 +159,7 @@ pub fn collect_pane_ids(node: &LayoutNode) -> Vec<PaneId> {
 
 pub fn leaf_count(node: &LayoutNode) -> usize {
     match node {
-        LayoutNode::Leaf(_) => 1,
+        LayoutNode::Leaf(_) | LayoutNode::External(_) => 1,
         LayoutNode::Split { children, .. } => {
             children.iter().map(leaf_count).sum()
         }
@@ -135,7 +192,8 @@ where
     F: FnOnce(LayoutNode) -> LayoutNode,
 {
     match (node, path) {
-        (leaf @ LayoutNode::Leaf(_), []) => f(leaf),
+        (leaf @ LayoutNode::Leaf(_), [])
+        | (leaf @ LayoutNode::External(_), []) => f(leaf),
         (
             LayoutNode::Split {
                 direction,
@@ -252,35 +310,63 @@ pub fn equal_sizes(n: usize) -> Vec<u16> {
 }
 
 pub fn next_pane_path(node: &LayoutNode, current: &[usize]) -> Vec<usize> {
-    let ids = collect_pane_ids(node);
-    if ids.len() <= 1 {
-        return current.to_vec();
-    }
-    if let Some(p) = active_pane(node, current) {
-        let cur_id = p.id;
-        if let Some(pos) = ids.iter().position(|&id| id == cur_id) {
-            let next_id = ids[(pos + 1) % ids.len()];
-            return find_pane_path(node, next_id)
-                .unwrap_or_else(|| current.to_vec());
-        }
-    }
-    current.to_vec()
+    cycle_pane_path(node, current, 1)
 }
 
 pub fn prev_pane_path(node: &LayoutNode, current: &[usize]) -> Vec<usize> {
+    cycle_pane_path(node, current, -1)
+}
+
+fn cycle_pane_path(
+    node: &LayoutNode,
+    current: &[usize],
+    delta: isize,
+) -> Vec<usize> {
     let ids = collect_pane_ids(node);
     if ids.len() <= 1 {
         return current.to_vec();
     }
-    if let Some(p) = active_pane(node, current) {
-        let cur_id = p.id;
-        if let Some(pos) = ids.iter().position(|&id| id == cur_id) {
-            let prev_id = ids[(pos + ids.len() - 1) % ids.len()];
-            return find_pane_path(node, prev_id)
-                .unwrap_or_else(|| current.to_vec());
+    let Some(cur_id) = active_node_id(node, current) else {
+        return current.to_vec();
+    };
+    let Some(pos) = ids.iter().position(|&id| id == cur_id) else {
+        return current.to_vec();
+    };
+    let len = ids.len() as isize;
+    let next = (pos as isize + delta).rem_euclid(len) as usize;
+    find_pane_path(node, ids[next]).unwrap_or_else(|| current.to_vec())
+}
+
+pub fn collect_externals(node: &LayoutNode) -> Vec<&ExternalSlot> {
+    match node {
+        LayoutNode::External(slot) => vec![slot],
+        LayoutNode::Split { children, .. } => {
+            children.iter().flat_map(collect_externals).collect()
         }
+        LayoutNode::Leaf(_) => vec![],
     }
-    current.to_vec()
+}
+
+pub fn find_external_by_host<'a>(
+    node: &'a LayoutNode,
+    host: &str,
+    remote_socket: Option<&str>,
+) -> Option<&'a ExternalSlot> {
+    collect_externals(node).into_iter().find(|slot| {
+        slot.host_alias == host
+            && remote_socket
+                .map(|sock| slot.remote_socket == sock)
+                .unwrap_or(true)
+    })
+}
+
+pub fn replace_pane_with_external(
+    root: LayoutNode,
+    pane_id: PaneId,
+    slot: ExternalSlot,
+) -> Option<LayoutNode> {
+    let path = find_pane_path(&root, pane_id)?;
+    Some(replace_leaf(root, &path, |_| LayoutNode::External(slot)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -302,11 +388,11 @@ pub fn pane_path_in_direction(
     use crate::layout::rect::compute_rects;
 
     let rects = compute_rects(node, total_area, border_size);
-    let cur_pane = match active_pane(node, current) {
-        Some(p) => p,
+    let cur_id = match active_node_id(node, current) {
+        Some(id) => id,
         None => return current.to_vec(),
     };
-    let cr = match rects.get(&cur_pane.id) {
+    let cr = match rects.get(&cur_id) {
         Some(r) => *r,
         None => return current.to_vec(),
     };
@@ -327,7 +413,7 @@ pub fn pane_path_in_direction(
     let mut best_score: Option<(i32, u8, usize, i32, i32, i32, PaneId)> = None;
 
     for &id in &ids {
-        if id == cur_pane.id {
+        if id == cur_id {
             continue;
         }
         let r = match rects.get(&id) {

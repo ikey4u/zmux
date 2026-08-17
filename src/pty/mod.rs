@@ -39,6 +39,7 @@ pub struct SpawnOptions<'a> {
     pub start_dir: Option<&'a str>,
     pub env: Vec<(String, String)>,
     pub scroll_on_erase_in_display: bool,
+    pub zmux_socket: Option<&'a str>,
 }
 
 pub fn spawn_pane(opts: SpawnOptions<'_>) -> io::Result<Pane> {
@@ -81,6 +82,10 @@ pub fn spawn_pane(opts: SpawnOptions<'_>) -> io::Result<Pane> {
     cmd.env("COLORTERM", "truecolor");
     cmd.env("ZMUX", "1");
     cmd.env("ZMUX_PANE", format!("%{}", opts.pane_id));
+    cmd.env("ZMUX_SLOT", format!("{}", opts.pane_id));
+    if let Some(socket) = opts.zmux_socket {
+        cmd.env("ZMUX_SOCKET", socket);
+    }
     // Override host COLUMNS/LINES. Many tools (GNU ls, eza, some prompts) prefer
     // these over TIOCGWINSZ; inheriting the outer terminal width makes columnar
     // output paint as if the pane were full-screen, which then wraps into the
@@ -804,6 +809,7 @@ mod tests {
             start_dir: None,
             env: vec![],
             scroll_on_erase_in_display: false,
+            zmux_socket: None,
         })?;
         let actual = pane
             .parser
@@ -834,6 +840,7 @@ mod tests {
             start_dir: None,
             env: vec![],
             scroll_on_erase_in_display: false,
+            zmux_socket: None,
         })?;
         *pane.history.lock().unwrap() =
             PaneHistory::for_test(directory.clone(), 100);
@@ -878,6 +885,7 @@ mod tests {
             start_dir: None,
             env: vec![],
             scroll_on_erase_in_display: false,
+            zmux_socket: None,
         })?;
         let deadline = started + Duration::from_secs(15);
         let mut saw_bytes = false;
@@ -937,6 +945,7 @@ mod tests {
             start_dir: None,
             env: vec![],
             scroll_on_erase_in_display: false,
+            zmux_socket: None,
         })?;
         pane.parser = Arc::new(Mutex::new(parser));
         resize_pane(&mut pane, 4, 20)?;

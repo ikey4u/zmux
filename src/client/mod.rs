@@ -1,5 +1,7 @@
 use std::{
+    collections::HashMap,
     io::{self, Write},
+    sync::mpsc,
     time::{Duration, Instant},
 };
 
@@ -26,13 +28,15 @@ use backend::TerminalBackend;
 use serde::{Deserialize, Serialize};
 
 mod render;
-mod socket;
+pub(crate) mod socket;
+mod visual;
 use regex::Regex;
 pub use render::*;
 pub use socket::SocketClient;
 
 use crate::{
     commands::ParsedCommand,
+    domain::DomainHandle,
     server::SessionTreeEntry,
     types::{session::Size, SelectionMode},
 };
@@ -44,6 +48,7 @@ pub struct ClientApp {
     pub start_dir: Option<String>,
     pub initial_tab_title: Option<String>,
     pub attach_all: bool,
+    pub ssh_host: Option<String>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -108,6 +113,7 @@ enum InputMode {
 const RESIZE_IDLE_TIMEOUT: Duration = Duration::from_millis(500);
 const SCROLL_LINES: usize = 3;
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(400);
+const RECONNECT_BACKOFF: Duration = Duration::from_millis(750);
 
 struct LastMouseClick {
     row: u16,
@@ -125,7 +131,40 @@ struct ClientTab {
     code: String,
     title: String,
     socket_name: String,
-    client: SocketClient,
+    client: Box<dyn DomainHandle>,
+    grafts: HashMap<u64, Graft>,
+    visual_focus: VisualFocus,
+    pending_attach: Option<PendingAttach>,
+    pending_reconnect: HashMap<u64, PendingReconnect>,
+}
+
+struct Graft {
+    host: String,
+    #[allow(dead_code)]
+    remote_socket: String,
+    client: Box<dyn DomainHandle>,
+    generation: u64,
+    last_size: Option<Size>,
+    last_reconnect_at: Option<Instant>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum VisualFocus {
+    Local { pane_id: Option<usize> },
+    Remote { slot_id: u64, pane_id: usize },
+}
+
+struct PendingAttach {
+    request_id: String,
+    host: String,
+    #[allow(dead_code)]
+    pane_id: usize,
+    rx: mpsc::Receiver<Result<crate::domain::cloud::CloudClient, String>>,
+    ready: Option<Box<dyn DomainHandle>>,
+}
+
+struct PendingReconnect {
+    rx: mpsc::Receiver<Result<crate::domain::cloud::CloudClient, String>>,
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -177,7 +216,11 @@ impl TabManager {
                 code,
                 title,
                 socket_name: base_socket.to_string(),
-                client,
+                client: Box::new(client),
+                grafts: HashMap::new(),
+                visual_focus: VisualFocus::Local { pane_id: None },
+                pending_attach: None,
+                pending_reconnect: HashMap::new(),
             }],
             active: 0,
             tab_bar_offset: 0,
@@ -230,7 +273,11 @@ impl TabManager {
                         code,
                         title,
                         socket_name,
-                        client,
+                        client: Box::new(client),
+                        grafts: HashMap::new(),
+                        visual_focus: VisualFocus::Local { pane_id: None },
+                        pending_attach: None,
+                        pending_reconnect: HashMap::new(),
                     });
                 }
                 Err(e) => {
@@ -259,8 +306,681 @@ impl TabManager {
         })
     }
 
-    fn active_client(&self) -> &SocketClient {
-        &self.tabs[self.active].client
+    fn from_ssh(
+        host: &str,
+        local_socket: &str,
+        size: Size,
+        start_dir: Option<String>,
+    ) -> io::Result<Self> {
+        let client = crate::domain::connect_ssh(host, size)?;
+        Ok(Self {
+            tabs: vec![ClientTab {
+                code: tab_code(0),
+                title: host.to_string(),
+                socket_name: format!("ssh:{host}"),
+                client: Box::new(client),
+                grafts: HashMap::new(),
+                visual_focus: VisualFocus::Local { pane_id: None },
+                pending_attach: None,
+                pending_reconnect: HashMap::new(),
+            }],
+            active: 0,
+            tab_bar_offset: 0,
+            base_socket: local_socket.to_string(),
+            start_dir,
+            next_id: 1,
+            killed_sockets: std::collections::HashSet::new(),
+        })
+    }
+
+    fn attach_ssh(&mut self, host: &str, size: Size) -> io::Result<String> {
+        let socket_name = format!("ssh:{host}");
+        if let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.socket_name == socket_name)
+        {
+            self.active = index;
+            return Ok(format!("attached {host}"));
+        }
+        let client = crate::domain::connect_ssh(host, size)?;
+        let code = next_available_tab_code(&self.tabs, self.tabs.len());
+        self.tabs.push(ClientTab {
+            code,
+            title: host.to_string(),
+            socket_name,
+            client: Box::new(client),
+            grafts: HashMap::new(),
+            visual_focus: VisualFocus::Local { pane_id: None },
+            pending_attach: None,
+            pending_reconnect: HashMap::new(),
+        });
+        self.active = self.tabs.len() - 1;
+        Ok(format!("ssh {host}"))
+    }
+
+    fn active_client(&self) -> &dyn DomainHandle {
+        self.tabs[self.active].client.as_ref()
+    }
+
+    fn focused_client(&self) -> &dyn DomainHandle {
+        let tab = &self.tabs[self.active];
+        match tab.visual_focus {
+            VisualFocus::Remote { slot_id, .. } => tab
+                .grafts
+                .get(&slot_id)
+                .map(|g| g.client.as_ref())
+                .unwrap_or(tab.client.as_ref()),
+            VisualFocus::Local { .. } => tab.client.as_ref(),
+        }
+    }
+
+    fn display_snapshot(&mut self) -> (Option<FrameData>, u64) {
+        self.tick_cloud();
+        let tab = &mut self.tabs[self.active];
+        let (mut frame, mut counter) = tab.client.frame_snapshot();
+        if let Some(fd) = frame.as_mut() {
+            let mut grafts = HashMap::new();
+            for (slot_id, graft) in &tab.grafts {
+                let (gframe, gcounter) = graft.client.frame_snapshot();
+                counter = counter.wrapping_add(gcounter);
+                if let Some(gframe) = gframe {
+                    if !gframe.exit {
+                        grafts.insert(*slot_id, gframe);
+                    }
+                }
+            }
+            fd.layout = visual::compose_layout(&fd.layout, &grafts);
+            let focused_remote =
+                matches!(tab.visual_focus, VisualFocus::Remote { .. });
+            let remote_status = match &tab.visual_focus {
+                VisualFocus::Remote { slot_id, .. } => {
+                    grafts.get(slot_id).and_then(|g| g.status.clone())
+                }
+                VisualFocus::Local { .. } => None,
+            };
+            let blob = tab.grafts.values().find_map(|g| g.client.blob_notice());
+            fd.status = visual::merge_status(
+                fd.status.as_ref(),
+                remote_status.as_ref(),
+                focused_remote,
+                blob.as_deref(),
+            );
+            if !tab.grafts.is_empty() {
+                if let Some(status) = fd.status.as_mut() {
+                    if !focused_remote && !status.left.starts_with("[local]") {
+                        status.left = format!("[local] {}", status.left);
+                    }
+                }
+            }
+        }
+        (frame, counter)
+    }
+
+    fn tick_cloud(&mut self) {
+        let tab = &mut self.tabs[self.active];
+        if let Some(fd) = tab.client.latest_frame() {
+            for req in &fd.client_requests {
+                match req {
+                    ClientRequest::DomainAttach {
+                        request_id,
+                        host,
+                        pane_id,
+                    } => {
+                        if tab
+                            .pending_attach
+                            .as_ref()
+                            .is_some_and(|p| p.request_id == *request_id)
+                        {
+                            continue;
+                        }
+                        if tab.grafts.values().any(|g| g.host == *host) {
+                            let ok = crate::domain::attach::DomainBindOk {
+                                request_id: request_id.clone(),
+                                host: host.clone(),
+                                remote_socket: "default".into(),
+                                generation: 1,
+                            };
+                            if let Ok(json) = serde_json::to_string(&ok) {
+                                tab.client.send_control_line(&format!(
+                                    "DOMAIN_BIND_OK {json}"
+                                ));
+                            }
+                            continue;
+                        }
+                        let host_c = host.clone();
+                        tab.pending_attach = Some(PendingAttach {
+                            request_id: request_id.clone(),
+                            host: host.clone(),
+                            pane_id: *pane_id,
+                            rx: spawn_ssh_connect(host_c),
+                            ready: None,
+                        });
+                    }
+                }
+            }
+        }
+        if let Some(mut pending) = tab.pending_attach.take() {
+            let mut aborted = false;
+            if pending.ready.is_none() {
+                match pending.rx.try_recv() {
+                    Ok(Ok(client)) => {
+                        let ok = crate::domain::attach::DomainBindOk {
+                            request_id: pending.request_id.clone(),
+                            host: pending.host.clone(),
+                            remote_socket: "default".into(),
+                            generation: 1,
+                        };
+                        if let Ok(json) = serde_json::to_string(&ok) {
+                            tab.client.send_control_line(&format!(
+                                "DOMAIN_BIND_OK {json}"
+                            ));
+                        }
+                        pending.ready = Some(Box::new(client));
+                    }
+                    Ok(Err(err)) => {
+                        let fail = crate::domain::attach::DomainBindFail {
+                            request_id: pending.request_id.clone(),
+                            error: err,
+                        };
+                        if let Ok(json) = serde_json::to_string(&fail) {
+                            tab.client.send_control_line(&format!(
+                                "DOMAIN_BIND_FAIL {json}"
+                            ));
+                        }
+                        aborted = true;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        let fail = crate::domain::attach::DomainBindFail {
+                            request_id: pending.request_id.clone(),
+                            error: "ssh attach thread exited".into(),
+                        };
+                        if let Ok(json) = serde_json::to_string(&fail) {
+                            tab.client.send_control_line(&format!(
+                                "DOMAIN_BIND_FAIL {json}"
+                            ));
+                        }
+                        aborted = true;
+                    }
+                }
+            }
+            if !aborted {
+                if let Some(client) = pending.ready.take() {
+                    if let Some(fd) = tab.client.latest_frame() {
+                        if let Some(slot_id) =
+                            visual::slot_id_for_host(&fd.layout, &pending.host)
+                        {
+                            tab.visual_focus = VisualFocus::Remote {
+                                slot_id,
+                                pane_id: 0,
+                            };
+                            tab.grafts.insert(
+                                slot_id,
+                                Graft {
+                                    host: pending.host.clone(),
+                                    remote_socket: "default".into(),
+                                    client,
+                                    generation: 1,
+                                    last_size: None,
+                                    last_reconnect_at: None,
+                                },
+                            );
+                        } else {
+                            pending.ready = Some(client);
+                            tab.pending_attach = Some(pending);
+                        }
+                    } else {
+                        pending.ready = Some(client);
+                        tab.pending_attach = Some(pending);
+                    }
+                } else {
+                    tab.pending_attach = Some(pending);
+                }
+            }
+        }
+        self.poll_reconnects();
+        self.sync_graft_sizes();
+    }
+
+    fn poll_reconnects(&mut self) {
+        let tab = &mut self.tabs[self.active];
+        let pending_ids: Vec<u64> =
+            tab.pending_reconnect.keys().copied().collect();
+        for slot_id in pending_ids {
+            let Some(pending) = tab.pending_reconnect.remove(&slot_id) else {
+                continue;
+            };
+            match pending.rx.try_recv() {
+                Ok(Ok(client)) => {
+                    if let Some(graft) = tab.grafts.get_mut(&slot_id) {
+                        graft.generation = graft.generation.saturating_add(1);
+                        graft.client = Box::new(client);
+                        graft.last_size = None;
+                        graft.last_reconnect_at = None;
+                        let generation = graft.generation;
+                        send_slot_state(
+                            tab.client.as_ref(),
+                            slot_id,
+                            "bound",
+                            generation,
+                        );
+                    }
+                }
+                Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => {
+                    if let Some(graft) = tab.grafts.get_mut(&slot_id) {
+                        graft.last_reconnect_at = Some(Instant::now());
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    tab.pending_reconnect.insert(slot_id, pending);
+                }
+            }
+        }
+        let mut start = Vec::new();
+        for (slot_id, graft) in &tab.grafts {
+            if !graft.client.disconnected() {
+                continue;
+            }
+            if tab.pending_reconnect.contains_key(slot_id) {
+                continue;
+            }
+            let due = graft
+                .last_reconnect_at
+                .is_none_or(|at| at.elapsed() >= RECONNECT_BACKOFF);
+            if due {
+                start.push((
+                    *slot_id,
+                    graft.host.clone(),
+                    graft.generation.saturating_add(1),
+                ));
+            }
+        }
+        for (slot_id, host, generation) in start {
+            send_slot_state(
+                tab.client.as_ref(),
+                slot_id,
+                "reconnecting",
+                generation,
+            );
+            tab.pending_reconnect.insert(
+                slot_id,
+                PendingReconnect {
+                    rx: spawn_ssh_connect(host),
+                },
+            );
+        }
+    }
+
+    fn sync_graft_sizes(&mut self) {
+        let tab = &mut self.tabs[self.active];
+        let Some(fd) = tab.client.latest_frame() else {
+            return;
+        };
+        let (cols, rows) = terminal::size().unwrap_or((80, 24));
+        let area = server_layout_area(cols, rows);
+        for (slot_id, graft) in tab.grafts.iter_mut() {
+            let Some(rect) =
+                visual::slot_rect(&fd.layout, area, false, *slot_id)
+            else {
+                continue;
+            };
+            let size = visual::graft_size(rect);
+            if graft.last_size != Some(size) {
+                graft.client.resize(size);
+                graft.last_size = Some(size);
+            }
+        }
+    }
+
+    fn visual_move(&mut self, dir: crate::layout::NavDir, hide_borders: bool) {
+        let (cols, rows) = terminal::size().unwrap_or((80, 24));
+        let area = server_layout_area(cols, rows);
+        let tab = &mut self.tabs[self.active];
+        let Some(fd) = tab.client.latest_frame() else {
+            return;
+        };
+        let mut grafts = HashMap::new();
+        for (id, graft) in &tab.grafts {
+            if let Some(frame) = graft.client.latest_frame() {
+                if !frame.exit {
+                    grafts.insert(*id, frame);
+                }
+            }
+        }
+        let composed = visual::compose_layout(&fd.layout, &grafts);
+        let hits =
+            visual::collect_visual_hits(&composed, area, hide_borders, None);
+        let current = match &tab.visual_focus {
+            VisualFocus::Remote { slot_id, pane_id } => {
+                visual::VisualTarget::Remote {
+                    slot_id: *slot_id,
+                    pane_id: *pane_id,
+                }
+            }
+            VisualFocus::Local { pane_id } => visual::VisualTarget::Local {
+                pane_id: pane_id
+                    .or_else(|| {
+                        visual::collect_visual_hits(
+                            &composed,
+                            area,
+                            hide_borders,
+                            None,
+                        )
+                        .iter()
+                        .find_map(|h| {
+                            if let visual::VisualTarget::Local { pane_id } =
+                                h.target
+                            {
+                                Some(pane_id)
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .unwrap_or(0),
+            },
+        };
+        let Some(next) = visual::neighbor_in_dir(&hits, &current, dir) else {
+            return;
+        };
+        match next {
+            visual::VisualTarget::Local { pane_id } => {
+                tab.client
+                    .run_command(&format!("select-pane -t %{pane_id}"));
+                tab.visual_focus = VisualFocus::Local {
+                    pane_id: Some(pane_id),
+                };
+            }
+            visual::VisualTarget::Remote { slot_id, pane_id } => {
+                if let Some(slot_pane) =
+                    visual::external_local_id(&composed, slot_id)
+                {
+                    tab.client
+                        .run_command(&format!("select-pane -t %{slot_pane}"));
+                }
+                if let Some(graft) = tab.grafts.get(&slot_id) {
+                    graft
+                        .client
+                        .run_command(&format!("select-pane -t %{pane_id}"));
+                }
+                tab.visual_focus = VisualFocus::Remote { slot_id, pane_id };
+            }
+            visual::VisualTarget::Placeholder { slot_id } => {
+                if let Some(slot_pane) =
+                    visual::external_local_id(&composed, slot_id)
+                {
+                    tab.client
+                        .run_command(&format!("select-pane -t %{slot_pane}"));
+                }
+                tab.visual_focus = VisualFocus::Local { pane_id: None };
+            }
+        }
+    }
+
+    fn paint_grafts(&self, hide_borders: bool) -> String {
+        let tab = &self.tabs[self.active];
+        let Some(fd) = tab.client.latest_frame() else {
+            return String::new();
+        };
+        let (cols, rows) = terminal::size().unwrap_or((80, 24));
+        let area = server_layout_area(cols, rows);
+        let mut out = String::new();
+        for (slot_id, graft) in &tab.grafts {
+            let Some(rect) =
+                visual::slot_rect(&fd.layout, area, hide_borders, *slot_id)
+            else {
+                continue;
+            };
+            let Some(gframe) = graft.client.latest_frame() else {
+                continue;
+            };
+            if gframe.exit {
+                continue;
+            }
+            out.push_str(&visual::paint_graft_ansi(
+                &gframe.layout,
+                rect,
+                false,
+            ));
+        }
+        out
+    }
+
+    fn resize_visual(&self, dir: crate::layout::NavDir) {
+        let cmd = match dir {
+            crate::layout::NavDir::Left => "resize-pane -L",
+            crate::layout::NavDir::Right => "resize-pane -R",
+            crate::layout::NavDir::Up => "resize-pane -U",
+            crate::layout::NavDir::Down => "resize-pane -D",
+        };
+        let hits = self.composed_hits(false);
+        let Some(current) = self.current_visual_target(&hits) else {
+            self.active_client().run_command(cmd);
+            return;
+        };
+        match visual::resize_owner(&hits, &current, dir) {
+            visual::ResizeOwner::Remote { slot_id } => {
+                if let Some(graft) = self.tabs[self.active].grafts.get(&slot_id)
+                {
+                    graft.client.run_command(cmd);
+                }
+            }
+            visual::ResizeOwner::Local => {
+                self.active_client().run_command(cmd);
+            }
+            visual::ResizeOwner::None => {}
+        }
+    }
+
+    fn composed_hits(&self, hide_borders: bool) -> Vec<visual::VisualHit> {
+        let (cols, rows) = terminal::size().unwrap_or((80, 24));
+        let area = server_layout_area(cols, rows);
+        let tab = &self.tabs[self.active];
+        let Some(fd) = tab.client.latest_frame() else {
+            return Vec::new();
+        };
+        let mut grafts = HashMap::new();
+        for (id, graft) in &tab.grafts {
+            if let Some(frame) = graft.client.latest_frame() {
+                if !frame.exit {
+                    grafts.insert(*id, frame);
+                }
+            }
+        }
+        let composed = visual::compose_layout(&fd.layout, &grafts);
+        visual::collect_visual_hits(&composed, area, hide_borders, None)
+    }
+
+    fn current_visual_target(
+        &self,
+        hits: &[visual::VisualHit],
+    ) -> Option<visual::VisualTarget> {
+        match self.tabs[self.active].visual_focus {
+            VisualFocus::Remote { slot_id, pane_id } => {
+                Some(visual::VisualTarget::Remote { slot_id, pane_id })
+            }
+            VisualFocus::Local {
+                pane_id: Some(pane_id),
+            } => Some(visual::VisualTarget::Local { pane_id }),
+            VisualFocus::Local { pane_id: None } => {
+                hits.iter().find_map(|h| match h.target {
+                    visual::VisualTarget::Local { pane_id } => {
+                        Some(visual::VisualTarget::Local { pane_id })
+                    }
+                    _ => None,
+                })
+            }
+        }
+    }
+
+    fn apply_visual_target(&mut self, target: visual::VisualTarget) {
+        let tab = &mut self.tabs[self.active];
+        let Some(fd) = tab.client.latest_frame() else {
+            return;
+        };
+        match target {
+            visual::VisualTarget::Local { pane_id } => {
+                tab.client
+                    .run_command(&format!("select-pane -t %{pane_id}"));
+                tab.visual_focus = VisualFocus::Local {
+                    pane_id: Some(pane_id),
+                };
+            }
+            visual::VisualTarget::Remote { slot_id, pane_id } => {
+                if let Some(slot_pane) =
+                    visual::external_local_id(&fd.layout, slot_id)
+                {
+                    tab.client
+                        .run_command(&format!("select-pane -t %{slot_pane}"));
+                }
+                if let Some(graft) = tab.grafts.get(&slot_id) {
+                    graft
+                        .client
+                        .run_command(&format!("select-pane -t %{pane_id}"));
+                }
+                tab.visual_focus = VisualFocus::Remote { slot_id, pane_id };
+            }
+            visual::VisualTarget::Placeholder { slot_id } => {
+                if let Some(slot_pane) =
+                    visual::external_local_id(&fd.layout, slot_id)
+                {
+                    tab.client
+                        .run_command(&format!("select-pane -t %{slot_pane}"));
+                    tab.visual_focus = VisualFocus::Local {
+                        pane_id: Some(slot_pane),
+                    };
+                } else {
+                    tab.visual_focus = VisualFocus::Local { pane_id: None };
+                }
+            }
+        }
+    }
+
+    fn focus_at(&mut self, col: u16, row: u16, hide_borders: bool) -> bool {
+        let hits = self.composed_hits(hide_borders);
+        let Some(hit) = visual::hit_at(&hits, col, row) else {
+            return false;
+        };
+        if self.current_visual_target(&hits).as_ref() == Some(&hit.target) {
+            return false;
+        }
+        let target = hit.target.clone();
+        self.apply_visual_target(target);
+        true
+    }
+
+    fn scroll_at(
+        &mut self,
+        mouse: MouseEvent,
+        hide_borders: bool,
+        direction: &str,
+    ) {
+        let hits = self.composed_hits(hide_borders);
+        if let Some(hit) = visual::hit_at(&hits, mouse.column, mouse.row) {
+            let pane_id = match hit.target {
+                visual::VisualTarget::Local { pane_id } => Some(pane_id),
+                visual::VisualTarget::Remote { pane_id, .. } => Some(pane_id),
+                visual::VisualTarget::Placeholder { .. } => None,
+            };
+            let target = hit.target.clone();
+            self.apply_visual_target(target);
+            if let Some(pane_id) = pane_id {
+                self.focused_client().scroll_pane(
+                    pane_id,
+                    direction,
+                    SCROLL_LINES,
+                );
+            }
+            return;
+        }
+        if direction == "up" {
+            self.focused_client().scroll_up(SCROLL_LINES);
+        } else {
+            self.focused_client().scroll_down(SCROLL_LINES);
+        }
+    }
+
+    fn send_mouse_at(&self, mouse: MouseEvent, hide_borders: bool) -> bool {
+        let hits = self.composed_hits(hide_borders);
+        let Some(hit) = visual::hit_at(&hits, mouse.column, mouse.row) else {
+            return false;
+        };
+        let hide = match hit.target {
+            visual::VisualTarget::Remote { .. } => false,
+            _ => hide_borders,
+        };
+        let inner = visual::content_rect(hit.rect, hide);
+        if mouse.column < inner.x
+            || mouse.column >= inner.x.saturating_add(inner.width)
+            || mouse.row < inner.y
+            || mouse.row >= inner.y.saturating_add(inner.height)
+        {
+            return false;
+        }
+        let mut mapped = mouse;
+        mapped.column = mouse.column.saturating_sub(inner.x);
+        mapped.row = mouse.row.saturating_sub(inner.y);
+        let bytes = mouse_to_bytes(mapped);
+        if bytes.is_empty() {
+            return false;
+        }
+        match hit.target {
+            visual::VisualTarget::Remote { slot_id, .. } => {
+                if let Some(graft) = self.tabs[self.active].grafts.get(&slot_id)
+                {
+                    graft.client.send_input(&bytes);
+                    true
+                } else {
+                    false
+                }
+            }
+            visual::VisualTarget::Local { .. } => {
+                self.active_client().send_input(&bytes);
+                true
+            }
+            visual::VisualTarget::Placeholder { .. } => false,
+        }
+    }
+
+    fn kill_visual_pane(&mut self) {
+        match self.tabs[self.active].visual_focus {
+            VisualFocus::Remote { slot_id, .. } => {
+                let last = self.tabs[self.active]
+                    .grafts
+                    .get(&slot_id)
+                    .and_then(|g| g.client.latest_frame())
+                    .map(|f| visual::leaf_count(&f.layout) <= 1)
+                    .unwrap_or(true);
+                if last {
+                    self.exit_slot(slot_id);
+                } else if let Some(graft) =
+                    self.tabs[self.active].grafts.get(&slot_id)
+                {
+                    graft.client.run_command("kill-pane");
+                }
+            }
+            VisualFocus::Local { .. } => {
+                self.active_client().run_command("kill-pane");
+            }
+        }
+    }
+
+    fn exit_slot(&mut self, slot_id: u64) {
+        let tab = &mut self.tabs[self.active];
+        tab.pending_reconnect.remove(&slot_id);
+        let generation =
+            tab.grafts.get(&slot_id).map(|g| g.generation).unwrap_or(1);
+        tab.grafts.remove(&slot_id);
+        send_slot_state(tab.client.as_ref(), slot_id, "exited", generation);
+        let local_id = tab
+            .client
+            .latest_frame()
+            .and_then(|fd| visual::external_local_id(&fd.layout, slot_id));
+        tab.visual_focus = VisualFocus::Local { pane_id: local_id };
+        if let Some(id) = local_id {
+            tab.client.run_command(&format!("select-pane -t %{id}"));
+        }
     }
 
     fn active_index(&self) -> usize {
@@ -365,7 +1085,11 @@ impl TabManager {
             code,
             title: String::new(),
             socket_name,
-            client,
+            client: Box::new(client),
+            grafts: HashMap::new(),
+            visual_focus: VisualFocus::Local { pane_id: None },
+            pending_attach: None,
+            pending_reconnect: HashMap::new(),
         });
         self.active = self.tabs.len() - 1;
         Ok(())
@@ -496,7 +1220,11 @@ impl TabManager {
             code,
             title,
             socket_name: socket_name.to_string(),
-            client,
+            client: Box::new(client),
+            grafts: HashMap::new(),
+            visual_focus: VisualFocus::Local { pane_id: None },
+            pending_attach: None,
+            pending_reconnect: HashMap::new(),
         });
         self.active = self.tabs.len() - 1;
         Ok(())
@@ -1191,6 +1919,7 @@ impl ClientApp {
             start_dir,
             initial_tab_title,
             attach_all: false,
+            ssh_host: None,
         }
     }
 
@@ -1207,6 +1936,23 @@ impl ClientApp {
             start_dir,
             initial_tab_title: None,
             attach_all: true,
+            ssh_host: None,
+        }
+    }
+
+    pub fn new_ssh(
+        host: String,
+        socket_name: &str,
+        start_dir: Option<String>,
+    ) -> Self {
+        Self {
+            socket_name: socket_name.to_string(),
+            session_name: None,
+            clean: false,
+            start_dir,
+            initial_tab_title: Some(host.clone()),
+            attach_all: false,
+            ssh_host: Some(host),
         }
     }
 
@@ -1220,7 +1966,14 @@ impl ClientApp {
         #[cfg(unix)]
         crate::pty::remember_host_termios();
 
-        let mut tabs = if self.attach_all {
+        let mut tabs = if let Some(host) = &self.ssh_host {
+            TabManager::from_ssh(
+                host,
+                &self.socket_name,
+                size,
+                self.start_dir.clone(),
+            )?
+        } else if self.attach_all {
             let socket_names = discover_all_socket_names(&self.socket_name)?;
             match TabManager::from_existing_sockets(
                 &self.socket_name,
@@ -1300,8 +2053,7 @@ impl ClientApp {
         let mut last_overlay_rect: Option<ratatui::layout::Rect> = None;
         let run_result: io::Result<()> = (|| {
             loop {
-                let (frame, current_counter) =
-                    tabs.active_client().frame_snapshot();
+                let (frame, current_counter) = tabs.display_snapshot();
                 let active_socket_name = tabs.active_socket_name();
                 if matches!(
                     copy_mode_sync_suppress_frame,
@@ -1469,6 +2221,24 @@ impl ClientApp {
                                                     log_client(&format!(
                                                         "failed to write pane ansi: {err}"
                                                     ));
+                                                }
+                                                let graft_ansi =
+                                                    tabs.paint_grafts(
+                                                        hide_borders,
+                                                    );
+                                                if !graft_ansi.is_empty() {
+                                                    if let Err(err) =
+                                                        terminal
+                                                            .backend_mut()
+                                                            .write_all(
+                                                                graft_ansi
+                                                                    .as_bytes(),
+                                                            )
+                                                    {
+                                                        log_client(&format!(
+                                                            "failed to write graft ansi: {err}"
+                                                        ));
+                                                    }
                                                 }
                                             }
                                             Err(err) => log_client(&format!(
@@ -1780,7 +2550,7 @@ impl ClientApp {
                                             )
                                     ) && display_scrolled
                                     {
-                                        tabs.active_client()
+                                        tabs.focused_client()
                                             .scroll_display_bottom();
                                         display_scrolled = false;
                                         last_drawn_counter = 0;
@@ -1791,7 +2561,7 @@ impl ClientApp {
                                             && copy_mode_exit_pending
                                         {
                                             leave_copy_mode_client(
-                                                tabs.active_client(),
+                                                tabs.focused_client(),
                                                 &mut mode,
                                                 &mut copy_mode_confirmed,
                                                 &mut copy_mode_exit_pending,
@@ -1800,7 +2570,7 @@ impl ClientApp {
                                         }
                                         let bytes = key_to_bytes(key);
                                         if !bytes.is_empty() {
-                                            tabs.active_client()
+                                            tabs.focused_client()
                                                 .send_input(&bytes);
                                         }
                                     }
@@ -1814,7 +2584,7 @@ impl ClientApp {
                                     if (key.code, key.modifiers) == prefix_key {
                                         let bytes = key_to_bytes(key);
                                         if !bytes.is_empty() {
-                                            tabs.active_client()
+                                            tabs.focused_client()
                                                 .send_input(&bytes);
                                         }
                                         continue;
@@ -1837,7 +2607,19 @@ impl ClientApp {
                                     if let Some(cmd) =
                                         resize_command_for_key(key)
                                     {
-                                        tabs.active_client().run_command(cmd);
+                                        let dir = match cmd {
+                                            "resize-pane -L" => {
+                                                crate::layout::NavDir::Left
+                                            }
+                                            "resize-pane -R" => {
+                                                crate::layout::NavDir::Right
+                                            }
+                                            "resize-pane -U" => {
+                                                crate::layout::NavDir::Up
+                                            }
+                                            _ => crate::layout::NavDir::Down,
+                                        };
+                                        tabs.resize_visual(dir);
                                         last_drawn_counter = 0;
                                         mode = InputMode::Resize;
                                         resize_deadline = Some(
@@ -1863,7 +2645,7 @@ impl ClientApp {
                                                     active_in_copy_mode,
                                                 )
                                             {
-                                                tabs.active_client()
+                                                tabs.focused_client()
                                                     .exit_copy_mode();
                                                 copy_mode_confirmed = false;
                                             }
@@ -1967,7 +2749,7 @@ impl ClientApp {
                                         }
                                         (KeyCode::Char('['), _) => {
                                             if tabs
-                                                .active_client()
+                                                .focused_client()
                                                 .enter_copy_mode()
                                             {
                                                 mode = InputMode::CopyMode;
@@ -2038,10 +2820,53 @@ impl ClientApp {
                                                 ));
                                             }
                                         }
+                                        (
+                                            KeyCode::Char(']'),
+                                            KeyModifiers::NONE,
+                                        ) => {
+                                            match tabs
+                                                .focused_client()
+                                                .paste_cloud()
+                                            {
+                                                Ok(message) => {
+                                                    status_notice = Some((
+                                                        message,
+                                                        Instant::now()
+                                                            + Duration::from_secs(
+                                                                3,
+                                                            ),
+                                                    ));
+                                                }
+                                                Err(message) => {
+                                                    status_notice = Some((
+                                                        message,
+                                                        Instant::now()
+                                                            + Duration::from_secs(
+                                                                3,
+                                                            ),
+                                                    ));
+                                                }
+                                            }
+                                        }
                                         _ => {
-                                            if let Some(message) =
+                                            if let Some(dir) =
+                                                prefix_nav_dir(key)
+                                            {
+                                                tabs.visual_move(
+                                                    dir,
+                                                    hide_borders,
+                                                );
+                                            } else if matches!(
+                                                (key.code, key.modifiers),
+                                                (
+                                                    KeyCode::Char('x'),
+                                                    KeyModifiers::NONE
+                                                )
+                                            ) {
+                                                tabs.kill_visual_pane();
+                                            } else if let Some(message) =
                                                 handle_prefix_key(
-                                                    tabs.active_client(),
+                                                    tabs.focused_client(),
                                                     key,
                                                 )
                                             {
@@ -2068,7 +2893,19 @@ impl ClientApp {
                                     if let Some(cmd) =
                                         resize_command_for_key(key)
                                     {
-                                        tabs.active_client().run_command(cmd);
+                                        let dir = match cmd {
+                                            "resize-pane -L" => {
+                                                crate::layout::NavDir::Left
+                                            }
+                                            "resize-pane -R" => {
+                                                crate::layout::NavDir::Right
+                                            }
+                                            "resize-pane -U" => {
+                                                crate::layout::NavDir::Up
+                                            }
+                                            _ => crate::layout::NavDir::Down,
+                                        };
+                                        tabs.resize_visual(dir);
                                         last_drawn_counter = 0;
                                         resize_deadline = Some(
                                             Instant::now()
@@ -2118,7 +2955,7 @@ impl ClientApp {
                                                 }
                                                 ClientTabCommandResult::NotHandled => {
                                                     if let Some(message) = run_command_notice(
-                                                        tabs.active_client(),
+                                                        tabs.focused_client(),
                                                         &trimmed,
                                                     ) {
                                                         status_notice = Some((
@@ -2191,7 +3028,7 @@ impl ClientApp {
                                             KeyModifiers::NONE,
                                         ) => {
                                             leave_copy_mode_client(
-                                                tabs.active_client(),
+                                                tabs.focused_client(),
                                                 &mut mode,
                                                 &mut copy_mode_confirmed,
                                                 &mut copy_mode_exit_pending,
@@ -2223,7 +3060,7 @@ impl ClientApp {
                                         )
                                         | (KeyCode::Left, KeyModifiers::NONE) =>
                                         {
-                                            tabs.active_client()
+                                            tabs.focused_client()
                                                 .copy_move_left();
                                             mode = InputMode::CopyMode;
                                         }
@@ -2235,7 +3072,7 @@ impl ClientApp {
                                             KeyCode::Right,
                                             KeyModifiers::NONE,
                                         ) => {
-                                            tabs.active_client()
+                                            tabs.focused_client()
                                                 .copy_move_right();
                                             mode = InputMode::CopyMode;
                                         }
@@ -2244,7 +3081,8 @@ impl ClientApp {
                                             KeyModifiers::NONE,
                                         )
                                         | (KeyCode::Up, KeyModifiers::NONE) => {
-                                            tabs.active_client().copy_move_up();
+                                            tabs.focused_client()
+                                                .copy_move_up();
                                             mode = InputMode::CopyMode;
                                         }
                                         (
@@ -2253,7 +3091,7 @@ impl ClientApp {
                                         )
                                         | (KeyCode::Down, KeyModifiers::NONE) =>
                                         {
-                                            tabs.active_client()
+                                            tabs.focused_client()
                                                 .copy_move_down();
                                             mode = InputMode::CopyMode;
                                         }
@@ -2261,7 +3099,7 @@ impl ClientApp {
                                             KeyCode::Char('b'),
                                             KeyModifiers::NONE,
                                         ) => {
-                                            tabs.active_client()
+                                            tabs.focused_client()
                                                 .copy_move_word_backward();
                                             mode = InputMode::CopyMode;
                                         }
@@ -2269,7 +3107,7 @@ impl ClientApp {
                                             KeyCode::Char('w'),
                                             KeyModifiers::NONE,
                                         ) => {
-                                            tabs.active_client()
+                                            tabs.focused_client()
                                                 .copy_move_word_forward();
                                             mode = InputMode::CopyMode;
                                         }
@@ -2277,7 +3115,7 @@ impl ClientApp {
                                             KeyCode::Char('e'),
                                             KeyModifiers::NONE,
                                         ) => {
-                                            tabs.active_client()
+                                            tabs.focused_client()
                                                 .copy_move_word_end();
                                             mode = InputMode::CopyMode;
                                         }
@@ -2289,7 +3127,8 @@ impl ClientApp {
                                             KeyCode::Char('b'),
                                             KeyModifiers::CONTROL,
                                         ) => {
-                                            tabs.active_client().copy_page_up();
+                                            tabs.focused_client()
+                                                .copy_page_up();
                                             mode = InputMode::CopyMode;
                                         }
                                         (
@@ -2300,7 +3139,7 @@ impl ClientApp {
                                             KeyCode::Char('f'),
                                             KeyModifiers::CONTROL,
                                         ) => {
-                                            tabs.active_client()
+                                            tabs.focused_client()
                                                 .copy_page_down();
                                             mode = InputMode::CopyMode;
                                         }
@@ -2308,24 +3147,24 @@ impl ClientApp {
                                             KeyCode::Char('g'),
                                             KeyModifiers::NONE,
                                         ) => {
-                                            tabs.active_client()
+                                            tabs.focused_client()
                                                 .copy_move_to_top();
                                             mode = InputMode::CopyMode;
                                         }
                                         (KeyCode::Char('G'), mods)
                                             if is_copy_plain_key(mods) =>
                                         {
-                                            tabs.active_client()
+                                            tabs.focused_client()
                                                 .copy_move_to_bottom();
                                             mode = InputMode::CopyMode;
                                         }
                                         _ if is_copy_line_start_key(key) => {
-                                            tabs.active_client()
+                                            tabs.focused_client()
                                                 .copy_move_to_line_start();
                                             mode = InputMode::CopyMode;
                                         }
                                         _ if is_copy_line_end_key(key) => {
-                                            tabs.active_client()
+                                            tabs.focused_client()
                                                 .copy_move_to_line_end();
                                             mode = InputMode::CopyMode;
                                         }
@@ -2337,7 +3176,7 @@ impl ClientApp {
                                             KeyCode::Char(' '),
                                             KeyModifiers::NONE,
                                         ) => {
-                                            tabs.active_client()
+                                            tabs.focused_client()
                                                 .copy_start_selection(
                                                     SelectionMode::Char,
                                                 );
@@ -2346,7 +3185,7 @@ impl ClientApp {
                                         (KeyCode::Char('V'), mods)
                                             if is_copy_plain_key(mods) =>
                                         {
-                                            tabs.active_client()
+                                            tabs.focused_client()
                                                 .copy_start_selection(
                                                     SelectionMode::Line,
                                                 );
@@ -2356,7 +3195,7 @@ impl ClientApp {
                                             KeyCode::Char('v'),
                                             KeyModifiers::CONTROL,
                                         ) => {
-                                            tabs.active_client()
+                                            tabs.focused_client()
                                                 .copy_start_selection(
                                                     SelectionMode::Rect,
                                                 );
@@ -2366,14 +3205,14 @@ impl ClientApp {
                                             KeyCode::Char('n'),
                                             KeyModifiers::NONE,
                                         ) => {
-                                            tabs.active_client()
+                                            tabs.focused_client()
                                                 .copy_search_next();
                                             mode = InputMode::CopyMode;
                                         }
                                         (KeyCode::Char('N'), mods)
                                             if is_copy_plain_key(mods) =>
                                         {
-                                            tabs.active_client()
+                                            tabs.focused_client()
                                                 .copy_search_prev();
                                             mode = InputMode::CopyMode;
                                         }
@@ -2396,7 +3235,7 @@ impl ClientApp {
                                                 mode = InputMode::CopyMode;
                                             } else {
                                                 leave_copy_mode_client(
-                                                    tabs.active_client(),
+                                                    tabs.focused_client(),
                                                     &mut mode,
                                                     &mut copy_mode_confirmed,
                                                     &mut copy_mode_exit_pending,
@@ -2472,7 +3311,7 @@ impl ClientApp {
                                                 == KeyModifiers::NONE =>
                                         {
                                             leave_copy_mode_client(
-                                                tabs.active_client(),
+                                                tabs.focused_client(),
                                                 &mut mode,
                                                 &mut copy_mode_confirmed,
                                                 &mut copy_mode_exit_pending,
@@ -3727,7 +4566,7 @@ impl ClientApp {
                                                         mouse.column,
                                                     )
                                                 {
-                                                    tabs.active_client()
+                                                    tabs.focused_client()
                                                         .run_command(&format!(
                                                         "select-window -t {}",
                                                         win_index
@@ -3769,81 +4608,28 @@ impl ClientApp {
                                         );
                                     if mouse_mode != 0 && !shift_overrides {
                                         mouse_select = None;
-                                        let focused_other_pane = if matches!(
+                                        let focused_other_pane = matches!(
                                             mouse.kind,
                                             MouseEventKind::Down(
                                                 MouseButton::Left
                                             )
-                                        ) {
-                                            frame.as_ref().is_some_and(|fd| {
-                                                let (cols, rows) =
-                                                    terminal::size().unwrap_or((
-                                                        80, 24,
-                                                    ));
-                                                let layout_area =
-                                                    server_layout_area(cols, rows);
-                                                let clicked = find_pane_id_at(
-                                                    &fd.layout,
-                                                    layout_area,
-                                                    mouse.column,
-                                                    mouse.row,
-                                                    hide_borders,
-                                                );
-                                                let active =
-                                                    active_pane_id(&fd.layout);
-                                                if let Some(clicked_id) = clicked
-                                                {
-                                                    if Some(clicked_id)
-                                                        != active
-                                                    {
-                                                        tabs.active_client().run_command(
-                                                            &format!(
-                                                                "select-pane -t %{}",
-                                                                clicked_id
-                                                            ),
-                                                        );
-                                                        return true;
-                                                    }
-                                                }
-                                                false
-                                            })
-                                        } else {
-                                            false
-                                        };
+                                        ) && tabs
+                                            .focus_at(
+                                                mouse.column,
+                                                mouse.row,
+                                                hide_borders,
+                                            );
                                         if !focused_other_pane {
-                                            if let Some(fd) = frame.as_ref() {
-                                                let (cols, rows) =
-                                                    terminal::size()
-                                                        .unwrap_or((80, 24));
-                                                if let Some(server_mouse) =
-                                                    mouse_for_pane(
-                                                        mouse,
-                                                        fd,
-                                                        server_layout_area(
-                                                            cols, rows,
-                                                        ),
-                                                        hide_borders,
-                                                    )
-                                                {
-                                                    let bytes = mouse_to_bytes(
-                                                        server_mouse,
-                                                    );
-                                                    if !bytes.is_empty() {
-                                                        tabs.active_client()
-                                                            .send_input(&bytes);
-                                                    }
-                                                }
-                                            }
+                                            tabs.send_mouse_at(
+                                                mouse,
+                                                hide_borders,
+                                            );
                                         }
                                     } else {
                                         match mouse.kind {
                                             MouseEventKind::ScrollUp => {
-                                                scroll_pane_at_mouse(
-                                                    tabs.active_client(),
-                                                    frame.as_ref(),
+                                                tabs.scroll_at(
                                                     mouse,
-                                                    cols,
-                                                    rows,
                                                     hide_borders,
                                                     "up",
                                                 );
@@ -3854,12 +4640,8 @@ impl ClientApp {
                                                 last_drawn_counter = 0;
                                             }
                                             MouseEventKind::ScrollDown => {
-                                                scroll_pane_at_mouse(
-                                                    tabs.active_client(),
-                                                    frame.as_ref(),
+                                                tabs.scroll_at(
                                                     mouse,
-                                                    cols,
-                                                    rows,
                                                     hide_borders,
                                                     "down",
                                                 );
@@ -3877,10 +4659,6 @@ impl ClientApp {
                                                     let fa = server_frame_area(
                                                         cols, rows,
                                                     );
-                                                    let layout_area =
-                                                        server_layout_area(
-                                                            cols, rows,
-                                                        );
                                                     let pa = active_pane_content_rect(fd, fa, hide_borders);
                                                     if mouse.column >= pa.x
                                                         && mouse.column
@@ -3911,22 +4689,12 @@ impl ClientApp {
                                                                     col: mouse.column,
                                                                 });
                                                         }
-                                                    } else if let Some(
-                                                        pane_id,
-                                                    ) =
-                                                        find_pane_id_at(
-                                                            &fd.layout,
-                                                            layout_area,
+                                                    } else {
+                                                        let _ = tabs.focus_at(
                                                             mouse.column,
                                                             mouse.row,
                                                             hide_borders,
-                                                        )
-                                                    {
-                                                        // Clicked on a non-active pane — focus it.
-                                                        tabs.active_client().run_command(&format!(
-                                                            "select-pane -t %{}",
-                                                            pane_id
-                                                        ));
+                                                        );
                                                     }
                                                 }
                                             }
@@ -4098,24 +4866,16 @@ impl ClientApp {
                                 }
                                 InputMode::CopyMode => match mouse.kind {
                                     MouseEventKind::ScrollUp => {
-                                        scroll_pane_at_mouse(
-                                            tabs.active_client(),
-                                            frame.as_ref(),
+                                        tabs.scroll_at(
                                             mouse,
-                                            cols,
-                                            rows,
                                             hide_borders,
                                             "up",
                                         );
                                         last_drawn_counter = 0;
                                     }
                                     MouseEventKind::ScrollDown => {
-                                        scroll_pane_at_mouse(
-                                            tabs.active_client(),
-                                            frame.as_ref(),
+                                        tabs.scroll_at(
                                             mouse,
-                                            cols,
-                                            rows,
                                             hide_borders,
                                             "down",
                                         );
@@ -4127,8 +4887,6 @@ impl ClientApp {
                                                 .unwrap_or((80, 24));
                                             let fa =
                                                 server_frame_area(cols, rows);
-                                            let layout_area =
-                                                server_layout_area(cols, rows);
                                             let pa = active_pane_content_rect(
                                                 fd,
                                                 fa,
@@ -4165,31 +4923,16 @@ impl ClientApp {
                                                         },
                                                     );
                                                 }
-                                            } else if let Some(pane_id) =
-                                                find_pane_id_at(
-                                                    &fd.layout,
-                                                    layout_area,
-                                                    mouse.column,
-                                                    mouse.row,
-                                                    hide_borders,
-                                                )
-                                            {
-                                                if Some(pane_id)
-                                                    != active_pane_id(
-                                                        &fd.layout,
-                                                    )
-                                                {
-                                                    tabs.active_client()
-                                                        .run_command(&format!(
-                                                        "select-pane -t %{}",
-                                                        pane_id
-                                                    ));
-                                                    mode = InputMode::Normal;
-                                                    copy_mode_confirmed = false;
-                                                    copy_mode_sync_suppress_frame =
-                                                        Some(current_counter);
-                                                    mouse_select = None;
-                                                }
+                                            } else if tabs.focus_at(
+                                                mouse.column,
+                                                mouse.row,
+                                                hide_borders,
+                                            ) {
+                                                mode = InputMode::Normal;
+                                                copy_mode_confirmed = false;
+                                                copy_mode_sync_suppress_frame =
+                                                    Some(current_counter);
+                                                mouse_select = None;
                                             }
                                         }
                                     }
@@ -4316,7 +5059,7 @@ impl ClientApp {
                         }
                         Event::Paste(text) => {
                             handle_paste_event(
-                                tabs.active_client(),
+                                tabs.focused_client(),
                                 &mut mode,
                                 text,
                             );
@@ -4359,6 +5102,34 @@ impl ClientApp {
     }
 }
 
+fn spawn_ssh_connect(
+    host: String,
+) -> mpsc::Receiver<Result<crate::domain::cloud::CloudClient, String>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = crate::domain::connect_ssh(&host, Size::new(24, 80))
+            .map_err(|e| e.to_string());
+        let _ = tx.send(result);
+    });
+    rx
+}
+
+fn send_slot_state(
+    client: &dyn DomainHandle,
+    slot_id: u64,
+    state: &str,
+    generation: u64,
+) {
+    let msg = crate::domain::attach::DomainSlotState {
+        slot_id,
+        state: state.to_string(),
+        generation,
+    };
+    if let Ok(json) = serde_json::to_string(&msg) {
+        client.send_control_line(&format!("DOMAIN_SLOT_STATE {json}"));
+    }
+}
+
 fn server_content_size(cols: u16, rows: u16) -> Size {
     Size::new(rows.saturating_sub(1).max(1), cols.max(1))
 }
@@ -4393,6 +5164,7 @@ fn server_layout_area(cols: u16, rows: u16) -> ratatui::layout::Rect {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn mouse_for_pane(
     mut mouse: MouseEvent,
     fd: &FrameData,
@@ -4894,6 +5666,12 @@ fn active_pane_layout_rect(
             area
         }
         LayoutJson::Leaf { .. } => area,
+        LayoutJson::External {
+            graft: Some(g),
+            active: true,
+            ..
+        } => active_pane_layout_rect(g, area, false),
+        LayoutJson::External { .. } => area,
     }
 }
 
@@ -4904,6 +5682,12 @@ fn pane_tree_has_active(layout: &LayoutJson) -> bool {
         LayoutJson::Split { children, .. } => {
             children.iter().any(pane_tree_has_active)
         }
+        LayoutJson::External {
+            graft: Some(g),
+            active: true,
+            ..
+        } => pane_tree_has_active(g),
+        LayoutJson::External { active, .. } => *active,
     }
 }
 
@@ -4986,6 +5770,12 @@ fn find_active_pane_content(
             (Vec::new(), area)
         }
         LayoutJson::Leaf { .. } => (Vec::new(), area),
+        LayoutJson::External {
+            graft: Some(g),
+            active: true,
+            ..
+        } => find_active_pane_content(g, area, false),
+        LayoutJson::External { .. } => (Vec::new(), area),
     }
 }
 
@@ -5031,38 +5821,20 @@ fn find_pane_id_at(
             }
             None
         }
-    }
-}
-
-/// Scroll the pane under the pointer, not whichever pane happened to be active.
-/// Selecting it first keeps client copy-mode state aligned with the server.
-fn scroll_pane_at_mouse(
-    server: &SocketClient,
-    frame: Option<&FrameData>,
-    mouse: MouseEvent,
-    cols: u16,
-    rows: u16,
-    hide_borders: bool,
-    direction: &str,
-) {
-    let pane_id = frame.and_then(|fd| {
-        find_pane_id_at(
-            &fd.layout,
-            server_layout_area(cols, rows),
-            mouse.column,
-            mouse.row,
-            hide_borders,
-        )
-    });
-    if let Some(pane_id) = pane_id {
-        if frame.and_then(|fd| active_pane_id(&fd.layout)) != Some(pane_id) {
-            server.run_command(&format!("select-pane -t %{}", pane_id));
+        LayoutJson::External { graft: Some(g), .. } => {
+            find_pane_id_at(g, area, col, row, hide_borders)
         }
-        server.scroll_pane(pane_id, direction, SCROLL_LINES);
-    } else if direction == "up" {
-        server.scroll_up(SCROLL_LINES);
-    } else {
-        server.scroll_down(SCROLL_LINES);
+        LayoutJson::External { id, .. } => {
+            if col >= area.x
+                && col < area.x + area.width
+                && row >= area.y
+                && row < area.y + area.height
+            {
+                Some(*id)
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -5075,6 +5847,13 @@ fn active_pane_id(layout: &LayoutJson) -> Option<usize> {
             children.iter().find_map(active_pane_id)
         }
         LayoutJson::Leaf { .. } => None,
+        LayoutJson::External {
+            graft: Some(g),
+            active: true,
+            ..
+        } => active_pane_id(g),
+        LayoutJson::External { id, active, .. } if *active => Some(*id),
+        LayoutJson::External { .. } => None,
     }
 }
 
@@ -5286,7 +6065,7 @@ fn cursor_style_for_shape(shape: Option<u8>) -> SetCursorStyle {
 }
 
 fn leave_copy_mode_client(
-    client: &SocketClient,
+    client: &dyn DomainHandle,
     mode: &mut InputMode,
     copy_mode_confirmed: &mut bool,
     copy_mode_exit_pending: &mut bool,
@@ -5324,7 +6103,28 @@ fn is_shifted_letter(key: KeyEvent, letter: char) -> bool {
             || key.modifiers.contains(KeyModifiers::SHIFT))
 }
 
-fn handle_prefix_key(server: &SocketClient, key: KeyEvent) -> Option<String> {
+fn prefix_nav_dir(key: KeyEvent) -> Option<crate::layout::NavDir> {
+    match (key.code, key.modifiers) {
+        (KeyCode::Char('h'), KeyModifiers::NONE) | (KeyCode::Left, _) => {
+            Some(crate::layout::NavDir::Left)
+        }
+        (KeyCode::Char('j'), KeyModifiers::NONE) | (KeyCode::Down, _) => {
+            Some(crate::layout::NavDir::Down)
+        }
+        (KeyCode::Char('k'), KeyModifiers::NONE) | (KeyCode::Up, _) => {
+            Some(crate::layout::NavDir::Up)
+        }
+        (KeyCode::Char('l'), KeyModifiers::NONE) | (KeyCode::Right, _) => {
+            Some(crate::layout::NavDir::Right)
+        }
+        _ => None,
+    }
+}
+
+fn handle_prefix_key(
+    server: &dyn DomainHandle,
+    key: KeyEvent,
+) -> Option<String> {
     let cmd = match (key.code, key.modifiers) {
         (KeyCode::Char('%'), _) => "split-window -h",
         (KeyCode::Char('"'), _) => "split-window -v",
@@ -5438,11 +6238,33 @@ fn run_client_tab_command(
         "list-tabs" | "lst" => {
             ClientTabCommandResult::Handled(Some(tab_summary(tabs)))
         }
+        "ssh-attach" | "ssh" => {
+            let host = cmd
+                .args
+                .first()
+                .map(String::as_str)
+                .or_else(|| cmd.flag_value("t"));
+            let Some(host) = host else {
+                return ClientTabCommandResult::Handled(Some(
+                    "usage: ssh-attach <host>".to_string(),
+                ));
+            };
+            match tabs.attach_ssh(host, size) {
+                Ok(message) => ClientTabCommandResult::Handled(Some(message)),
+                Err(e) => ClientTabCommandResult::Handled(Some(format!(
+                    "ssh-attach failed: {e}"
+                ))),
+            }
+        }
+        "paste-cloud" => match tabs.focused_client().paste_cloud() {
+            Ok(message) => ClientTabCommandResult::Handled(Some(message)),
+            Err(e) => ClientTabCommandResult::Handled(Some(e)),
+        },
         _ => ClientTabCommandResult::NotHandled,
     }
 }
 
-fn run_command_notice(server: &SocketClient, cmd: &str) -> Option<String> {
+fn run_command_notice(server: &dyn DomainHandle, cmd: &str) -> Option<String> {
     if cmd.trim() == "set-pane-start-dir" {
         let output = server.run_command_with_output(cmd);
         let path = output.trim();
@@ -5609,7 +6431,7 @@ fn is_copy_line_end_key(key: KeyEvent) -> bool {
 }
 
 fn handle_paste_event(
-    server: &SocketClient,
+    server: &dyn DomainHandle,
     mode: &mut InputMode,
     text: String,
 ) {
@@ -5618,10 +6440,10 @@ fn handle_paste_event(
     }
     match mode.clone() {
         InputMode::Normal => {
-            server.send_input(text.as_bytes());
+            server.send_paste(&text);
         }
         InputMode::Prefix | InputMode::Resize => {
-            server.send_input(text.as_bytes());
+            server.send_paste(&text);
             *mode = InputMode::Normal;
         }
         InputMode::CopySearch {
@@ -6566,6 +7388,7 @@ mod tests {
             ansi: None,
             exit: false,
             yank_text: None,
+            client_requests: Vec::new(),
         };
         let (cols, rows) = (101u16, 22u16);
         let layout_area = server_layout_area(cols, rows);
@@ -6893,6 +7716,7 @@ mod tests {
             ansi: None,
             exit: false,
             yank_text: None,
+            client_requests: Vec::new(),
         }
     }
 
@@ -7022,6 +7846,7 @@ mod tests {
                 start_dir: None,
                 env: vec![],
                 scroll_on_erase_in_display: false,
+                zmux_socket: None,
             })
         }
 
