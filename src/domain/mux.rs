@@ -723,6 +723,16 @@ mod tests {
         assert!(!frame.exit);
         client.send_input(b"true\n");
         client.detach();
+        for _ in 0..100 {
+            if !crate::domain::lease::lease_held(&socket) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !crate::domain::lease::lease_held(&socket),
+            "cloud lease should be released after detach"
+        );
         Ok(())
     }
 

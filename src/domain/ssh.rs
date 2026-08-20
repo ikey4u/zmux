@@ -86,6 +86,16 @@ pub fn connect_ssh(alias: &str, size: Size) -> io::Result<CloudClient> {
             legacy_hint(&probe, &host.ssh, &host.socket),
         ));
     }
+    if probe.lease_held {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "remote cloud attach is already active on {} socket {}\n\
+close the other SSH/cloud client before attaching again",
+                host.ssh, host.socket
+            ),
+        ));
+    }
     let local = Hello::offer("client", None, &[]);
     let remote = Hello {
         binary_version: probe
@@ -121,16 +131,15 @@ pub fn connect_ssh(alias: &str, size: Size) -> io::Result<CloudClient> {
         ));
     }
 
-    let remote_cmd = join_quoted(&[
+    let remote_cmd = remote_zmux_command(&[
         &host.remote_zmux,
+        "--socket",
+        &host.socket,
         "mux",
         "--stdio",
         "--start-if-missing",
-        "--socket",
-        &host.socket,
     ])?;
     let mut child = ssh_command(&host.ssh)
-        .arg("--")
         .arg(&remote_cmd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -171,15 +180,14 @@ pub fn connect_ssh(alias: &str, size: Size) -> io::Result<CloudClient> {
 pub fn ssh_probe(
     host: &crate::domain::config::SshHost,
 ) -> io::Result<crate::domain::hello::ProbeReport> {
-    let remote_cmd = join_quoted(&[
+    let remote_cmd = remote_zmux_command(&[
         &host.remote_zmux,
-        "cloud-probe",
-        "--json",
         "--socket",
         &host.socket,
+        "cloud-probe",
+        "--json",
     ])?;
     let output = ssh_command(&host.ssh)
-        .arg("--")
         .arg(&remote_cmd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -239,6 +247,13 @@ fn extract_json(stdout: &str) -> Option<&str> {
     }
 }
 
+fn remote_zmux_command(args: &[&str]) -> io::Result<String> {
+    let command = join_quoted(args)?;
+    Ok(format!(
+        "export PATH=\"$HOME/.cargo/bin:$HOME/.local/bin:$PATH\"; exec {command}"
+    ))
+}
+
 fn ssh_command(target: &str) -> Command {
     let mut cmd = Command::new("ssh");
     cmd.arg("-T")
@@ -248,8 +263,51 @@ fn ssh_command(target: &str) -> Command {
         .arg("StrictHostKeyChecking=yes")
         .arg("-o")
         .arg("ConnectTimeout=10")
+        .arg("--")
         .arg(target);
     cmd
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssh_options_end_before_target_and_remote_command() {
+        let mut cmd = ssh_command("example.test");
+        cmd.arg("zmux --socket default cloud-probe --json");
+        let args = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        let marker = args.iter().position(|arg| arg == "--").unwrap();
+        let target = args.iter().position(|arg| arg == "example.test").unwrap();
+        let remote = args
+            .iter()
+            .position(|arg| arg == "zmux --socket default cloud-probe --json")
+            .unwrap();
+        assert!(marker < target);
+        assert!(target < remote);
+    }
+
+    #[test]
+    fn remote_command_exposes_user_bins_and_orders_global_options() {
+        let command = remote_zmux_command(&[
+            "zmux",
+            "--socket",
+            "default",
+            "cloud-probe",
+            "--json",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            command,
+            "export PATH=\"$HOME/.cargo/bin:$HOME/.local/bin:$PATH\"; \
+             exec zmux --socket default cloud-probe --json"
+        );
+    }
 }
 
 fn log_ssh(msg: &str) {
