@@ -201,8 +201,12 @@ impl TabManager {
         )?;
         let stored = if existing_server {
             load_tab_metadata().remove(base_socket)
-        } else {
+        } else if clean {
             remove_tab_metadata_for_socket_family(base_socket);
+            None
+        } else {
+            // Keep titles for sibling tab servers that may still be running.
+            let _ = remove_tab_metadata(base_socket);
             None
         };
         let code = stored
@@ -210,8 +214,8 @@ impl TabManager {
             .and_then(|meta| meta.code.as_deref())
             .and_then(|code| normalize_tab_code(code).ok())
             .unwrap_or_else(|| tab_code(0));
-        let title = stored.and_then(|meta| meta.title).unwrap_or_default();
-        Ok(Self {
+        let title = title_from_stored(stored.as_ref());
+        let manager = Self {
             tabs: vec![ClientTab {
                 code,
                 title,
@@ -228,7 +232,9 @@ impl TabManager {
             start_dir,
             next_id: 1,
             killed_sockets: std::collections::HashSet::new(),
-        })
+        };
+        manager.persist_active_metadata();
+        Ok(manager)
     }
 
     fn from_existing_sockets(
@@ -264,11 +270,7 @@ impl TabManager {
                         .unwrap_or_else(|| {
                             next_available_tab_code(&tabs, tabs.len())
                         });
-                    let title = stored
-                        .and_then(|meta| meta.title.clone())
-                        .unwrap_or_else(|| {
-                            attach_tab_title(base_socket, &socket_name)
-                        });
+                    let title = title_from_stored(stored);
                     tabs.push(ClientTab {
                         code,
                         title,
@@ -295,7 +297,7 @@ impl TabManager {
                 "no attachable zmux servers found",
             ));
         }
-        Ok(Self {
+        let manager = Self {
             active: 0,
             tab_bar_offset: 0,
             base_socket: base_socket.to_string(),
@@ -303,7 +305,9 @@ impl TabManager {
             next_id: tabs.len().max(1),
             tabs,
             killed_sockets: std::collections::HashSet::new(),
-        })
+        };
+        manager.persist_all_metadata();
+        Ok(manager)
     }
 
     fn from_ssh(
@@ -356,6 +360,7 @@ impl TabManager {
             pending_reconnect: HashMap::new(),
         });
         self.active = self.tabs.len() - 1;
+        self.persist_active_metadata();
         Ok(format!("ssh {host}"))
     }
 
@@ -634,87 +639,26 @@ impl TabManager {
     }
 
     fn visual_move(&mut self, dir: crate::layout::NavDir, hide_borders: bool) {
-        let (cols, rows) = terminal::size().unwrap_or((80, 24));
-        let area = server_layout_area(cols, rows);
-        let tab = &mut self.tabs[self.active];
-        let Some(fd) = tab.client.latest_frame() else {
+        let hits = self.composed_hits(hide_borders);
+        let Some(current) = self.current_visual_target(&hits) else {
             return;
         };
-        let mut grafts = HashMap::new();
-        for (id, graft) in &tab.grafts {
-            if let Some(frame) = graft.client.latest_frame() {
-                if !frame.exit {
-                    grafts.insert(*id, frame);
-                }
-            }
+        if let Some(next) = visual::neighbor_in_dir(&hits, &current, dir) {
+            self.apply_visual_target(next);
+            return;
         }
-        let composed = visual::compose_layout(&fd.layout, &grafts);
-        let hits =
-            visual::collect_visual_hits(&composed, area, hide_borders, None);
-        let current = match &tab.visual_focus {
-            VisualFocus::Remote { slot_id, pane_id } => {
-                visual::VisualTarget::Remote {
-                    slot_id: *slot_id,
-                    pane_id: *pane_id,
-                }
-            }
-            VisualFocus::Local { pane_id } => visual::VisualTarget::Local {
-                pane_id: pane_id
-                    .or_else(|| {
-                        visual::collect_visual_hits(
-                            &composed,
-                            area,
-                            hide_borders,
-                            None,
-                        )
-                        .iter()
-                        .find_map(|h| {
-                            if let visual::VisualTarget::Local { pane_id } =
-                                h.target
-                            {
-                                Some(pane_id)
-                            } else {
-                                None
-                            }
-                        })
-                    })
-                    .unwrap_or(0),
-            },
-        };
-        let Some(next) = visual::neighbor_in_dir(&hits, &current, dir) else {
-            return;
-        };
-        match next {
-            visual::VisualTarget::Local { pane_id } => {
-                tab.client
-                    .run_command(&format!("select-pane -t %{pane_id}"));
-                tab.visual_focus = VisualFocus::Local {
-                    pane_id: Some(pane_id),
-                };
-            }
-            visual::VisualTarget::Remote { slot_id, pane_id } => {
-                if let Some(slot_pane) =
-                    visual::external_local_id(&composed, slot_id)
-                {
-                    tab.client
-                        .run_command(&format!("select-pane -t %{slot_pane}"));
-                }
-                if let Some(graft) = tab.grafts.get(&slot_id) {
-                    graft
-                        .client
-                        .run_command(&format!("select-pane -t %{pane_id}"));
-                }
-                tab.visual_focus = VisualFocus::Remote { slot_id, pane_id };
-            }
-            visual::VisualTarget::Placeholder { slot_id } => {
-                if let Some(slot_pane) =
-                    visual::external_local_id(&composed, slot_id)
-                {
-                    tab.client
-                        .run_command(&format!("select-pane -t %{slot_pane}"));
-                }
-                tab.visual_focus = VisualFocus::Local { pane_id: None };
-            }
+        if matches!(
+            self.tabs[self.active].visual_focus,
+            VisualFocus::Local { .. }
+        ) {
+            let cmd = match dir {
+                crate::layout::NavDir::Left => "select-pane -L",
+                crate::layout::NavDir::Right => "select-pane -R",
+                crate::layout::NavDir::Up => "select-pane -U",
+                crate::layout::NavDir::Down => "select-pane -D",
+            };
+            self.active_client().run_command(cmd);
+            self.invalidate_visual_pane();
         }
     }
 
@@ -796,21 +740,22 @@ impl TabManager {
         &self,
         hits: &[visual::VisualHit],
     ) -> Option<visual::VisualTarget> {
-        match self.tabs[self.active].visual_focus {
+        let stored = match self.tabs[self.active].visual_focus {
             VisualFocus::Remote { slot_id, pane_id } => {
                 Some(visual::VisualTarget::Remote { slot_id, pane_id })
             }
             VisualFocus::Local {
                 pane_id: Some(pane_id),
             } => Some(visual::VisualTarget::Local { pane_id }),
-            VisualFocus::Local { pane_id: None } => {
-                hits.iter().find_map(|h| match h.target {
-                    visual::VisualTarget::Local { pane_id } => {
-                        Some(visual::VisualTarget::Local { pane_id })
-                    }
-                    _ => None,
-                })
-            }
+            VisualFocus::Local { pane_id: None } => None,
+        };
+        visual::current_from_hits(stored.as_ref(), hits)
+    }
+
+    fn invalidate_visual_pane(&mut self) {
+        match &mut self.tabs[self.active].visual_focus {
+            VisualFocus::Local { pane_id } => *pane_id = None,
+            VisualFocus::Remote { pane_id, .. } => *pane_id = usize::MAX,
         }
     }
 
@@ -1037,7 +982,16 @@ impl TabManager {
     }
 
     fn persist_active_metadata(&self) {
-        let tab = &self.tabs[self.active];
+        self.persist_tab_metadata(&self.tabs[self.active]);
+    }
+
+    fn persist_all_metadata(&self) {
+        for tab in &self.tabs {
+            self.persist_tab_metadata(tab);
+        }
+    }
+
+    fn persist_tab_metadata(&self, tab: &ClientTab) {
         if let Err(e) =
             store_tab_metadata(&tab.socket_name, &tab.code, &tab.title)
         {
@@ -1045,6 +999,20 @@ impl TabManager {
                 "failed to store tab metadata for '{}': {}",
                 tab.socket_name, e
             ));
+        }
+    }
+
+    fn capture_session_title_if_empty(&mut self, index: usize) {
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        if !tab.title.trim().is_empty() {
+            return;
+        }
+        if let Some(title) =
+            meaningful_session_title(&tab.client.session_name())
+        {
+            tab.title = title;
         }
     }
 
@@ -1092,6 +1060,7 @@ impl TabManager {
             pending_reconnect: HashMap::new(),
         });
         self.active = self.tabs.len() - 1;
+        self.persist_active_metadata();
         Ok(())
     }
 
@@ -1142,12 +1111,14 @@ impl TabManager {
     }
 
     fn close_active(&mut self) -> bool {
+        self.capture_session_title_if_empty(self.active);
         self.set_active_visibility(false);
         self.tabs[self.active].client.detach();
         self.remove_active()
     }
 
     fn close_dead_active(&mut self) -> bool {
+        self.capture_session_title_if_empty(self.active);
         self.set_active_visibility(false);
         self.remove_active()
     }
@@ -1208,13 +1179,15 @@ impl TabManager {
             .unwrap_or_else(|| {
                 next_available_tab_code(&self.tabs, self.tabs.len())
             });
-        let title =
-            stored
-                .and_then(|meta| meta.title.clone())
-                .unwrap_or_else(|| {
-                    attach_tab_title(&self.base_socket, socket_name)
-                });
+        let mut title = title_from_stored(stored);
         let client = SocketClient::connect(socket_name, size)?;
+        if title.is_empty() {
+            if let Some(session) =
+                meaningful_session_title(&client.session_name())
+            {
+                title = session;
+            }
+        }
         set_tab_visibility(socket_name, &code, &title, true)?;
         self.tabs.push(ClientTab {
             code,
@@ -1241,6 +1214,7 @@ impl TabManager {
         else {
             return Ok(());
         };
+        self.capture_session_title_if_empty(index);
         if let Err(e) = set_tab_visibility(
             socket_name,
             &self.tabs[index].code,
@@ -1327,6 +1301,7 @@ impl TabManager {
     }
 
     fn detach_all(&self) {
+        self.persist_all_metadata();
         for tab in &self.tabs {
             tab.client.detach();
         }
@@ -1366,10 +1341,7 @@ impl TabManager {
                 stored.and_then(|meta| meta.code.clone()).unwrap_or_else(
                     || next_available_view_code(&views, views.len()),
                 );
-            let title =
-                stored.and_then(|meta| meta.title.clone()).unwrap_or_else(
-                    || attach_tab_title(&self.base_socket, &socket_name),
-                );
+            let title = title_from_stored(stored);
             views.push(ClientTabView {
                 code,
                 title,
@@ -1411,6 +1383,7 @@ fn tab_code(index: usize) -> String {
     format!("{}{}", first, second)
 }
 
+#[cfg(test)]
 fn attach_tab_title(base_socket: &str, socket_name: &str) -> String {
     let tab_prefix = format!("{}.tab.", base_socket);
     if socket_name == base_socket {
@@ -1422,6 +1395,21 @@ fn attach_tab_title(base_socket: &str, socket_name: &str) -> String {
         }
     }
     socket_name.to_string()
+}
+
+fn title_from_stored(stored: Option<&StoredTabMetadata>) -> String {
+    stored
+        .and_then(|meta| meta.title.clone())
+        .unwrap_or_default()
+}
+
+fn meaningful_session_title(name: &str) -> Option<String> {
+    let name = name.trim();
+    if name.is_empty() || name == "0" {
+        None
+    } else {
+        Some(name.to_string())
+    }
 }
 
 type TabMetadataMap = std::collections::BTreeMap<String, StoredTabMetadata>;
@@ -1475,14 +1463,16 @@ fn read_tab_metadata_file(path: &std::path::Path) -> Option<TabMetadataMap> {
 
 fn load_tab_metadata() -> TabMetadataMap {
     if let Ok(path) = tab_metadata_path() {
+        let file_exists = path.exists();
         let metadata = {
             let _lock = TabMetadataLock::acquire(&path).ok();
             read_tab_metadata_file(&path)
         };
         if let Some(metadata) = metadata {
-            if !metadata.is_empty() {
-                return metadata;
-            }
+            return metadata;
+        }
+        if file_exists {
+            return TabMetadataMap::new();
         }
     }
     if let Ok(path) = legacy_tab_metadata_path() {
@@ -1543,7 +1533,13 @@ fn set_tab_visibility(
         std::fs::create_dir_all(parent)?;
     }
     let _lock = TabMetadataLock::acquire(&path)?;
-    let mut metadata = read_tab_metadata_file(&path).unwrap_or_default();
+    let mut metadata = read_tab_metadata_file(&path)
+        .or_else(|| {
+            legacy_tab_metadata_path()
+                .ok()
+                .and_then(|path| read_tab_metadata_file(&path))
+        })
+        .unwrap_or_default();
     metadata.insert(
         socket_name.to_string(),
         StoredTabMetadata {
@@ -2864,19 +2860,48 @@ impl ClientApp {
                                                 )
                                             ) {
                                                 tabs.kill_visual_pane();
-                                            } else if let Some(message) =
-                                                handle_prefix_key(
-                                                    tabs.focused_client(),
-                                                    key,
-                                                )
-                                            {
-                                                status_notice = Some((
-                                                    message,
-                                                    Instant::now()
-                                                        + Duration::from_secs(
-                                                            3,
-                                                        ),
-                                                ));
+                                                tabs.invalidate_visual_pane();
+                                            } else {
+                                                let invalidate_focus =
+                                                    matches!(
+                                                    (key.code, key.modifiers),
+                                                    (
+                                                        KeyCode::Char('%'),
+                                                        _
+                                                    ) | (
+                                                        KeyCode::Char('"'),
+                                                        _
+                                                    ) | (
+                                                        KeyCode::Char('c'),
+                                                        KeyModifiers::NONE
+                                                    ) | (
+                                                        KeyCode::Char('n'),
+                                                        KeyModifiers::NONE
+                                                    ) | (
+                                                        KeyCode::Char('p'),
+                                                        KeyModifiers::NONE
+                                                    ) | (
+                                                        KeyCode::Char('z'),
+                                                        _
+                                                    )
+                                                );
+                                                if let Some(message) =
+                                                    handle_prefix_key(
+                                                        tabs.focused_client(),
+                                                        key,
+                                                    )
+                                                {
+                                                    status_notice = Some((
+                                                        message,
+                                                        Instant::now()
+                                                            + Duration::from_secs(
+                                                                3,
+                                                            ),
+                                                    ));
+                                                }
+                                                if invalidate_focus {
+                                                    tabs.invalidate_visual_pane();
+                                                }
                                             }
                                         }
                                     }
@@ -5081,6 +5106,7 @@ impl ClientApp {
             Ok(())
         })();
 
+        tabs.persist_all_metadata();
         let _ = terminal::disable_raw_mode();
         if keyboard_enhancement_enabled {
             let _ =
@@ -7272,6 +7298,43 @@ mod tests {
             Some("/Users/me/project".to_string())
         );
         assert_eq!(start_dir_from_command_output(" \n\t"), None);
+    }
+
+    #[test]
+    fn attach_tab_title_uses_socket_id_suffix() {
+        assert_eq!(
+            attach_tab_title("default", "default.tab.12345.2"),
+            "default:2"
+        );
+        assert_eq!(attach_tab_title("default", "default"), "default");
+    }
+
+    #[test]
+    fn title_from_stored_keeps_custom_and_empty_titles() {
+        let named = StoredTabMetadata {
+            code: Some("AB".into()),
+            title: Some("work".into()),
+            visible: Some(false),
+        };
+        assert_eq!(title_from_stored(Some(&named)), "work");
+
+        let empty = StoredTabMetadata {
+            code: Some("AC".into()),
+            title: Some(String::new()),
+            visible: Some(false),
+        };
+        assert_eq!(title_from_stored(Some(&empty)), "");
+        assert_eq!(title_from_stored(None), "");
+    }
+
+    #[test]
+    fn meaningful_session_title_skips_default_session() {
+        assert_eq!(meaningful_session_title("0"), None);
+        assert_eq!(meaningful_session_title("  "), None);
+        assert_eq!(
+            meaningful_session_title(" work "),
+            Some("work".to_string())
+        );
     }
 
     #[test]
