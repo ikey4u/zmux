@@ -57,6 +57,7 @@ enum Outgoing {
         tx: mpsc::Sender<RespPayload>,
     },
     Credit(u32),
+    Shutdown,
 }
 
 pub struct CloudClient {
@@ -175,6 +176,7 @@ impl CloudClient {
                         Ok(Outgoing::Credit(credit)) => {
                             writer.add_credit(credit);
                         }
+                        Ok(Outgoing::Shutdown) => break,
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
@@ -460,6 +462,7 @@ impl CloudClient {
 
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
+        let _ = self.out_tx.send(Outgoing::Shutdown);
     }
 
     pub fn detach(&self) {
