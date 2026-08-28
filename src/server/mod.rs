@@ -15,8 +15,18 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 /// incremental frame so the polling client cannot deduplicate them away.
 static OVERLAY_RESTORE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
-const FRAME_HISTORY_ENTRIES: usize = 512;
-const FRAME_HISTORY_BYTES: usize = 16 * 1024 * 1024;
+// Frame ANSI entries are complete dirty-pane paints, not compact terminal
+// mutations. The client writes the merged delta inside one synchronized-update
+// transaction, and VTE-based terminals cap that transaction at 2 MiB. Keep a
+// generous safety margin so a recovering terminal never falls through into a
+// visible replay of stale full-pane paints.
+const FRAME_HISTORY_ENTRIES: usize = 64;
+const FRAME_HISTORY_BYTES: usize = 512 * 1024;
+const RENDER_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
+fn render_pacing_delay(elapsed_since_publish: Duration) -> Duration {
+    RENDER_FRAME_INTERVAL.saturating_sub(elapsed_since_publish)
+}
 
 #[derive(Default)]
 struct FrameStore {
@@ -33,8 +43,17 @@ impl FrameStore {
         if let Some(encoded) = frame.ansi.as_deref() {
             if let Ok(bytes) = STANDARD.decode(encoded) {
                 if !bytes.is_empty() {
-                    self.ansi_history_bytes += bytes.len();
-                    self.ansi_history.push_back((self.sequence, bytes));
+                    if bytes.len() > FRAME_HISTORY_BYTES {
+                        // This publication cannot be replayed within the
+                        // budget. Drop the older prefix immediately and make
+                        // every connection before this sequence resnapshot.
+                        self.ansi_history.clear();
+                        self.ansi_history_bytes = 0;
+                        self.history_floor = self.sequence;
+                    } else {
+                        self.ansi_history_bytes += bytes.len();
+                        self.ansi_history.push_back((self.sequence, bytes));
+                    }
                 }
             }
         }
@@ -53,22 +72,24 @@ impl FrameStore {
 
     fn frame_since(&self, sequence: u64) -> (Option<FrameData>, u64, bool) {
         let mut frame = self.latest.clone();
-        let missed_history = sequence < self.history_floor;
+        let needs_snapshot = sequence < self.history_floor;
         if let Some(frame) = frame.as_mut() {
             let mut ansi = Vec::new();
-            for (_, bytes) in self
-                .ansi_history
-                .iter()
-                .filter(|(published, _)| *published > sequence)
-            {
-                ansi.extend_from_slice(bytes);
+            if !needs_snapshot {
+                for (_, bytes) in self
+                    .ansi_history
+                    .iter()
+                    .filter(|(published, _)| *published > sequence)
+                {
+                    ansi.extend_from_slice(bytes);
+                }
             }
             // Never replay `latest.ansi` when there are no new publications.
             // Each frame connection receives only deltas newer than its own
             // acknowledged sequence.
             frame.ansi = Some(STANDARD.encode(ansi));
         }
-        (frame, self.sequence, missed_history)
+        (frame, self.sequence, needs_snapshot)
     }
 }
 
@@ -81,7 +102,7 @@ use crate::{
     },
     output::{
         encode_ansi_base64, frame_ansi_area, layout_fingerprint,
-        serialize_frame_ansi, FrameAnsiOptions,
+        serialize_frame_ansi, serialize_frame_ansi_snapshot, FrameAnsiOptions,
     },
     pty::{resize_pane, spawn_pane, SpawnOptions},
     types::{
@@ -886,32 +907,25 @@ where
             mark_data_ready();
         } else if line == "FRAME?" {
             let yank_ref = pending_yank.take();
-            // Keep every ANSI delta published since this frame connection's last
-            // poll. A single shared "latest frame" loses nvim updates whenever a
-            // cursor-only frame or a busy sibling pane (for example `ping`)
-            // publishes before the client polls again.
-            let (mut frame, mut published_sequence, missed_history) =
+            // Merge every unread ANSI delta that still fits the bounded replay
+            // window. A connection older than that window gets one authoritative
+            // snapshot instead of visibly replaying stale pane paints.
+            let (mut frame, mut published_sequence, needs_snapshot) =
                 latest_frame
                     .lock()
                     .map(|store| store.frame_since(last_frame_sequence))
                     .unwrap_or((None, last_frame_sequence, false));
-            if missed_history {
+            if needs_snapshot {
                 let size = size_arc
                     .lock()
                     .map(|size| *size)
                     .unwrap_or(Size::new(24, 80));
-                if let Ok(state) = state.lock() {
-                    let baseline = latest_frame
-                        .lock()
-                        .map(|store| store.sequence)
-                        .unwrap_or(last_frame_sequence);
-                    refresh_latest_frame(&latest_frame, &state, size);
-                    last_frame_sequence = baseline;
-                }
-                (frame, published_sequence, _) = latest_frame
-                    .lock()
-                    .map(|store| store.frame_since(last_frame_sequence))
-                    .unwrap_or((None, last_frame_sequence, false));
+                // This connection fell behind the bounded replay window. Build
+                // an authoritative frame only for it: publishing the recovery
+                // frame would make every healthy connection repaint as well.
+                frame = state.lock().ok().and_then(|state| {
+                    build_private_snapshot_frame(&state, size)
+                });
             }
             if frame.is_none() {
                 let is_empty = state
@@ -936,10 +950,20 @@ where
                 if let Ok(state) = state.lock() {
                     refresh_latest_frame(&latest_frame, &state, size);
                 }
-                (frame, published_sequence, _) = latest_frame
-                    .lock()
-                    .map(|store| store.frame_since(last_frame_sequence))
-                    .unwrap_or((None, last_frame_sequence, false));
+                let needs_snapshot_after_refresh;
+                (frame, published_sequence, needs_snapshot_after_refresh) =
+                    latest_frame
+                        .lock()
+                        .map(|store| store.frame_since(last_frame_sequence))
+                        .unwrap_or((None, last_frame_sequence, false));
+                // A single initial full paint can itself exceed the replay
+                // budget on a very large terminal. Do not acknowledge an empty
+                // ANSI marker in that case; use the same private resync path.
+                if needs_snapshot_after_refresh {
+                    frame = state.lock().ok().and_then(|state| {
+                        build_private_snapshot_frame(&state, size)
+                    });
+                }
             }
             let Some(mut frame) = frame else {
                 log_server("no frame available after startup refresh");
@@ -1216,6 +1240,29 @@ fn refresh_latest_frame(
     }
 }
 
+fn build_private_snapshot_frame(
+    state: &Server,
+    size: Size,
+) -> Option<FrameData> {
+    let session = state.active_session()?;
+    let win = session.windows.get(session.active_window_idx)?;
+    let json = build_frame_json_with_mode(
+        session,
+        win,
+        frame_layout_area(size),
+        None,
+        state.hide_borders,
+        size,
+        FrameAnsiOptions {
+            clear_display: true,
+            force_repaint: true,
+        },
+        &client_requests_json(state),
+        false,
+    );
+    serde_json::from_str(&json).ok()
+}
+
 fn build_frame_json(
     session: &crate::types::session::Session,
     win: &crate::types::session::Window,
@@ -1226,18 +1273,52 @@ fn build_frame_json(
     ansi_opts: FrameAnsiOptions,
     requests_json: &str,
 ) -> String {
+    build_frame_json_with_mode(
+        session,
+        win,
+        area,
+        yank_text,
+        hide_borders,
+        size,
+        ansi_opts,
+        requests_json,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_frame_json_with_mode(
+    session: &crate::types::session::Session,
+    win: &crate::types::session::Window,
+    area: Rect,
+    yank_text: Option<&str>,
+    hide_borders: bool,
+    size: Size,
+    ansi_opts: FrameAnsiOptions,
+    requests_json: &str,
+    consume_render_state: bool,
+) -> String {
     use crate::layout::serialize_frame;
     let layout_json = serialize_frame(win, area, hide_borders);
     let layout_part = layout_json
         .strip_prefix("{\"type\":\"frame\",\"layout\":")
         .and_then(|s| s.strip_suffix('}'))
         .unwrap_or("{}");
-    let ansi = serialize_frame_ansi(
-        win,
-        frame_ansi_area(size),
-        hide_borders,
-        ansi_opts,
-    );
+    let ansi = if consume_render_state {
+        serialize_frame_ansi(
+            win,
+            frame_ansi_area(size),
+            hide_borders,
+            ansi_opts,
+        )
+    } else {
+        serialize_frame_ansi_snapshot(
+            win,
+            frame_ansi_area(size),
+            hide_borders,
+            ansi_opts,
+        )
+    };
     let ansi_b64 = encode_ansi_base64(&ansi);
     let session_name = &session.name;
     let active_idx = session.active_window_idx;
@@ -1763,8 +1844,17 @@ fn render_loop(
     let mut first = true;
     let mut last_layout_fp = 0u64;
     let mut last_reap = Instant::now() - Duration::from_millis(250);
+    let mut last_published_at = Instant::now() - RENDER_FRAME_INTERVAL;
     loop {
-        crate::types::events::wait_render(Duration::from_millis(16));
+        crate::types::events::wait_render(RENDER_FRAME_INTERVAL);
+
+        // PTY notifications wake `wait_render` immediately, so the timeout by
+        // itself is not a frame-rate limit. Pace before consuming dirty state:
+        // output arriving during this short wait is folded into the same paint.
+        let pacing_delay = render_pacing_delay(last_published_at.elapsed());
+        if !pacing_delay.is_zero() {
+            thread::sleep(pacing_delay);
+        }
 
         let sync_flushed = state
             .lock()
@@ -1879,6 +1969,7 @@ fn render_loop(
         if let Ok(fd) = serde_json::from_str::<FrameData>(&frame_json) {
             if let Ok(mut frame) = latest_frame.lock() {
                 frame.publish(fd);
+                last_published_at = Instant::now();
             }
         }
     }
@@ -3322,6 +3413,7 @@ mod tests {
             let pane =
                 crate::layout::active_pane(&win.root, &win.active_pane_path)
                     .unwrap();
+            pane.history_writer.flush();
             assert!(pane.history.lock().unwrap().is_empty());
         }
         kill_all_panes(&mut state);
@@ -3681,6 +3773,60 @@ mod tests {
     }
 
     #[test]
+    fn render_pacing_enforces_minimum_frame_interval() {
+        assert_eq!(
+            render_pacing_delay(Duration::from_millis(0)),
+            Duration::from_millis(16)
+        );
+        assert_eq!(
+            render_pacing_delay(Duration::from_millis(8)),
+            Duration::from_millis(8)
+        );
+        assert_eq!(
+            render_pacing_delay(Duration::from_millis(16)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            render_pacing_delay(Duration::from_millis(32)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn frame_store_large_backlog_requires_snapshot_and_stays_bounded() {
+        let mut store = FrameStore::default();
+        let payload = vec![b'x'; 128 * 1024];
+        let publications = 20;
+        assert!(payload.len() * publications > 2 * 1024 * 1024);
+
+        for _ in 0..publications {
+            let mut frame = test_frame();
+            frame.ansi = Some(STANDARD.encode(&payload));
+            store.publish(frame);
+        }
+
+        let retained_bytes = store
+            .ansi_history
+            .iter()
+            .map(|(_, ansi)| ansi.len())
+            .sum::<usize>();
+        assert_eq!(retained_bytes, store.ansi_history_bytes);
+        assert!(retained_bytes <= FRAME_HISTORY_BYTES);
+        assert!(store.ansi_history.len() <= FRAME_HISTORY_ENTRIES);
+
+        let (frame, sequence, needs_snapshot) = store.frame_since(0);
+        assert_eq!(sequence, publications as u64);
+        assert!(needs_snapshot);
+        let ansi = STANDARD
+            .decode(frame.unwrap().ansi.unwrap())
+            .expect("snapshot fallback ANSI marker must remain valid base64");
+        assert!(
+            ansi.is_empty(),
+            "expired deltas must not be replayed before the full snapshot"
+        );
+    }
+
+    #[test]
     fn frame_store_does_not_replay_last_delta_after_ack() {
         let mut store = FrameStore::default();
         let mut frame = test_frame();
@@ -3693,6 +3839,39 @@ mod tests {
             .decode(frame.unwrap().ansi.unwrap())
             .expect("empty ANSI must remain valid base64");
         assert!(ansi.is_empty());
+    }
+
+    #[test]
+    fn private_snapshot_does_not_publish_or_consume_render_state(
+    ) -> io::Result<()> {
+        let size = Size::new(24, 80);
+        let mut state = Server::new();
+        make_session(&mut state, "0", size)?;
+        let latest_frame = Arc::new(Mutex::new(FrameStore::default()));
+        refresh_latest_frame(&latest_frame, &state, size);
+        let sequence_before = latest_frame.lock().unwrap().sequence;
+
+        let win = &state.sessions[0].windows[0];
+        let pane = crate::layout::active_pane(&win.root, &win.active_pane_path)
+            .expect("test session has an active pane");
+        pane.render_dirty.store(true, Ordering::Relaxed);
+        let osc52 = b"\x1b]52;c;Zm9v\x07".to_vec();
+        pane.pending_osc52.lock().unwrap().push_back(osc52.clone());
+
+        let snapshot = build_private_snapshot_frame(&state, size)
+            .expect("private snapshot should serialize");
+        let ansi = STANDARD
+            .decode(snapshot.ansi.expect("snapshot has ANSI"))
+            .expect("snapshot ANSI must remain valid base64");
+
+        assert_eq!(latest_frame.lock().unwrap().sequence, sequence_before);
+        assert!(pane.render_dirty.load(Ordering::Relaxed));
+        assert_eq!(pane.pending_osc52.lock().unwrap().front(), Some(&osc52));
+        assert!(
+            !ansi.windows(osc52.len()).any(|window| window == osc52),
+            "connection-private snapshot must not relay one-shot OSC 52"
+        );
+        Ok(())
     }
 
     #[test]
