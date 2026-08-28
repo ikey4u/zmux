@@ -158,7 +158,7 @@ pub struct PaneHistory {
 enum HistoryWriterCommand {
     Append(Vec<SnapshotLine>),
     Barrier(mpsc::Sender<()>),
-    Reset(mpsc::Sender<()>),
+    Reset,
     Discard(mpsc::Sender<()>),
 }
 
@@ -166,9 +166,10 @@ enum HistoryWriterCommand {
 ///
 /// PTY readers only enqueue parsed logical lines; SQLite transactions run on
 /// this worker. A barrier lets copy mode observe an atomic hot/cold boundary.
-/// The bounded queue applies per-pane PTY backpressure instead of consuming
-/// unbounded memory. If disk storage fails, the cold tier is discarded and
-/// disabled rather than retrying the same growing buffer forever.
+/// The bounded queue caps per-pane memory without applying disk backpressure
+/// to the PTY reader. If the queue fills or disk storage fails, the cold tier
+/// is discarded and disabled rather than delaying interactive terminal I/O or
+/// retrying the same growing buffer forever.
 #[derive(Clone)]
 pub struct PaneHistoryWriter {
     sender: SyncSender<HistoryWriterCommand>,
@@ -187,9 +188,36 @@ impl PaneHistoryWriter {
 
         thread::spawn(move || {
             let mut discarded = false;
-            while let Ok(command) = receiver.recv() {
+            let mut pending_command = None;
+            loop {
+                let command = match pending_command.take() {
+                    Some(command) => command,
+                    None => match receiver.recv() {
+                        Ok(command) => command,
+                        Err(_) => break,
+                    },
+                };
                 match command {
-                    HistoryWriterCommand::Append(lines) => {
+                    HistoryWriterCommand::Append(mut lines) => {
+                        // A busy terminal usually produces many small parser
+                        // captures. Combine adjacent captures into one SQLite
+                        // transaction, but never move a barrier or reset across
+                        // an append boundary.
+                        while lines.len() < HISTORY_WRITE_BATCH_LINES {
+                            match receiver.try_recv() {
+                                Ok(HistoryWriterCommand::Append(mut next)) => {
+                                    lines.append(&mut next);
+                                }
+                                Ok(command) => {
+                                    pending_command = Some(command);
+                                    break;
+                                }
+                                Err(mpsc::TryRecvError::Empty)
+                                | Err(mpsc::TryRecvError::Disconnected) => {
+                                    break;
+                                }
+                            }
+                        }
                         if worker_failed.load(Ordering::Relaxed)
                             || worker_stopped.load(Ordering::Relaxed)
                         {
@@ -217,11 +245,23 @@ impl PaneHistoryWriter {
                         }
                         let _ = ack.send(());
                     }
-                    HistoryWriterCommand::Reset(ack) => {
-                        if let Ok(mut history) = history.lock() {
-                            let _ = history.clear();
+                    HistoryWriterCommand::Reset => {
+                        if worker_failed.load(Ordering::Relaxed) {
+                            discard_failed_history(&history, &mut discarded);
+                            continue;
                         }
-                        let _ = ack.send(());
+                        let clear_ok = history
+                            .lock()
+                            .map(|mut history| history.clear().is_ok())
+                            .unwrap_or(false);
+                        if !clear_ok {
+                            if !worker_failed.swap(true, Ordering::Relaxed) {
+                                eprintln!(
+                                    "zmux: disabling disk scrollback after a history clear failure"
+                                );
+                            }
+                            discard_failed_history(&history, &mut discarded);
+                        }
                     }
                     HistoryWriterCommand::Discard(ack) => {
                         if let Ok(mut history) = history.lock() {
@@ -249,28 +289,22 @@ impl PaneHistoryWriter {
             return;
         }
 
-        let mut batch = Vec::with_capacity(HISTORY_WRITE_BATCH_LINES);
-        for line in lines {
-            batch.push(line);
-            if batch.len() == HISTORY_WRITE_BATCH_LINES {
-                if !self.try_append(std::mem::take(&mut batch)) {
-                    return;
-                }
-                batch = Vec::with_capacity(HISTORY_WRITE_BATCH_LINES);
+        match self.sender.try_send(HistoryWriterCommand::Append(lines)) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => {
+                self.disable_after_queue_failure("history write queue is full");
             }
-        }
-        if !batch.is_empty() {
-            let _ = self.try_append(batch);
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.disable_after_queue_failure(
+                    "history write worker disconnected",
+                );
+            }
         }
     }
 
-    fn try_append(&self, lines: Vec<SnapshotLine>) -> bool {
-        match self.sender.send(HistoryWriterCommand::Append(lines)) {
-            Ok(()) => true,
-            Err(_) => {
-                self.failed.store(true, Ordering::Relaxed);
-                false
-            }
+    fn disable_after_queue_failure(&self, reason: &str) {
+        if !self.failed.swap(true, Ordering::Relaxed) {
+            eprintln!("zmux: disabling disk scrollback because the {reason}");
         }
     }
 
@@ -291,18 +325,25 @@ impl PaneHistoryWriter {
         }
     }
 
-    /// Clear committed and already queued cold history at one FIFO boundary.
+    /// Queue a clear of committed and already queued cold history at one FIFO
+    /// boundary. This never waits for SQLite; call `flush` afterward when the
+    /// cleared state must be observed synchronously.
     pub fn clear(&self) {
-        if self.stopped.load(Ordering::Relaxed) {
+        if self.failed.load(Ordering::Relaxed)
+            || self.stopped.load(Ordering::Relaxed)
+        {
             return;
         }
-        let (ack_sender, ack_receiver) = mpsc::channel();
-        if self
-            .sender
-            .send(HistoryWriterCommand::Reset(ack_sender))
-            .is_ok()
-        {
-            let _ = ack_receiver.recv();
+        match self.sender.try_send(HistoryWriterCommand::Reset) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => {
+                self.disable_after_queue_failure("history write queue is full");
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.disable_after_queue_failure(
+                    "history write worker disconnected",
+                );
+            }
         }
     }
 
@@ -1413,9 +1454,10 @@ mod tests {
                 .map(|index| line(&format!("line {index}")))
                 .collect(),
         );
-        // Reset is queued after the appends and acknowledges only after both
-        // the queued data and the clear have completed.
+        // Reset is queued after the append. The following barrier observes
+        // both the queued data and the asynchronous clear.
         writer.clear();
+        writer.flush();
         assert!(history.lock().unwrap().is_empty());
         let database_path = history
             .lock()
@@ -1434,6 +1476,114 @@ mod tests {
         writer.shutdown_and_discard();
         assert!(database_path.exists());
         assert!(history.lock().unwrap().tail(10).unwrap().is_empty());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn large_write_behind_append_returns_while_history_is_locked() {
+        let (directory, history) = history("nonblocking-large-append", 20_000);
+        let history = Arc::new(Mutex::new(history));
+        let writer = PaneHistoryWriter::start(Arc::clone(&history));
+        let history_guard = history.lock().unwrap();
+        let line_count =
+            (HISTORY_WRITE_QUEUE_BATCHES + 2) * HISTORY_WRITE_BATCH_LINES;
+        let lines = (0..line_count)
+            .map(|index| line(&format!("line {index}")))
+            .collect();
+        let producer_writer = writer.clone();
+        let (returned_sender, returned_receiver) = mpsc::channel();
+        let producer = thread::spawn(move || {
+            producer_writer.append(lines);
+            let _ = returned_sender.send(());
+        });
+
+        let returned_while_locked = returned_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .is_ok();
+        drop(history_guard);
+        producer.join().unwrap();
+        writer.flush();
+
+        assert!(
+            returned_while_locked,
+            "a large append waited for the history worker's mutex"
+        );
+        assert!(!writer.failed.load(Ordering::Relaxed));
+        assert_eq!(history.lock().unwrap().len(), line_count as u64);
+        writer.shutdown_and_discard();
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn write_behind_clear_returns_while_history_is_locked() {
+        let (directory, history) = history("nonblocking-clear", 100);
+        let history = Arc::new(Mutex::new(history));
+        let writer = PaneHistoryWriter::start(Arc::clone(&history));
+        let history_guard = history.lock().unwrap();
+        // The append ahead of Reset guarantees the worker must acquire the
+        // held history lock before it can reach the clear command.
+        writer.append(vec![line("before clear")]);
+        let clear_writer = writer.clone();
+        let (returned_sender, returned_receiver) = mpsc::channel();
+        let clearer = thread::spawn(move || {
+            clear_writer.clear();
+            let _ = returned_sender.send(());
+        });
+
+        let returned_while_locked = returned_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .is_ok();
+        drop(history_guard);
+        clearer.join().unwrap();
+        writer.flush();
+
+        assert!(
+            returned_while_locked,
+            "clear waited for the history worker's mutex"
+        );
+        assert!(history.lock().unwrap().is_empty());
+        writer.shutdown_and_discard();
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn full_write_behind_queue_disables_and_discards_cold_history() {
+        let (directory, history) = history("full-write-queue", 100);
+        let history = Arc::new(Mutex::new(history));
+        let writer = PaneHistoryWriter::start(Arc::clone(&history));
+        let history_guard = history.lock().unwrap();
+        let producer_writer = writer.clone();
+        let (returned_sender, returned_receiver) = mpsc::channel();
+        let producer = thread::spawn(move || {
+            // The worker can coalesce at most one transaction's target size
+            // before blocking on the held history lock, so this always sends
+            // enough commands to exceed the remaining queue capacity.
+            for index in
+                0..(HISTORY_WRITE_BATCH_LINES + HISTORY_WRITE_QUEUE_BATCHES + 1)
+            {
+                producer_writer.append(vec![line(&format!("queued {index}"))]);
+            }
+            let _ = returned_sender.send(());
+        });
+
+        let returned_while_locked = returned_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .is_ok();
+        let queue_failed = writer.failed.load(Ordering::Relaxed);
+        drop(history_guard);
+        producer.join().unwrap();
+        writer.flush();
+
+        assert!(
+            returned_while_locked,
+            "a full history queue applied backpressure to the producer"
+        );
+        assert!(queue_failed, "queue overflow did not disable cold history");
+        let history = history.lock().unwrap();
+        assert_eq!(history.max_lines(), 0);
+        assert!(history.is_empty());
+        drop(history);
+        writer.shutdown_and_discard();
         let _ = fs::remove_dir_all(directory);
     }
 
