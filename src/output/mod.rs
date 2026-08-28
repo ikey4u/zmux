@@ -435,7 +435,11 @@ fn claim_render_dirty(
     force_repaint || was_dirty
 }
 
-fn pane_paint_pending(pane: &Pane, opts: &FrameAnsiOptions) -> bool {
+fn pane_paint_pending_with_mode(
+    pane: &Pane,
+    opts: &FrameAnsiOptions,
+    consume_dirty: bool,
+) -> bool {
     let sync_still_active =
         pane.parser.lock().ok().is_some_and(|mut parser| {
             if parser.sync_update_active() {
@@ -448,6 +452,11 @@ fn pane_paint_pending(pane: &Pane, opts: &FrameAnsiOptions) -> bool {
         // frame. Incremental sync replay may already have updated the internal
         // grid, but exposing it here would reintroduce TUI flicker.
         return false;
+    }
+    if !consume_dirty {
+        return opts.clear_display
+            || opts.force_repaint
+            || pane.render_dirty.load(Ordering::Acquire);
     }
     claim_render_dirty(
         &pane.render_dirty,
@@ -527,8 +536,9 @@ fn write_pane(
     hide_borders: bool,
     out: &mut String,
     opts: &FrameAnsiOptions,
+    consume_dirty: bool,
 ) {
-    if !pane_paint_pending(pane, opts) {
+    if !pane_paint_pending_with_mode(pane, opts, consume_dirty) {
         return;
     }
     if area.width == 0 || area.height == 0 {
@@ -695,6 +705,7 @@ fn write_node(
     hide_borders: bool,
     out: &mut String,
     opts: &FrameAnsiOptions,
+    consume_dirty: bool,
 ) {
     match node {
         LayoutNode::Split {
@@ -724,6 +735,7 @@ fn write_node(
                     hide_borders,
                     out,
                     opts,
+                    consume_dirty,
                 );
             }
             // Only refresh gaps when the frame is doing a full clear/repaint.
@@ -734,7 +746,15 @@ fn write_node(
             }
         }
         LayoutNode::Leaf(pane) => {
-            write_pane(pane, true, area, hide_borders, out, opts);
+            write_pane(
+                pane,
+                true,
+                area,
+                hide_borders,
+                out,
+                opts,
+                consume_dirty,
+            );
         }
         LayoutNode::External(slot) => {
             write_external_slot(slot, true, area, hide_borders, out, opts);
@@ -750,6 +770,7 @@ fn write_child_node(
     hide_borders: bool,
     out: &mut String,
     opts: &FrameAnsiOptions,
+    consume_dirty: bool,
 ) {
     match node {
         LayoutNode::Split {
@@ -780,6 +801,7 @@ fn write_child_node(
                     hide_borders,
                     out,
                     opts,
+                    consume_dirty,
                 );
             }
             // Only refresh gaps on full clear/repaint (see write_node).
@@ -789,7 +811,15 @@ fn write_child_node(
         }
         LayoutNode::Leaf(pane) => {
             let is_active = is_active_branch && relative_path.is_empty();
-            write_pane(pane, is_active, area, hide_borders, out, opts);
+            write_pane(
+                pane,
+                is_active,
+                area,
+                hide_borders,
+                out,
+                opts,
+                consume_dirty,
+            );
         }
         LayoutNode::External(slot) => {
             let is_active = is_active_branch && relative_path.is_empty();
@@ -900,6 +930,29 @@ pub fn serialize_frame_ansi(
     hide_borders: bool,
     opts: FrameAnsiOptions,
 ) -> String {
+    serialize_frame_ansi_with_mode(win, area, hide_borders, opts, true)
+}
+
+/// Build an authoritative full paint without claiming the normal renderer's
+/// dirty generation or draining one-shot terminal side effects. This is used
+/// to resynchronize one lagging frame connection; publishing it globally would
+/// make healthy clients replay a recovery frame they did not request.
+pub(crate) fn serialize_frame_ansi_snapshot(
+    win: &Window,
+    area: Rect,
+    hide_borders: bool,
+    opts: FrameAnsiOptions,
+) -> String {
+    serialize_frame_ansi_with_mode(win, area, hide_borders, opts, false)
+}
+
+fn serialize_frame_ansi_with_mode(
+    win: &Window,
+    area: Rect,
+    hide_borders: bool,
+    opts: FrameAnsiOptions,
+    consume_render_state: bool,
+) -> String {
     let mut out = String::with_capacity(65536);
     if opts.clear_display {
         write_clear_pane_area(&mut out, area);
@@ -908,8 +961,18 @@ pub fn serialize_frame_ansi(
         if let Some(pane) =
             crate::layout::find_pane_by_id(&win.root, zoom.zoomed_pane_id)
         {
-            write_pane(pane, true, area, hide_borders, &mut out, &opts);
-            relay_pending_osc52(&win.root, &mut out);
+            write_pane(
+                pane,
+                true,
+                area,
+                hide_borders,
+                &mut out,
+                &opts,
+                consume_render_state,
+            );
+            if consume_render_state {
+                relay_pending_osc52(&win.root, &mut out);
+            }
             return out;
         }
     }
@@ -920,8 +983,11 @@ pub fn serialize_frame_ansi(
         hide_borders,
         &mut out,
         &opts,
+        consume_render_state,
     );
-    relay_pending_osc52(&win.root, &mut out);
+    if consume_render_state {
+        relay_pending_osc52(&win.root, &mut out);
+    }
     out
 }
 

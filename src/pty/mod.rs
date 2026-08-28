@@ -462,8 +462,9 @@ fn start_reader_thread(
                     }
                     if clear_history {
                         // The terminal capture split discarded only rows before
-                        // the exact clear boundary; preserve rows produced
-                        // afterward by clearing the durable tier first.
+                        // the exact clear boundary. Queue the durable clear
+                        // first so FIFO ordering preserves rows appended below
+                        // without making the PTY reader wait for SQLite.
                         history_writer.clear();
                     }
                     // The screen can repaint from the hot parser immediately;
