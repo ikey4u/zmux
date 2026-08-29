@@ -1,4 +1,5 @@
 /target
+/dist
 inner/
 __pycache__
 .DS_Store
