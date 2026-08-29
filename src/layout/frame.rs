@@ -17,10 +17,6 @@ pub fn serialize_frame(win: &Window, area: Rect, hide_borders: bool) -> String {
         if let Some(pane) = crate::layout::find_pane_by_id(&win.root, zoomed_id)
         {
             write_leaf(pane, true, &mut out);
-        } else if let Some(slot) =
-            crate::layout::find_external_by_pane_id(&win.root, zoomed_id)
-        {
-            write_external(slot, true, &mut out);
         } else {
             write_node(
                 &win.root,
@@ -104,9 +100,6 @@ fn write_node(
         LayoutNode::Leaf(p) => {
             write_leaf(p, true, out);
         }
-        LayoutNode::External(slot) => {
-            write_external(slot, true, out);
-        }
     }
 }
 
@@ -174,10 +167,6 @@ fn write_child_node(
             let is_active = is_active_branch && relative_path.is_empty();
             write_leaf(p, is_active, out);
         }
-        LayoutNode::External(slot) => {
-            let is_active = is_active_branch && relative_path.is_empty();
-            write_external(slot, is_active, out);
-        }
     }
 }
 
@@ -217,31 +206,6 @@ fn child_rect(
         offset += dim + border_size;
     }
     area
-}
-
-fn write_external(
-    slot: &crate::types::ExternalSlot,
-    is_active: bool,
-    out: &mut String,
-) {
-    let _ = write!(
-        out,
-        "{{\"type\":\"external\",\"id\":{},\"slot_id\":{},\"host\":\"",
-        slot.id, slot.slot_id
-    );
-    json_escape(&slot.host_alias, out);
-    out.push_str("\",\"remote_socket\":\"");
-    json_escape(&slot.remote_socket, out);
-    let _ = write!(
-        out,
-        "\",\"state\":\"{}\",\"generation\":{},\"rows\":{},\"cols\":{},\
-         \"active\":{}}}",
-        slot.state.as_str(),
-        slot.generation,
-        slot.last_rows,
-        slot.last_cols,
-        is_active,
-    );
 }
 
 fn write_leaf(pane: &Pane, is_active: bool, out: &mut String) {
