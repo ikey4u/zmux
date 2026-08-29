@@ -33,7 +33,7 @@ prefix key first, then the action key. Pressing `Ctrl+a` twice sends a literal
 | `Prefix + K` | Completely clear the current pane output history, including copy mode history |
 | `Prefix + b` | Toggle pane borders on or off |
 | `Prefix + H` | Set the current pane's current directory as the working directory for future splits |
-| `Prefix + ]` | Paste from the OS clipboard (text, image, or files). In a remote pane this uploads files to `~/.zmux/drop/` and pastes the remote paths |
+| `Prefix + ]` | Paste clipboard text, image, or files into the focused pane. Uses the OS clipboard when available, otherwise `zsync`. In a remote pane, files are uploaded to `~/.zmux/drop/` and the remote paths are pasted |
 | `Prefix + h` | Move focus to the pane on the left, in Vim style |
 | `Prefix + j` | Move focus to the pane below, in Vim style |
 | `Prefix + k` | Move focus to the pane above, in Vim style |
@@ -127,7 +127,7 @@ Each tab is backed by an independent server. Sessions, windows, and panes are is
 | `set-option -g history-limit <lines>` | Set the in-memory scrollback limit for existing and future panes (`0`–`100000`) |
 | `show-options` | Show the current server options |
 | `set-pane-start-dir` | Save the current pane's current directory as the working directory for future splits |
-| `paste-cloud` | Same as `Prefix + ]`: read the OS clipboard and paste into the focused pane |
+| `paste-cloud` | Same as `Prefix + ]`: paste clipboard contents into the focused pane |
 
 ---
 
@@ -137,7 +137,7 @@ Each tab is backed by an independent server. Sessions, windows, and panes are is
 
 - Inside an existing pane: the current leaf becomes a remote slot after SSH and the first frame succeed. Failure keeps the original local shell.
 - Split (`Prefix + %` / `"`) and window commands follow the focused pane's machine. `Prefix + h/j/k/l` moves across local and remote panes.
-- File and image paste uses `Prefix + ]` (not Cmd+V). Remote files land in `~/.zmux/drop/` on the SSH host.
+- File and image paste uses `Prefix + ]` (not Cmd+V). Remote files land in `~/.zmux/drop/` on the SSH host. Text paste on a headless remote uses zsync when the OS clipboard is empty.
 - Optional host settings live in `~/.config/zmux/ssh.toml`. Do not nest `ssh` + `zmux a` inside a pane.
 
 ---
@@ -201,37 +201,34 @@ part of that line rather than allowing memory to grow without limit.
 
 ---
 
-### Remote Clipboard (OSC 52)
+### Remote Clipboard (zsync)
 
-When zmux runs on a remote Linux server over SSH, it cannot directly call the
-clipboard on the client machine. Instead, zmux sends copied text to the
-terminal emulator running on the SSH client using the OSC 52 escape sequence.
-That terminal emulator must support OSC 52. For example, WezTerm supports it;
-macOS Terminal.app does not. See the [OSC 52 terminal compatibility
-list](https://can-i-use-terminal.github.io/features/osc52copy.html) for other
-supported terminals.
+A headless Linux host has no OS clipboard. zmux uses [zsync](https://github.com/ikey4u/zsync) so copy and paste still work across the laptop and the server.
 
-This OSC 52 path does not require Linux graphical clipboard tools such as
-`xsel`, `xclip`, `wl-copy`, or a display server. You may still install and use
-them for other clipboard workflows on the remote host.
+On both machines, run `zsync daemon`, then pair once (`zsync pair` on one side, `zsync connect <ticket>` on the other). After that:
 
-Programs running inside a pane, including Neovim, emit their own terminal
-output. zmux relays valid OSC 52 sequences from that output to the attached
-terminal. Make sure the remote host runs a zmux version with this support and
-restart the remote zmux server after upgrading.
+- Copy mode `y` / `Enter` writes into zsync (and into the local OS clipboard when one exists). Over a nested SSH session without a display, this is the path that reaches the laptop.
+- `Prefix + ]` reads the OS clipboard first; if that is empty (typical on the server), it falls back to `zsync p --content`.
+- Programs in a pane that emit OSC 52 (for example Neovim's osc52 provider) are still relayed to the attached terminal, and the decoded text is also copied into zsync.
 
-For Neovim on the remote Linux host, configure the OSC 52 clipboard provider
-early in `~/.config/nvim/init.lua`:
+OSC 52 remains a fallback when zsync is not installed or the daemon is down. It needs a terminal that implements OSC 52 (WezTerm does; macOS Terminal.app does not). See the [OSC 52 terminal compatibility list](https://can-i-use-terminal.github.io/features/osc52copy.html).
+
+For Neovim on the remote host, point the `+` register at zsync (daemon must be running):
 
 ```lua
-vim.g.clipboard = "osc52"
-vim.opt.clipboard:append("unnamedplus")
+vim.g.clipboard = {
+  name = "zsync",
+  copy = { ["+"] = { "zsync", "c" }, ["*"] = { "zsync", "c" } },
+  paste = {
+    ["+"] = { "zsync", "p", "--content" },
+    ["*"] = { "zsync", "p", "--content" },
+  },
+  cache_enabled = 0,
+}
+vim.opt.clipboard = "unnamedplus"
 ```
 
-Restart Neovim after changing the setting. `unnamedplus` makes ordinary `y`
-use the `+` register; `vim.g.clipboard = "osc52"` is what makes that register
-send its copied text through the terminal. You can verify the active provider
-with `:checkhealth clipboard` and test explicitly with `"+y`.
+`zsync p` prints a file path on a headless host; editors must use `--content`. Restart Neovim after changing the setting and confirm with `:checkhealth clipboard` / `"+y`.
 
 ---
 
