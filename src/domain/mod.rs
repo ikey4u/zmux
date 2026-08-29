@@ -1,21 +1,9 @@
-pub mod attach;
 pub mod clip;
-pub mod cloud;
-pub mod config;
-pub mod daemon;
 pub mod drop;
 pub mod handle;
-pub mod hello;
 pub mod ids;
-pub mod lease;
-pub mod mux;
 pub mod paste;
-pub mod payload;
-pub mod probe;
 pub mod quote;
-pub mod ssh;
 
 pub use handle::DomainHandle;
-pub use hello::{Hello, ProbeReport};
-pub use ids::{DomainId, PaneRef};
-pub use ssh::connect_ssh;
+pub use ids::new_instance_id;

@@ -20,7 +20,7 @@ use crate::{
     copy_mode::CopyRenderRow,
     layout::BORDER_SIZE,
     terminal::{color_is_default, TerminalCell},
-    types::{ExternalSlot, LayoutNode, Pane, Rect, SplitDirection, Window},
+    types::{LayoutNode, Pane, Rect, SplitDirection, Window},
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -485,50 +485,6 @@ fn write_scrollbar(content: Rect, ratio: f32, out: &mut String) {
     }
 }
 
-fn write_external_slot(
-    slot: &ExternalSlot,
-    is_active: bool,
-    area: Rect,
-    hide_borders: bool,
-    out: &mut String,
-    opts: &FrameAnsiOptions,
-) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    if !(opts.clear_display || opts.force_repaint) {
-        return;
-    }
-    write_erase_rect(area, out);
-    let has_border = !hide_borders && area.width > 2 && area.height > 2;
-    if has_border {
-        write_border(area, is_active, out);
-    }
-    let inner = content_area(area, has_border);
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-    let label = match slot.state {
-        crate::types::ExternalState::Connecting => {
-            Some(format!("{}: connecting…", slot.host_alias))
-        }
-        crate::types::ExternalState::Reconnecting => {
-            Some(format!("{}: reconnecting…", slot.host_alias))
-        }
-        crate::types::ExternalState::Exited => {
-            Some(format!("{}: exited", slot.host_alias))
-        }
-        crate::types::ExternalState::Bound => None,
-    };
-    let Some(label) = label else {
-        return;
-    };
-    let max = inner.width as usize;
-    let shown: String = label.chars().take(max).collect();
-    vte_goto(inner.x, inner.y, out);
-    let _ = write!(out, "\x1b[0m{shown}");
-}
-
 fn write_pane(
     pane: &Pane,
     is_active: bool,
@@ -756,9 +712,6 @@ fn write_node(
                 consume_dirty,
             );
         }
-        LayoutNode::External(slot) => {
-            write_external_slot(slot, true, area, hide_borders, out, opts);
-        }
     }
 }
 
@@ -821,10 +774,6 @@ fn write_child_node(
                 consume_dirty,
             );
         }
-        LayoutNode::External(slot) => {
-            let is_active = is_active_branch && relative_path.is_empty();
-            write_external_slot(slot, is_active, area, hide_borders, out, opts);
-        }
     }
 }
 
@@ -847,7 +796,6 @@ fn relay_pending_osc52(node: &LayoutNode, out: &mut String) {
                 }
             }
         }
-        LayoutNode::External(_) => {}
     }
 }
 
@@ -897,16 +845,6 @@ fn hash_layout_node(
         }
         LayoutNode::Leaf(pane) => {
             pane.id.hash(hasher);
-            area.x.hash(hasher);
-            area.y.hash(hasher);
-            area.width.hash(hasher);
-            area.height.hash(hasher);
-        }
-        LayoutNode::External(slot) => {
-            slot.id.hash(hasher);
-            slot.slot_id.hash(hasher);
-            slot.state.as_str().hash(hasher);
-            slot.generation.hash(hasher);
             area.x.hash(hasher);
             area.y.hash(hasher);
             area.width.hash(hasher);

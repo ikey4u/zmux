@@ -3,7 +3,7 @@ use std::{
     io::{self, Write},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Condvar, Mutex,
+        Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -110,7 +110,6 @@ use crate::{
         layout::{LayoutNode, Rect, SplitDirection},
         options::{SessionOptions, WindowOptions, MAX_HISTORY_LIMIT},
         session::{PaneId, Server, Session, Size, Window},
-        ExternalSlot, ExternalState,
     },
 };
 
@@ -700,17 +699,6 @@ where
             log_server("CMD_OUTPUT served, closing");
             return Ok(());
         }
-        "CLOUD_PROBE" => {
-            let json = build_cloud_probe_json(&state);
-            send_resp(&mut write_stream, &json)?;
-            log_server("CLOUD_PROBE served, closing");
-            return Ok(());
-        }
-        line if line.starts_with("DOMAIN_ATTACH ") => {
-            let json = &line["DOMAIN_ATTACH ".len()..];
-            handle_domain_attach_oneshot(json, &state, &mut write_stream)?;
-            return Ok(());
-        }
         "COPY_YANK" => {
             let text = state
                 .lock()
@@ -788,26 +776,6 @@ where
             if let Ok(bytes) = decode_hex(hex) {
                 paste_bytes_to_pane(&state, pane_id, &bytes, false);
             }
-        } else if line.starts_with("DOMAIN_BIND_OK ") {
-            let json = &line["DOMAIN_BIND_OK ".len()..];
-            if let Ok(mut s) = state.lock() {
-                match apply_domain_bind_ok(&mut s, json) {
-                    Ok(()) => {}
-                    Err(err) => log_server(&format!("DOMAIN_BIND_OK: {err}")),
-                }
-            }
-            mark_data_ready();
-        } else if line.starts_with("DOMAIN_BIND_FAIL ") {
-            let json = &line["DOMAIN_BIND_FAIL ".len()..];
-            if let Ok(mut s) = state.lock() {
-                apply_domain_bind_fail(&mut s, json);
-            }
-        } else if line.starts_with("DOMAIN_SLOT_STATE ") {
-            let json = &line["DOMAIN_SLOT_STATE ".len()..];
-            if let Ok(mut s) = state.lock() {
-                apply_domain_slot_state(&mut s, json);
-            }
-            mark_data_ready();
         } else if line.starts_with("CMD ") {
             let cmd = &line["CMD ".len()..];
             let sz = size_arc.lock().map(|s| *s).unwrap_or(Size::new(24, 80));
@@ -1231,7 +1199,7 @@ fn refresh_latest_frame(
             clear_display: true,
             force_repaint: true,
         },
-        &client_requests_json(state),
+        "",
     );
     if let Ok(fd) = serde_json::from_str::<FrameData>(&json) {
         if let Ok(mut frame) = latest_frame.lock() {
@@ -1257,7 +1225,7 @@ fn build_private_snapshot_frame(
             clear_display: true,
             force_repaint: true,
         },
-        &client_requests_json(state),
+        "",
         false,
     );
     serde_json::from_str(&json).ok()
@@ -1441,212 +1409,6 @@ fn parse_input_line(rest: &str) -> (Option<usize>, &str) {
     }
 }
 
-fn client_requests_json(state: &Server) -> String {
-    let Some(pending) = &state.pending_domain_attach else {
-        return String::new();
-    };
-    let body = serde_json::json!([{
-        "type": "domain_attach",
-        "request_id": pending.request_id,
-        "host": pending.host,
-        "pane_id": pending.pane_id,
-    }]);
-    format!(",\"client_requests\":{body}")
-}
-
-fn handle_domain_attach_oneshot(
-    json: &str,
-    state: &Arc<Mutex<Server>>,
-    write_stream: &mut impl Write,
-) -> io::Result<()> {
-    use crate::{
-        domain::attach::DomainAttachRequest, ipc::send_resp,
-        types::PendingDomainAttach,
-    };
-
-    let req: DomainAttachRequest = serde_json::from_str(json)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-    let waiter = Arc::new((Mutex::new(None), Condvar::new()));
-    {
-        let mut s = state.lock().map_err(|_| {
-            io::Error::new(io::ErrorKind::Other, "server lock poisoned")
-        })?;
-        if let Some(session) = s.active_session_mut() {
-            if let Some(win) = session.active_window_mut() {
-                if let Some(slot) = crate::layout::find_external_by_host(
-                    &win.root, &req.host, None,
-                ) {
-                    let id = slot.id;
-                    win.active_pane_path =
-                        crate::layout::find_pane_path(&win.root, id)
-                            .unwrap_or_default();
-                    return send_resp(write_stream, "OK already attached");
-                }
-                if crate::layout::find_pane_by_id(&win.root, req.pane_id)
-                    .is_none()
-                {
-                    return send_resp(write_stream, "ERROR pane not found");
-                }
-            }
-        }
-        if s.pending_domain_attach.is_some() {
-            return send_resp(write_stream, "ERROR attach already in progress");
-        }
-        s.pending_domain_attach = Some(PendingDomainAttach {
-            request_id: req.request_id.clone(),
-            host: req.host.clone(),
-            pane_id: req.pane_id,
-            waiter: waiter.clone(),
-        });
-        s.force_clear_display = true;
-    }
-    mark_data_ready();
-    let (lock, cvar) = &*waiter;
-    let mut guard = lock.lock().map_err(|_| {
-        io::Error::new(io::ErrorKind::Other, "attach waiter poisoned")
-    })?;
-    let deadline = Instant::now() + Duration::from_secs(45);
-    while guard.is_none() {
-        let now = Instant::now();
-        if now >= deadline {
-            break;
-        }
-        let (g, _) = cvar
-            .wait_timeout(guard, deadline.saturating_duration_since(now))
-            .map_err(|_| {
-                io::Error::new(io::ErrorKind::Other, "attach waiter poisoned")
-            })?;
-        guard = g;
-    }
-    let result = guard.take();
-    if let Ok(mut s) = state.lock() {
-        if s.pending_domain_attach
-            .as_ref()
-            .is_some_and(|p| p.request_id == req.request_id)
-        {
-            s.pending_domain_attach = None;
-        }
-    }
-    match result {
-        Some(Ok(msg)) => send_resp(write_stream, &format!("OK {msg}")),
-        Some(Err(err)) => send_resp(write_stream, &format!("ERROR {err}")),
-        None => send_resp(write_stream, "ERROR domain attach timed out"),
-    }
-}
-
-fn notify_pending(
-    pending: &crate::types::PendingDomainAttach,
-    result: Result<String, String>,
-) {
-    if let Ok(mut slot) = pending.waiter.0.lock() {
-        *slot = Some(result);
-        pending.waiter.1.notify_all();
-    }
-}
-
-fn apply_domain_bind_ok(state: &mut Server, json: &str) -> Result<(), String> {
-    use crate::domain::attach::DomainBindOk;
-
-    let bind: DomainBindOk =
-        serde_json::from_str(json).map_err(|e| e.to_string())?;
-    let pending = state
-        .pending_domain_attach
-        .take()
-        .ok_or_else(|| "no pending attach".to_string())?;
-    if pending.request_id != bind.request_id {
-        notify_pending(&pending, Err("request id mismatch".into()));
-        return Err("request id mismatch".into());
-    }
-    let slot_id = state.next_slot_id;
-    state.next_slot_id += 1;
-    let pane_id = pending.pane_id;
-    let (rows, cols, path) = {
-        let session = state
-            .active_session()
-            .ok_or_else(|| "no session".to_string())?;
-        let win = session
-            .active_window()
-            .ok_or_else(|| "no window".to_string())?;
-        let path = crate::layout::find_pane_path(&win.root, pane_id)
-            .ok_or_else(|| "pane gone".to_string())?;
-        let (rows, cols) = crate::layout::find_pane_by_id(&win.root, pane_id)
-            .map(|p| (p.last_rows, p.last_cols))
-            .unwrap_or((24, 80));
-        (rows, cols, path)
-    };
-    let slot = ExternalSlot {
-        id: pane_id,
-        slot_id,
-        host_alias: bind.host.clone(),
-        remote_socket: bind.remote_socket.clone(),
-        state: ExternalState::Bound,
-        generation: bind.generation,
-        last_rows: rows,
-        last_cols: cols,
-    };
-    let session = state
-        .active_session_mut()
-        .ok_or_else(|| "no session".to_string())?;
-    let win = session
-        .active_window_mut()
-        .ok_or_else(|| "no window".to_string())?;
-    let old = std::mem::replace(
-        &mut win.root,
-        LayoutNode::Split {
-            direction: SplitDirection::Horizontal,
-            sizes: vec![],
-            children: vec![],
-        },
-    );
-    match crate::layout::replace_pane_with_external(old, pane_id, slot) {
-        Some(root) => {
-            win.root = root;
-            win.active_pane_path = path;
-        }
-        None => {
-            notify_pending(&pending, Err("failed to convert pane".into()));
-            return Err("failed to convert pane".into());
-        }
-    }
-    state.force_clear_display = true;
-    notify_pending(&pending, Ok(format!("slot {slot_id}")));
-    Ok(())
-}
-
-fn apply_domain_bind_fail(state: &mut Server, json: &str) {
-    use crate::domain::attach::DomainBindFail;
-    let Ok(fail) = serde_json::from_str::<DomainBindFail>(json) else {
-        return;
-    };
-    if let Some(pending) = state.pending_domain_attach.take() {
-        if pending.request_id == fail.request_id {
-            notify_pending(&pending, Err(fail.error));
-        } else {
-            state.pending_domain_attach = Some(pending);
-        }
-    }
-}
-
-fn apply_domain_slot_state(state: &mut Server, json: &str) {
-    use crate::domain::attach::DomainSlotState;
-    let Ok(msg) = serde_json::from_str::<DomainSlotState>(json) else {
-        return;
-    };
-    let Some(session) = state.active_session_mut() else {
-        return;
-    };
-    for win in &mut session.windows {
-        if let Some(slot) =
-            crate::layout::find_external_mut(&mut win.root, msg.slot_id)
-        {
-            slot.state = ExternalState::parse(&msg.state);
-            slot.generation = msg.generation;
-            state.force_clear_display = true;
-            break;
-        }
-    }
-}
-
 fn paste_bytes_to_pane(
     state: &Arc<Mutex<Server>>,
     pane_id: Option<usize>,
@@ -1687,44 +1449,6 @@ fn paste_bytes_to_pane(
         out
     };
     let _ = write_pty_writer(&writer, &payload);
-}
-
-fn build_cloud_probe_json(state: &Arc<Mutex<Server>>) -> String {
-    use crate::domain::hello::{Hello, ProbeReport};
-
-    let (instance, socket, version) = match state.lock() {
-        Ok(s) => (
-            s.instance_id.clone(),
-            s.socket_name.clone().unwrap_or_else(|| "default".into()),
-            crate::platform::ZMUX_VERSION.to_string(),
-        ),
-        Err(_) => {
-            return "{}".to_string();
-        }
-    };
-    let hello = Hello::offer(
-        instance.clone(),
-        Some(crate::domain::hello::HelloDomain {
-            transport: "unix".to_string(),
-            host_alias: "local".to_string(),
-            remote_socket: socket.clone(),
-        }),
-        &crate::domain::hello::OPTIONAL_CAPS,
-    );
-    let lease_held = crate::domain::lease::lease_held(&socket);
-    let report = ProbeReport {
-        binary_version: version.clone(),
-        server_running: true,
-        server_version: Some(version),
-        server_instance_id: Some(instance),
-        protocol: hello.protocol,
-        capabilities: hello.capabilities,
-        limits: hello.limits,
-        legacy_remote: false,
-        lease_held,
-        error: None,
-    };
-    serde_json::to_string(&report).unwrap_or_else(|_| "{}".to_string())
 }
 
 fn write_pty_writer(
@@ -1826,7 +1550,6 @@ fn flush_sync_for_display_in_layout(node: &mut LayoutNode, flushed: &mut bool) {
                 *flushed = true;
             }
         }
-        LayoutNode::External(_) => {}
         LayoutNode::Split { children, .. } => {
             for child in children {
                 flush_sync_for_display_in_layout(child, flushed);
@@ -1959,10 +1682,9 @@ fn render_loop(
                 },
             );
             let ansi_b64 = encode_ansi_base64(&ansi);
-            let requests = client_requests_json(&s);
             format!(
-                "{{\"type\":\"frame\",\"layout\":{},\"status\":{},\"ansi\":\"{}\"{}}}",
-                layout_part, status, ansi_b64, requests
+                "{{\"type\":\"frame\",\"layout\":{},\"status\":{},\"ansi\":\"{}\"}}",
+                layout_part, status, ansi_b64
             )
         };
 
@@ -2045,7 +1767,6 @@ fn mark_exited_panes(node: &mut LayoutNode) {
                 mark_data_ready();
             }
         }
-        LayoutNode::External(_) => {}
         LayoutNode::Split { children, .. } => {
             for child in children {
                 mark_exited_panes(child);
@@ -2068,7 +1789,6 @@ fn kill_node_panes(node: &mut LayoutNode) {
             let _ = p.child.kill();
             p.dead.store(true, Ordering::Relaxed);
         }
-        LayoutNode::External(_) => {}
         LayoutNode::Split { children, .. } => {
             for child in children {
                 kill_node_panes(child);
@@ -2086,7 +1806,6 @@ fn collect_dead_pane_ids(node: &LayoutNode) -> Vec<PaneId> {
                 vec![]
             }
         }
-        LayoutNode::External(_) => vec![],
         LayoutNode::Split { children, .. } => {
             children.iter().flat_map(collect_dead_pane_ids).collect()
         }
@@ -2184,18 +1903,6 @@ fn resize_node_panes(
                 crate::copy_mode::refresh_layout(p);
             }
         }
-        LayoutNode::External(slot) => {
-            if let Some(zoomed) = zoom_pane_id {
-                if slot.id != zoomed {
-                    return;
-                }
-            }
-            if let Some(&rect) = rects.get(&slot.id) {
-                let (rows, cols) = pane_viewport_size(rect, hide_borders);
-                slot.last_rows = rows;
-                slot.last_cols = cols;
-            }
-        }
         LayoutNode::Split { children, .. } => {
             for child in children.iter_mut() {
                 resize_node_panes(child, rects, zoom_pane_id, hide_borders);
@@ -2220,7 +1927,6 @@ fn set_scroll_on_erase_in_display_node(node: &mut LayoutNode, enabled: bool) {
                 parser.set_scroll_on_erase_in_display(enabled);
             }
         }
-        LayoutNode::External(_) => {}
         LayoutNode::Split { children, .. } => {
             for child in children {
                 set_scroll_on_erase_in_display_node(child, enabled);
@@ -2249,7 +1955,6 @@ fn set_history_limit_node(node: &mut LayoutNode, history_limit: usize) {
             crate::copy_mode::refresh_layout(pane);
             pane.mark_render_dirty();
         }
-        LayoutNode::External(_) => {}
         LayoutNode::Split { children, .. } => {
             for child in children {
                 set_history_limit_node(child, history_limit);
@@ -2619,18 +2324,6 @@ fn cmd_split_window(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
             Some(s) => s,
             None => return,
         };
-        if let Some(win) = session.windows.get(session.active_window_idx) {
-            if crate::layout::find_external_by_pane_id(
-                &win.root,
-                crate::layout::active_node_id(&win.root, &win.active_pane_path)
-                    .unwrap_or(usize::MAX),
-            )
-            .is_some()
-            {
-                return;
-            }
-        }
-
         let pane_id = session.next_pane_id;
         session.next_pane_id += 1;
 
@@ -3033,7 +2726,7 @@ fn cmd_zoom_pane(state: &mut Server, sz: Size) {
             None => return,
         };
 
-        if matches!(win.root, LayoutNode::Leaf(_) | LayoutNode::External(_)) {
+        if matches!(win.root, LayoutNode::Leaf(_)) {
             return;
         }
 
@@ -3110,7 +2803,6 @@ fn set_all_sizes_to_full(node: &mut LayoutNode, active_id: PaneId) {
 fn subtree_contains_pane(node: &LayoutNode, id: PaneId) -> bool {
     match node {
         LayoutNode::Leaf(p) => p.id == id,
-        LayoutNode::External(slot) => slot.id == id,
         LayoutNode::Split { children, .. } => {
             children.iter().any(|c| subtree_contains_pane(c, id))
         }
@@ -3124,7 +2816,7 @@ fn resize_layout_in_direction(
     step: u16,
 ) -> bool {
     match node {
-        LayoutNode::Leaf(_) | LayoutNode::External(_) => false,
+        LayoutNode::Leaf(_) => false,
         LayoutNode::Split {
             direction,
             sizes,
@@ -3305,10 +2997,6 @@ mod tests {
                 rows, cols, active, ..
             } if *active => Some((*rows, *cols)),
             crate::client::LayoutJson::Leaf { .. } => None,
-            crate::client::LayoutJson::External { graft: Some(g), .. } => {
-                active_frame_size(g)
-            }
-            crate::client::LayoutJson::External { .. } => None,
             crate::client::LayoutJson::Split { children, .. } => {
                 children.iter().find_map(active_frame_size)
             }
@@ -3499,7 +3187,6 @@ mod tests {
             LayoutNode::Leaf(pane) => {
                 pane.render_dirty.store(dirty, Ordering::Relaxed)
             }
-            LayoutNode::External(_) => {}
             LayoutNode::Split { children, .. } => {
                 for child in children {
                     set_all_render_dirty(child, dirty);

@@ -85,7 +85,6 @@ pub(crate) fn exit_frame() -> FrameData {
         ansi: None,
         exit: true,
         yank_text: None,
-        client_requests: Vec::new(),
     }
 }
 

@@ -1,7 +1,5 @@
 use std::{
-    collections::HashMap,
     io::{self, Write},
-    sync::mpsc,
     time::{Duration, Instant},
 };
 
@@ -48,7 +46,6 @@ pub struct ClientApp {
     pub start_dir: Option<String>,
     pub initial_tab_title: Option<String>,
     pub attach_all: bool,
-    pub ssh_host: Option<String>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -113,8 +110,6 @@ enum InputMode {
 const RESIZE_IDLE_TIMEOUT: Duration = Duration::from_millis(500);
 const SCROLL_LINES: usize = 3;
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(400);
-const RECONNECT_BACKOFF: Duration = Duration::from_millis(750);
-
 struct LastMouseClick {
     row: u16,
     col: u16,
@@ -132,39 +127,12 @@ struct ClientTab {
     title: String,
     socket_name: String,
     client: Box<dyn DomainHandle>,
-    grafts: HashMap<u64, Graft>,
     visual_focus: VisualFocus,
-    pending_attach: Option<PendingAttach>,
-    pending_reconnect: HashMap<u64, PendingReconnect>,
-}
-
-struct Graft {
-    host: String,
-    #[allow(dead_code)]
-    remote_socket: String,
-    client: Box<dyn DomainHandle>,
-    generation: u64,
-    last_size: Option<Size>,
-    last_reconnect_at: Option<Instant>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum VisualFocus {
     Local { pane_id: Option<usize> },
-    Remote { slot_id: u64, pane_id: usize },
-}
-
-struct PendingAttach {
-    request_id: String,
-    host: String,
-    #[allow(dead_code)]
-    pane_id: usize,
-    rx: mpsc::Receiver<Result<crate::domain::cloud::CloudClient, String>>,
-    ready: Option<Box<dyn DomainHandle>>,
-}
-
-struct PendingReconnect {
-    rx: mpsc::Receiver<Result<crate::domain::cloud::CloudClient, String>>,
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -221,10 +189,7 @@ impl TabManager {
                 title,
                 socket_name: base_socket.to_string(),
                 client: Box::new(client),
-                grafts: HashMap::new(),
                 visual_focus: VisualFocus::Local { pane_id: None },
-                pending_attach: None,
-                pending_reconnect: HashMap::new(),
             }],
             active: 0,
             tab_bar_offset: 0,
@@ -276,10 +241,7 @@ impl TabManager {
                         title,
                         socket_name,
                         client: Box::new(client),
-                        grafts: HashMap::new(),
                         visual_focus: VisualFocus::Local { pane_id: None },
-                        pending_attach: None,
-                        pending_reconnect: HashMap::new(),
                     });
                 }
                 Err(e) => {
@@ -310,332 +272,16 @@ impl TabManager {
         Ok(manager)
     }
 
-    fn from_ssh(
-        host: &str,
-        local_socket: &str,
-        size: Size,
-        start_dir: Option<String>,
-    ) -> io::Result<Self> {
-        let client = crate::domain::connect_ssh(host, size)?;
-        Ok(Self {
-            tabs: vec![ClientTab {
-                code: tab_code(0),
-                title: host.to_string(),
-                socket_name: format!("ssh:{host}"),
-                client: Box::new(client),
-                grafts: HashMap::new(),
-                visual_focus: VisualFocus::Local { pane_id: None },
-                pending_attach: None,
-                pending_reconnect: HashMap::new(),
-            }],
-            active: 0,
-            tab_bar_offset: 0,
-            base_socket: local_socket.to_string(),
-            start_dir,
-            next_id: 1,
-            killed_sockets: std::collections::HashSet::new(),
-        })
-    }
-
-    fn attach_ssh(&mut self, host: &str, size: Size) -> io::Result<String> {
-        let socket_name = format!("ssh:{host}");
-        if let Some(index) = self
-            .tabs
-            .iter()
-            .position(|tab| tab.socket_name == socket_name)
-        {
-            self.active = index;
-            return Ok(format!("attached {host}"));
-        }
-        let client = crate::domain::connect_ssh(host, size)?;
-        let code = next_available_tab_code(&self.tabs, self.tabs.len());
-        self.tabs.push(ClientTab {
-            code,
-            title: host.to_string(),
-            socket_name,
-            client: Box::new(client),
-            grafts: HashMap::new(),
-            visual_focus: VisualFocus::Local { pane_id: None },
-            pending_attach: None,
-            pending_reconnect: HashMap::new(),
-        });
-        self.active = self.tabs.len() - 1;
-        self.persist_active_metadata();
-        Ok(format!("ssh {host}"))
-    }
-
     fn active_client(&self) -> &dyn DomainHandle {
         self.tabs[self.active].client.as_ref()
     }
 
     fn focused_client(&self) -> &dyn DomainHandle {
-        let tab = &self.tabs[self.active];
-        match tab.visual_focus {
-            VisualFocus::Remote { slot_id, .. } => tab
-                .grafts
-                .get(&slot_id)
-                .map(|g| g.client.as_ref())
-                .unwrap_or(tab.client.as_ref()),
-            VisualFocus::Local { .. } => tab.client.as_ref(),
-        }
+        self.active_client()
     }
 
     fn display_snapshot(&mut self) -> (Option<FrameData>, u64) {
-        self.tick_cloud();
-        let tab = &mut self.tabs[self.active];
-        let (mut frame, mut counter) = tab.client.frame_snapshot();
-        if let Some(fd) = frame.as_mut() {
-            let mut grafts = HashMap::new();
-            for (slot_id, graft) in &tab.grafts {
-                let (gframe, gcounter) = graft.client.frame_snapshot();
-                counter = counter.wrapping_add(gcounter);
-                if let Some(gframe) = gframe {
-                    if !gframe.exit {
-                        grafts.insert(*slot_id, gframe);
-                    }
-                }
-            }
-            fd.layout = visual::compose_layout(&fd.layout, &grafts);
-            let focused_remote =
-                matches!(tab.visual_focus, VisualFocus::Remote { .. });
-            let remote_status = match &tab.visual_focus {
-                VisualFocus::Remote { slot_id, .. } => {
-                    grafts.get(slot_id).and_then(|g| g.status.clone())
-                }
-                VisualFocus::Local { .. } => None,
-            };
-            let blob = tab.grafts.values().find_map(|g| g.client.blob_notice());
-            fd.status = visual::merge_status(
-                fd.status.as_ref(),
-                remote_status.as_ref(),
-                focused_remote,
-                blob.as_deref(),
-            );
-            if !tab.grafts.is_empty() {
-                if let Some(status) = fd.status.as_mut() {
-                    if !focused_remote && !status.left.starts_with("[local]") {
-                        status.left = format!("[local] {}", status.left);
-                    }
-                }
-            }
-        }
-        (frame, counter)
-    }
-
-    fn tick_cloud(&mut self) {
-        let tab = &mut self.tabs[self.active];
-        if let Some(fd) = tab.client.latest_frame() {
-            for req in &fd.client_requests {
-                match req {
-                    ClientRequest::DomainAttach {
-                        request_id,
-                        host,
-                        pane_id,
-                    } => {
-                        if tab
-                            .pending_attach
-                            .as_ref()
-                            .is_some_and(|p| p.request_id == *request_id)
-                        {
-                            continue;
-                        }
-                        if tab.grafts.values().any(|g| g.host == *host) {
-                            let ok = crate::domain::attach::DomainBindOk {
-                                request_id: request_id.clone(),
-                                host: host.clone(),
-                                remote_socket: "default".into(),
-                                generation: 1,
-                            };
-                            if let Ok(json) = serde_json::to_string(&ok) {
-                                tab.client.send_control_line(&format!(
-                                    "DOMAIN_BIND_OK {json}"
-                                ));
-                            }
-                            continue;
-                        }
-                        let host_c = host.clone();
-                        tab.pending_attach = Some(PendingAttach {
-                            request_id: request_id.clone(),
-                            host: host.clone(),
-                            pane_id: *pane_id,
-                            rx: spawn_ssh_connect(host_c),
-                            ready: None,
-                        });
-                    }
-                }
-            }
-        }
-        if let Some(mut pending) = tab.pending_attach.take() {
-            let mut aborted = false;
-            if pending.ready.is_none() {
-                match pending.rx.try_recv() {
-                    Ok(Ok(client)) => {
-                        let ok = crate::domain::attach::DomainBindOk {
-                            request_id: pending.request_id.clone(),
-                            host: pending.host.clone(),
-                            remote_socket: "default".into(),
-                            generation: 1,
-                        };
-                        if let Ok(json) = serde_json::to_string(&ok) {
-                            tab.client.send_control_line(&format!(
-                                "DOMAIN_BIND_OK {json}"
-                            ));
-                        }
-                        pending.ready = Some(Box::new(client));
-                    }
-                    Ok(Err(err)) => {
-                        let fail = crate::domain::attach::DomainBindFail {
-                            request_id: pending.request_id.clone(),
-                            error: err,
-                        };
-                        if let Ok(json) = serde_json::to_string(&fail) {
-                            tab.client.send_control_line(&format!(
-                                "DOMAIN_BIND_FAIL {json}"
-                            ));
-                        }
-                        aborted = true;
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {}
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        let fail = crate::domain::attach::DomainBindFail {
-                            request_id: pending.request_id.clone(),
-                            error: "ssh attach thread exited".into(),
-                        };
-                        if let Ok(json) = serde_json::to_string(&fail) {
-                            tab.client.send_control_line(&format!(
-                                "DOMAIN_BIND_FAIL {json}"
-                            ));
-                        }
-                        aborted = true;
-                    }
-                }
-            }
-            if !aborted {
-                if let Some(client) = pending.ready.take() {
-                    if let Some(fd) = tab.client.latest_frame() {
-                        if let Some(slot_id) =
-                            visual::slot_id_for_host(&fd.layout, &pending.host)
-                        {
-                            tab.visual_focus = VisualFocus::Remote {
-                                slot_id,
-                                pane_id: 0,
-                            };
-                            tab.grafts.insert(
-                                slot_id,
-                                Graft {
-                                    host: pending.host.clone(),
-                                    remote_socket: "default".into(),
-                                    client,
-                                    generation: 1,
-                                    last_size: None,
-                                    last_reconnect_at: None,
-                                },
-                            );
-                        } else {
-                            pending.ready = Some(client);
-                            tab.pending_attach = Some(pending);
-                        }
-                    } else {
-                        pending.ready = Some(client);
-                        tab.pending_attach = Some(pending);
-                    }
-                } else {
-                    tab.pending_attach = Some(pending);
-                }
-            }
-        }
-        self.poll_reconnects();
-        self.sync_graft_sizes();
-    }
-
-    fn poll_reconnects(&mut self) {
-        let tab = &mut self.tabs[self.active];
-        let pending_ids: Vec<u64> =
-            tab.pending_reconnect.keys().copied().collect();
-        for slot_id in pending_ids {
-            let Some(pending) = tab.pending_reconnect.remove(&slot_id) else {
-                continue;
-            };
-            match pending.rx.try_recv() {
-                Ok(Ok(client)) => {
-                    if let Some(graft) = tab.grafts.get_mut(&slot_id) {
-                        graft.generation = graft.generation.saturating_add(1);
-                        graft.client = Box::new(client);
-                        graft.last_size = None;
-                        graft.last_reconnect_at = None;
-                        let generation = graft.generation;
-                        send_slot_state(
-                            tab.client.as_ref(),
-                            slot_id,
-                            "bound",
-                            generation,
-                        );
-                    }
-                }
-                Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => {
-                    if let Some(graft) = tab.grafts.get_mut(&slot_id) {
-                        graft.last_reconnect_at = Some(Instant::now());
-                    }
-                }
-                Err(mpsc::TryRecvError::Empty) => {
-                    tab.pending_reconnect.insert(slot_id, pending);
-                }
-            }
-        }
-        let mut start = Vec::new();
-        for (slot_id, graft) in &tab.grafts {
-            if !graft.client.disconnected() {
-                continue;
-            }
-            if tab.pending_reconnect.contains_key(slot_id) {
-                continue;
-            }
-            let due = graft
-                .last_reconnect_at
-                .is_none_or(|at| at.elapsed() >= RECONNECT_BACKOFF);
-            if due {
-                start.push((
-                    *slot_id,
-                    graft.host.clone(),
-                    graft.generation.saturating_add(1),
-                ));
-            }
-        }
-        for (slot_id, host, generation) in start {
-            send_slot_state(
-                tab.client.as_ref(),
-                slot_id,
-                "reconnecting",
-                generation,
-            );
-            tab.pending_reconnect.insert(
-                slot_id,
-                PendingReconnect {
-                    rx: spawn_ssh_connect(host),
-                },
-            );
-        }
-    }
-
-    fn sync_graft_sizes(&mut self) {
-        let tab = &mut self.tabs[self.active];
-        let Some(fd) = tab.client.latest_frame() else {
-            return;
-        };
-        let (cols, rows) = terminal::size().unwrap_or((80, 24));
-        let area = server_layout_area(cols, rows);
-        for (slot_id, graft) in tab.grafts.iter_mut() {
-            let Some(rect) =
-                visual::slot_rect(&fd.layout, area, false, *slot_id)
-            else {
-                continue;
-            };
-            let size = visual::graft_size(rect);
-            if graft.last_size != Some(size) {
-                graft.client.resize(size);
-                graft.last_size = Some(size);
-            }
-        }
+        self.tabs[self.active].client.frame_snapshot()
     }
 
     fn visual_move(&mut self, dir: crate::layout::NavDir, hide_borders: bool) {
@@ -647,48 +293,14 @@ impl TabManager {
             self.apply_visual_target(next);
             return;
         }
-        if matches!(
-            self.tabs[self.active].visual_focus,
-            VisualFocus::Local { .. }
-        ) {
-            let cmd = match dir {
-                crate::layout::NavDir::Left => "select-pane -L",
-                crate::layout::NavDir::Right => "select-pane -R",
-                crate::layout::NavDir::Up => "select-pane -U",
-                crate::layout::NavDir::Down => "select-pane -D",
-            };
-            self.active_client().run_command(cmd);
-            self.invalidate_visual_pane();
-        }
-    }
-
-    fn paint_grafts(&self, hide_borders: bool) -> String {
-        let tab = &self.tabs[self.active];
-        let Some(fd) = tab.client.latest_frame() else {
-            return String::new();
+        let cmd = match dir {
+            crate::layout::NavDir::Left => "select-pane -L",
+            crate::layout::NavDir::Right => "select-pane -R",
+            crate::layout::NavDir::Up => "select-pane -U",
+            crate::layout::NavDir::Down => "select-pane -D",
         };
-        let (cols, rows) = terminal::size().unwrap_or((80, 24));
-        let area = server_layout_area(cols, rows);
-        let mut out = String::new();
-        for (slot_id, graft) in &tab.grafts {
-            let Some(rect) =
-                visual::slot_rect(&fd.layout, area, hide_borders, *slot_id)
-            else {
-                continue;
-            };
-            let Some(gframe) = graft.client.latest_frame() else {
-                continue;
-            };
-            if gframe.exit {
-                continue;
-            }
-            out.push_str(&visual::paint_graft_ansi(
-                &gframe.layout,
-                rect,
-                false,
-            ));
-        }
-        out
+        self.active_client().run_command(cmd);
+        self.invalidate_visual_pane();
     }
 
     fn resize_visual(&self, dir: crate::layout::NavDir) {
@@ -698,23 +310,7 @@ impl TabManager {
             crate::layout::NavDir::Up => "resize-pane -U",
             crate::layout::NavDir::Down => "resize-pane -D",
         };
-        let hits = self.composed_hits(false);
-        let Some(current) = self.current_visual_target(&hits) else {
-            self.active_client().run_command(cmd);
-            return;
-        };
-        match visual::resize_owner(&hits, &current, dir) {
-            visual::ResizeOwner::Remote { slot_id } => {
-                if let Some(graft) = self.tabs[self.active].grafts.get(&slot_id)
-                {
-                    graft.client.run_command(cmd);
-                }
-            }
-            visual::ResizeOwner::Local => {
-                self.active_client().run_command(cmd);
-            }
-            visual::ResizeOwner::None => {}
-        }
+        self.active_client().run_command(cmd);
     }
 
     fn composed_hits(&self, hide_borders: bool) -> Vec<visual::VisualHit> {
@@ -724,16 +320,7 @@ impl TabManager {
         let Some(fd) = tab.client.latest_frame() else {
             return Vec::new();
         };
-        let mut grafts = HashMap::new();
-        for (id, graft) in &tab.grafts {
-            if let Some(frame) = graft.client.latest_frame() {
-                if !frame.exit {
-                    grafts.insert(*id, frame);
-                }
-            }
-        }
-        let composed = visual::compose_layout(&fd.layout, &grafts);
-        visual::collect_visual_hits(&composed, area, hide_borders, None)
+        visual::collect_visual_hits(&fd.layout, area, hide_borders)
     }
 
     fn current_visual_target(
@@ -741,9 +328,6 @@ impl TabManager {
         hits: &[visual::VisualHit],
     ) -> Option<visual::VisualTarget> {
         let stored = match self.tabs[self.active].visual_focus {
-            VisualFocus::Remote { slot_id, pane_id } => {
-                Some(visual::VisualTarget::Remote { slot_id, pane_id })
-            }
             VisualFocus::Local {
                 pane_id: Some(pane_id),
             } => Some(visual::VisualTarget::Local { pane_id }),
@@ -753,17 +337,12 @@ impl TabManager {
     }
 
     fn invalidate_visual_pane(&mut self) {
-        match &mut self.tabs[self.active].visual_focus {
-            VisualFocus::Local { pane_id } => *pane_id = None,
-            VisualFocus::Remote { pane_id, .. } => *pane_id = usize::MAX,
-        }
+        self.tabs[self.active].visual_focus =
+            VisualFocus::Local { pane_id: None };
     }
 
     fn apply_visual_target(&mut self, target: visual::VisualTarget) {
         let tab = &mut self.tabs[self.active];
-        let Some(fd) = tab.client.latest_frame() else {
-            return;
-        };
         match target {
             visual::VisualTarget::Local { pane_id } => {
                 tab.client
@@ -771,33 +350,6 @@ impl TabManager {
                 tab.visual_focus = VisualFocus::Local {
                     pane_id: Some(pane_id),
                 };
-            }
-            visual::VisualTarget::Remote { slot_id, pane_id } => {
-                if let Some(slot_pane) =
-                    visual::external_local_id(&fd.layout, slot_id)
-                {
-                    tab.client
-                        .run_command(&format!("select-pane -t %{slot_pane}"));
-                }
-                if let Some(graft) = tab.grafts.get(&slot_id) {
-                    graft
-                        .client
-                        .run_command(&format!("select-pane -t %{pane_id}"));
-                }
-                tab.visual_focus = VisualFocus::Remote { slot_id, pane_id };
-            }
-            visual::VisualTarget::Placeholder { slot_id } => {
-                if let Some(slot_pane) =
-                    visual::external_local_id(&fd.layout, slot_id)
-                {
-                    tab.client
-                        .run_command(&format!("select-pane -t %{slot_pane}"));
-                    tab.visual_focus = VisualFocus::Local {
-                        pane_id: Some(slot_pane),
-                    };
-                } else {
-                    tab.visual_focus = VisualFocus::Local { pane_id: None };
-                }
             }
         }
     }
@@ -823,20 +375,11 @@ impl TabManager {
     ) {
         let hits = self.composed_hits(hide_borders);
         if let Some(hit) = visual::hit_at(&hits, mouse.column, mouse.row) {
-            let pane_id = match hit.target {
-                visual::VisualTarget::Local { pane_id } => Some(pane_id),
-                visual::VisualTarget::Remote { pane_id, .. } => Some(pane_id),
-                visual::VisualTarget::Placeholder { .. } => None,
-            };
+            let visual::VisualTarget::Local { pane_id } = hit.target;
             let target = hit.target.clone();
             self.apply_visual_target(target);
-            if let Some(pane_id) = pane_id {
-                self.focused_client().scroll_pane(
-                    pane_id,
-                    direction,
-                    SCROLL_LINES,
-                );
-            }
+            self.focused_client()
+                .scroll_pane(pane_id, direction, SCROLL_LINES);
             return;
         }
         if direction == "up" {
@@ -851,11 +394,7 @@ impl TabManager {
         let Some(hit) = visual::hit_at(&hits, mouse.column, mouse.row) else {
             return false;
         };
-        let hide = match hit.target {
-            visual::VisualTarget::Remote { .. } => false,
-            _ => hide_borders,
-        };
-        let inner = visual::content_rect(hit.rect, hide);
+        let inner = visual::content_rect(hit.rect, hide_borders);
         if mouse.column < inner.x
             || mouse.column >= inner.x.saturating_add(inner.width)
             || mouse.row < inner.y
@@ -870,62 +409,12 @@ impl TabManager {
         if bytes.is_empty() {
             return false;
         }
-        match hit.target {
-            visual::VisualTarget::Remote { slot_id, .. } => {
-                if let Some(graft) = self.tabs[self.active].grafts.get(&slot_id)
-                {
-                    graft.client.send_input(&bytes);
-                    true
-                } else {
-                    false
-                }
-            }
-            visual::VisualTarget::Local { .. } => {
-                self.active_client().send_input(&bytes);
-                true
-            }
-            visual::VisualTarget::Placeholder { .. } => false,
-        }
+        self.active_client().send_input(&bytes);
+        true
     }
 
     fn kill_visual_pane(&mut self) {
-        match self.tabs[self.active].visual_focus {
-            VisualFocus::Remote { slot_id, .. } => {
-                let last = self.tabs[self.active]
-                    .grafts
-                    .get(&slot_id)
-                    .and_then(|g| g.client.latest_frame())
-                    .map(|f| visual::leaf_count(&f.layout) <= 1)
-                    .unwrap_or(true);
-                if last {
-                    self.exit_slot(slot_id);
-                } else if let Some(graft) =
-                    self.tabs[self.active].grafts.get(&slot_id)
-                {
-                    graft.client.run_command("kill-pane");
-                }
-            }
-            VisualFocus::Local { .. } => {
-                self.active_client().run_command("kill-pane");
-            }
-        }
-    }
-
-    fn exit_slot(&mut self, slot_id: u64) {
-        let tab = &mut self.tabs[self.active];
-        tab.pending_reconnect.remove(&slot_id);
-        let generation =
-            tab.grafts.get(&slot_id).map(|g| g.generation).unwrap_or(1);
-        tab.grafts.remove(&slot_id);
-        send_slot_state(tab.client.as_ref(), slot_id, "exited", generation);
-        let local_id = tab
-            .client
-            .latest_frame()
-            .and_then(|fd| visual::external_local_id(&fd.layout, slot_id));
-        tab.visual_focus = VisualFocus::Local { pane_id: local_id };
-        if let Some(id) = local_id {
-            tab.client.run_command(&format!("select-pane -t %{id}"));
-        }
+        self.active_client().run_command("kill-pane");
     }
 
     fn active_index(&self) -> usize {
@@ -1054,10 +543,7 @@ impl TabManager {
             title: String::new(),
             socket_name,
             client: Box::new(client),
-            grafts: HashMap::new(),
             visual_focus: VisualFocus::Local { pane_id: None },
-            pending_attach: None,
-            pending_reconnect: HashMap::new(),
         });
         self.active = self.tabs.len() - 1;
         self.persist_active_metadata();
@@ -1194,10 +680,7 @@ impl TabManager {
             title,
             socket_name: socket_name.to_string(),
             client: Box::new(client),
-            grafts: HashMap::new(),
             visual_focus: VisualFocus::Local { pane_id: None },
-            pending_attach: None,
-            pending_reconnect: HashMap::new(),
         });
         self.active = self.tabs.len() - 1;
         Ok(())
@@ -1915,7 +1398,6 @@ impl ClientApp {
             start_dir,
             initial_tab_title,
             attach_all: false,
-            ssh_host: None,
         }
     }
 
@@ -1932,23 +1414,6 @@ impl ClientApp {
             start_dir,
             initial_tab_title: None,
             attach_all: true,
-            ssh_host: None,
-        }
-    }
-
-    pub fn new_ssh(
-        host: String,
-        socket_name: &str,
-        start_dir: Option<String>,
-    ) -> Self {
-        Self {
-            socket_name: socket_name.to_string(),
-            session_name: None,
-            clean: false,
-            start_dir,
-            initial_tab_title: Some(host.clone()),
-            attach_all: false,
-            ssh_host: Some(host),
         }
     }
 
@@ -1962,14 +1427,7 @@ impl ClientApp {
         #[cfg(unix)]
         crate::pty::remember_host_termios();
 
-        let mut tabs = if let Some(host) = &self.ssh_host {
-            TabManager::from_ssh(
-                host,
-                &self.socket_name,
-                size,
-                self.start_dir.clone(),
-            )?
-        } else if self.attach_all {
+        let mut tabs = if self.attach_all {
             let socket_names = discover_all_socket_names(&self.socket_name)?;
             match TabManager::from_existing_sockets(
                 &self.socket_name,
@@ -2217,24 +1675,6 @@ impl ClientApp {
                                                     log_client(&format!(
                                                         "failed to write pane ansi: {err}"
                                                     ));
-                                                }
-                                                let graft_ansi =
-                                                    tabs.paint_grafts(
-                                                        hide_borders,
-                                                    );
-                                                if !graft_ansi.is_empty() {
-                                                    if let Err(err) =
-                                                        terminal
-                                                            .backend_mut()
-                                                            .write_all(
-                                                                graft_ansi
-                                                                    .as_bytes(),
-                                                            )
-                                                    {
-                                                        log_client(&format!(
-                                                            "failed to write graft ansi: {err}"
-                                                        ));
-                                                    }
                                                 }
                                             }
                                             Err(err) => log_client(&format!(
@@ -5115,34 +4555,6 @@ impl ClientApp {
     }
 }
 
-fn spawn_ssh_connect(
-    host: String,
-) -> mpsc::Receiver<Result<crate::domain::cloud::CloudClient, String>> {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let result = crate::domain::connect_ssh(&host, Size::new(24, 80))
-            .map_err(|e| e.to_string());
-        let _ = tx.send(result);
-    });
-    rx
-}
-
-fn send_slot_state(
-    client: &dyn DomainHandle,
-    slot_id: u64,
-    state: &str,
-    generation: u64,
-) {
-    let msg = crate::domain::attach::DomainSlotState {
-        slot_id,
-        state: state.to_string(),
-        generation,
-    };
-    if let Ok(json) = serde_json::to_string(&msg) {
-        client.send_control_line(&format!("DOMAIN_SLOT_STATE {json}"));
-    }
-}
-
 fn server_content_size(cols: u16, rows: u16) -> Size {
     Size::new(rows.saturating_sub(1).max(1), cols.max(1))
 }
@@ -5668,12 +5080,6 @@ fn active_pane_layout_rect(
             area
         }
         LayoutJson::Leaf { .. } => area,
-        LayoutJson::External {
-            graft: Some(g),
-            active: true,
-            ..
-        } => active_pane_layout_rect(g, area, false),
-        LayoutJson::External { .. } => area,
     }
 }
 
@@ -5684,12 +5090,6 @@ fn pane_tree_has_active(layout: &LayoutJson) -> bool {
         LayoutJson::Split { children, .. } => {
             children.iter().any(pane_tree_has_active)
         }
-        LayoutJson::External {
-            graft: Some(g),
-            active: true,
-            ..
-        } => pane_tree_has_active(g),
-        LayoutJson::External { active, .. } => *active,
     }
 }
 
@@ -5772,12 +5172,6 @@ fn find_active_pane_content(
             (Vec::new(), area)
         }
         LayoutJson::Leaf { .. } => (Vec::new(), area),
-        LayoutJson::External {
-            graft: Some(g),
-            active: true,
-            ..
-        } => find_active_pane_content(g, area, false),
-        LayoutJson::External { .. } => (Vec::new(), area),
     }
 }
 
@@ -5823,20 +5217,6 @@ fn find_pane_id_at(
             }
             None
         }
-        LayoutJson::External { graft: Some(g), .. } => {
-            find_pane_id_at(g, area, col, row, hide_borders)
-        }
-        LayoutJson::External { id, .. } => {
-            if col >= area.x
-                && col < area.x + area.width
-                && row >= area.y
-                && row < area.y + area.height
-            {
-                Some(*id)
-            } else {
-                None
-            }
-        }
     }
 }
 
@@ -5849,13 +5229,6 @@ fn active_pane_id(layout: &LayoutJson) -> Option<usize> {
             children.iter().find_map(active_pane_id)
         }
         LayoutJson::Leaf { .. } => None,
-        LayoutJson::External {
-            graft: Some(g),
-            active: true,
-            ..
-        } => active_pane_id(g),
-        LayoutJson::External { id, active, .. } if *active => Some(*id),
-        LayoutJson::External { .. } => None,
     }
 }
 
@@ -6239,24 +5612,6 @@ fn run_client_tab_command(
         }
         "list-tabs" | "lst" => {
             ClientTabCommandResult::Handled(Some(tab_summary(tabs)))
-        }
-        "ssh-attach" | "ssh" => {
-            let host = cmd
-                .args
-                .first()
-                .map(String::as_str)
-                .or_else(|| cmd.flag_value("t"));
-            let Some(host) = host else {
-                return ClientTabCommandResult::Handled(Some(
-                    "usage: ssh-attach <host>".to_string(),
-                ));
-            };
-            match tabs.attach_ssh(host, size) {
-                Ok(message) => ClientTabCommandResult::Handled(Some(message)),
-                Err(e) => ClientTabCommandResult::Handled(Some(format!(
-                    "ssh-attach failed: {e}"
-                ))),
-            }
         }
         "paste-cloud" => match tabs.focused_client().paste_cloud() {
             Ok(message) => ClientTabCommandResult::Handled(Some(message)),
@@ -7456,7 +6811,6 @@ mod tests {
             ansi: None,
             exit: false,
             yank_text: None,
-            client_requests: Vec::new(),
         };
         let (cols, rows) = (101u16, 22u16);
         let layout_area = server_layout_area(cols, rows);
@@ -7784,7 +7138,6 @@ mod tests {
             ansi: None,
             exit: false,
             yank_text: None,
-            client_requests: Vec::new(),
         }
     }
 

@@ -33,7 +33,7 @@ prefix key first, then the action key. Pressing `Ctrl+a` twice sends a literal
 | `Prefix + K` | Completely clear the current pane output history, including copy mode history |
 | `Prefix + b` | Toggle pane borders on or off |
 | `Prefix + H` | Set the current pane's current directory as the working directory for future splits |
-| `Prefix + ]` | Paste clipboard text, image, or files into the focused pane. Uses the OS clipboard when available, otherwise `zsync`. In a remote pane, files are uploaded to `~/.zmux/drop/` and the remote paths are pasted |
+| `Prefix + ]` | Paste clipboard text, image, or files into the focused pane. Uses the OS clipboard when available, otherwise `zsync` |
 | `Prefix + h` | Move focus to the pane on the left, in Vim style |
 | `Prefix + j` | Move focus to the pane below, in Vim style |
 | `Prefix + k` | Move focus to the pane above, in Vim style |
@@ -100,7 +100,6 @@ Each tab is backed by an independent server. Sessions, windows, and panes are is
 | `zmux server` | Start the server in daemon mode. This is usually invoked automatically by zmux and does not need to be run manually |
 | `zmux kill-server [SOCKET]...` | Stop one or more background servers. Without arguments it stops the current `-L` socket |
 | `zmux kill-server --all` | Stop all discoverable background servers |
-| `zmux ssh <host>` | Attach a remote zmux over SSH. Inside a pane this replaces that pane with the remote window; outside zmux it opens a dedicated client tab |
 
 #### Commands supported in command mode (`Prefix + :`)
 
@@ -128,17 +127,6 @@ Each tab is backed by an independent server. Sessions, windows, and panes are is
 | `show-options` | Show the current server options |
 | `set-pane-start-dir` | Save the current pane's current directory as the working directory for future splits |
 | `paste-cloud` | Same as `Prefix + ]`: paste clipboard contents into the focused pane |
-
----
-
-### Remote Domain (`zmux ssh`)
-
-`zmux ssh linux` attaches the remote zmux on that SSH host as a first-class pane, not a nested TUI. Prefix stays on the local client.
-
-- Inside an existing pane: the current leaf becomes a remote slot after SSH and the first frame succeed. Failure keeps the original local shell.
-- Split (`Prefix + %` / `"`) and window commands follow the focused pane's machine. `Prefix + h/j/k/l` moves across local and remote panes.
-- File and image paste uses `Prefix + ]` (not Cmd+V). Remote files land in `~/.zmux/drop/` on the SSH host. Text paste on a headless remote uses zsync when the OS clipboard is empty.
-- Optional host settings live in `~/.config/zmux/ssh.toml`. Do not nest `ssh` + `zmux a` inside a pane.
 
 ---
 

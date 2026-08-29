@@ -1,6 +1,5 @@
 use crate::{
     client::{socket::SocketClient, FrameData},
-    domain::cloud::CloudClient,
     server::SessionTreeEntry,
     types::{session::Size, SelectionMode},
 };
@@ -48,15 +47,9 @@ pub trait DomainHandle: Send {
     fn copy_search_next(&self) -> bool;
     fn copy_search_prev(&self) -> bool;
     fn copy_yank_selection(&self) -> String;
-    fn domain_label(&self) -> &str;
-    fn has_blob(&self) -> bool;
     fn paste_cloud(&self) -> Result<String, String>;
-    fn send_control_line(&self, _line: &str) {}
     fn disconnected(&self) -> bool {
         self.latest_frame().is_some_and(|f| f.exit)
-    }
-    fn blob_notice(&self) -> Option<String> {
-        None
     }
 }
 
@@ -195,48 +188,8 @@ impl DomainHandle for SocketClient {
         self.send_input(text.as_bytes());
     }
 
-    fn domain_label(&self) -> &str {
-        "local"
-    }
-
-    fn has_blob(&self) -> bool {
-        false
-    }
-
     fn paste_cloud(&self) -> Result<String, String> {
         local_paste_cloud(|text| self.send_input(text.as_bytes()))
-    }
-
-    fn send_control_line(&self, line: &str) {
-        let _ = self.send_line(line);
-    }
-}
-
-impl DomainHandle for CloudClient {
-    impl_common_handle!(CloudClient);
-
-    fn send_paste(&self, text: &str) {
-        Self::send_paste(self, text);
-    }
-
-    fn domain_label(&self) -> &str {
-        Self::domain_label(self)
-    }
-
-    fn has_blob(&self) -> bool {
-        Self::has_blob(self)
-    }
-
-    fn paste_cloud(&self) -> Result<String, String> {
-        Self::paste_cloud(self)
-    }
-
-    fn disconnected(&self) -> bool {
-        Self::disconnected(self)
-    }
-
-    fn blob_notice(&self) -> Option<String> {
-        Self::blob_notice(self)
     }
 }
 
