@@ -214,25 +214,6 @@ pub struct Server {
     pub force_clear_display: bool,
     pub instance_id: String,
     pub socket_name: Option<String>,
-    pub next_slot_id: u64,
-    pub pending_domain_attach: Option<PendingDomainAttach>,
-    pub paste_cloud_mode: PasteCloudMode,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PasteCloudMode {
-    ShellPaths,
-    RawPaths,
-}
-
-pub struct PendingDomainAttach {
-    pub request_id: String,
-    pub host: String,
-    pub pane_id: usize,
-    pub waiter: std::sync::Arc<(
-        std::sync::Mutex<Option<Result<String, String>>>,
-        std::sync::Condvar,
-    )>,
 }
 
 impl Server {
@@ -250,9 +231,6 @@ impl Server {
             force_clear_display: false,
             instance_id: crate::domain::ids::new_instance_id(),
             socket_name: None,
-            next_slot_id: 1,
-            pending_domain_attach: None,
-            paste_cloud_mode: PasteCloudMode::ShellPaths,
         }
     }
 

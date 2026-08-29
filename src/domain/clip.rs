@@ -1,7 +1,6 @@
 use std::{
-    fs::File,
     io::{Read, Write},
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -17,13 +16,6 @@ pub enum ClipboardItem {
     Text(String),
     ImagePng { bytes: Vec<u8>, name: String },
     Files(Vec<PathBuf>),
-}
-
-#[derive(Debug, Clone)]
-pub struct PasteTarget {
-    pub pane_id: usize,
-    pub generation: u64,
-    pub remote: bool,
 }
 
 pub fn read_os_clipboard() -> Result<ClipboardItem, String> {
@@ -342,27 +334,6 @@ pub fn validate_or_text(item: &ClipboardItem, raw: bool) -> Result<(), String> {
         validate_paste_text(text, raw)?;
     }
     Ok(())
-}
-
-pub fn stream_file_chunks(
-    path: &Path,
-    mut on_chunk: impl FnMut(&[u8]) -> Result<(), String>,
-) -> Result<u64, String> {
-    let mut file = File::open(path).map_err(|e| e.to_string())?;
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut total = 0u64;
-    loop {
-        let n = file.read(&mut buf).map_err(|e| e.to_string())?;
-        if n == 0 {
-            break;
-        }
-        total += n as u64;
-        if total > drop::MAX_FILE_BYTES {
-            return Err("file exceeds 64MiB limit".into());
-        }
-        on_chunk(&buf[..n])?;
-    }
-    Ok(total)
 }
 
 pub fn save_local_image(bytes: &[u8]) -> Result<PathBuf, String> {

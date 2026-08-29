@@ -1,4 +1,4 @@
-use crate::types::{LayoutNode, Pane, SplitDirection};
+use crate::types::{LayoutNode, SplitDirection};
 
 pub fn layout_checksum(s: &str) -> u16 {
     let mut csum: u16 = 0;
@@ -32,9 +32,6 @@ fn write_layout_node(
     match node {
         LayoutNode::Leaf(p) => {
             let _ = write!(out, "{}x{},{},{},{}", width, height, x, y, p.id);
-        }
-        LayoutNode::External(slot) => {
-            let _ = write!(out, "{}x{},{},{},{}", width, height, x, y, slot.id);
         }
         LayoutNode::Split {
             direction,

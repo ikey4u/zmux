@@ -82,7 +82,6 @@ pub fn spawn_pane(opts: SpawnOptions<'_>) -> io::Result<Pane> {
     cmd.env("COLORTERM", "truecolor");
     cmd.env("ZMUX", "1");
     cmd.env("ZMUX_PANE", format!("%{}", opts.pane_id));
-    cmd.env("ZMUX_SLOT", format!("{}", opts.pane_id));
     if let Some(socket) = opts.zmux_socket {
         cmd.env("ZMUX_SOCKET", socket);
     }
