@@ -3269,23 +3269,10 @@ impl ClientApp {
                                                 let copy_result =
                                                     copy_to_clipboard(&text);
                                                 status_notice = Some((
-                                                    match copy_result {
-                                                        ClipboardCopyResult::System => format!(
-                                                            "copied {} chars",
-                                                            text.chars()
-                                                                .count()
-                                                        ),
-                                                        ClipboardCopyResult::Osc52 => format!(
-                                                            "sent {} chars via OSC 52",
-                                                            text.chars()
-                                                                .count()
-                                                        ),
-                                                        ClipboardCopyResult::Unavailable => format!(
-                                                            "yanked {} chars",
-                                                            text.chars()
-                                                                .count()
-                                                        ),
-                                                    },
+                                                    clipboard_copy_notice(
+                                                        copy_result,
+                                                        &text,
+                                                    ),
                                                     Instant::now()
                                                         + Duration::from_secs(
                                                             3,
@@ -5397,18 +5384,7 @@ fn copy_text_and_notify(
     }
     let result = copy_to_clipboard(text);
     *status_notice = Some((
-        match result {
-            ClipboardCopyResult::System => {
-                format!("copied {} chars", text.chars().count())
-            }
-            ClipboardCopyResult::Osc52 => {
-                format!("sent {} chars via OSC 52", text.chars().count())
-            }
-            ClipboardCopyResult::Unavailable => format!(
-                "yanked {} chars (clipboard unavailable)",
-                text.chars().count()
-            ),
-        },
+        clipboard_copy_notice(result, text),
         Instant::now() + Duration::from_secs(3),
     ));
     *last_drawn_counter = 0;
@@ -6385,29 +6361,46 @@ fn should_write_server_ansi(_has_overlay: bool, _has_prompt: bool) -> bool {
 }
 
 enum ClipboardCopyResult {
+    Zsync,
     System,
     Osc52,
     Unavailable,
+}
+
+fn clipboard_copy_notice(result: ClipboardCopyResult, text: &str) -> String {
+    let n = text.chars().count();
+    match result {
+        ClipboardCopyResult::Zsync => {
+            format!("copied {n} chars via zsync")
+        }
+        ClipboardCopyResult::System => format!("copied {n} chars"),
+        ClipboardCopyResult::Osc52 => {
+            format!("sent {n} chars via OSC 52")
+        }
+        ClipboardCopyResult::Unavailable => {
+            format!("yanked {n} chars (clipboard unavailable)")
+        }
+    }
 }
 
 fn copy_to_clipboard(text: &str) -> ClipboardCopyResult {
     if text.is_empty() {
         return ClipboardCopyResult::Unavailable;
     }
-    if should_prefer_osc52() {
-        if copy_to_clipboard_via_osc52(text).is_ok() {
-            return ClipboardCopyResult::Osc52;
-        }
-        if copy_to_clipboard_via_arboard(text) {
-            return ClipboardCopyResult::System;
-        }
+    let zsync = crate::domain::clip::copy_via_zsync(text);
+    let system = if should_prefer_osc52() {
+        false
     } else {
-        if copy_to_clipboard_via_arboard(text) {
-            return ClipboardCopyResult::System;
-        }
-        if copy_to_clipboard_via_osc52(text).is_ok() {
-            return ClipboardCopyResult::Osc52;
-        }
+        copy_to_clipboard_via_arboard(text)
+    };
+    if system {
+        return ClipboardCopyResult::System;
+    }
+    if zsync {
+        return ClipboardCopyResult::Zsync;
+    }
+    if copy_to_clipboard_via_osc52(text).is_ok() {
+        return ClipboardCopyResult::Osc52;
     }
     ClipboardCopyResult::Unavailable
 }
@@ -7355,6 +7348,18 @@ mod tests {
     fn build_osc52_sequence_base64_encodes_utf8_text() {
         assert_eq!(build_osc52_sequence("hello"), "\x1b]52;c;aGVsbG8=\x07");
         assert_eq!(build_osc52_sequence("中"), "\x1b]52;c;5Lit\x07");
+    }
+
+    #[test]
+    fn clipboard_copy_notice_labels_zsync() {
+        assert_eq!(
+            clipboard_copy_notice(ClipboardCopyResult::Zsync, "ab"),
+            "copied 2 chars via zsync"
+        );
+        assert_eq!(
+            clipboard_copy_notice(ClipboardCopyResult::System, "ab"),
+            "copied 2 chars"
+        );
     }
 
     #[test]
