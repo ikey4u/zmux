@@ -26,7 +26,7 @@ fn main() {
         std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".into());
 
     let mut version = pkg_version.clone();
-    if let Some(commit) = git_output(&["rev-parse", "--short", "HEAD"]) {
+    if let Some(commit) = git_output(&["log", "-1", "--format=%h"]) {
         version = format!("{pkg_version}-{commit}");
         if git_dirty() {
             version.push_str("+dirty");
@@ -34,10 +34,4 @@ fn main() {
     }
 
     println!("cargo:rustc-env=ZMUX_VERSION={version}");
-    println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=.git/index");
-    println!("cargo:rerun-if-changed=src");
-    println!("cargo:rerun-if-changed=Cargo.toml");
-    println!("cargo:rerun-if-changed=Cargo.lock");
 }

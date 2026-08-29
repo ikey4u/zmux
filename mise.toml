@@ -40,5 +40,5 @@ env = { CARGO_HOME_DIR = "/tmp/zmux-cargo", CARGO_TARGET_DIR = "/tmp/zmux-target
 run = "bash scripts/release.sh"
 
 [tasks."release:clean"]
-description = "Remove release zip artifacts"
-run = "rm -rf {{vars.dist_dir}}"
+description = "Remove release zip artifacts and the isolated cargo target cache"
+run = "rm -rf {{vars.dist_dir}} /tmp/zmux-target"
