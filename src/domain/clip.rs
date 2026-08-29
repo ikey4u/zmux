@@ -1,7 +1,10 @@
 use std::{
     fs::File,
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use crate::domain::{drop, paste::validate_paste_text, quote::posix_quote};
@@ -33,23 +36,143 @@ pub fn read_os_clipboard() -> Result<ClipboardItem, String> {
         }
         return Ok(ClipboardItem::Files(files));
     }
-    let mut clipboard =
-        arboard::Clipboard::new().map_err(|err| err.to_string())?;
-    if let Ok(text) = clipboard.get_text() {
-        if looks_like_uri_list(&text) {
-            let files = parse_uri_list(&text)?;
-            if !files.is_empty() {
-                return Ok(ClipboardItem::Files(files));
+    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+        if let Ok(text) = clipboard.get_text() {
+            if let Some(item) = clipboard_item_from_text(&text)? {
+                return Ok(item);
             }
         }
-        if !text.is_empty() {
-            return Ok(ClipboardItem::Text(text));
+        if let Ok(image) = clipboard.get_image() {
+            return encode_clipboard_image(image);
         }
     }
-    if let Ok(image) = clipboard.get_image() {
-        return encode_clipboard_image(image);
+    if let Some(text) = read_zsync_text() {
+        if let Some(item) = clipboard_item_from_text(&text)? {
+            return Ok(item);
+        }
     }
     Err("clipboard is empty or unsupported".into())
+}
+
+fn clipboard_item_from_text(
+    text: &str,
+) -> Result<Option<ClipboardItem>, String> {
+    if looks_like_uri_list(text) {
+        let files = parse_uri_list(text)?;
+        if !files.is_empty() {
+            return Ok(Some(ClipboardItem::Files(files)));
+        }
+    }
+    if text.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(ClipboardItem::Text(text.to_string())))
+    }
+}
+
+const ZSYNC_TIMEOUT: Duration = Duration::from_millis(1500);
+
+fn zsync_command() -> Command {
+    Command::new(zsync_bin())
+}
+
+fn zsync_bin() -> PathBuf {
+    extra_zsync_dirs()
+        .into_iter()
+        .map(|dir| dir.join("zsync"))
+        .chain(path_lookup("zsync"))
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| PathBuf::from("zsync"))
+}
+
+fn extra_zsync_dirs() -> Vec<PathBuf> {
+    let Some(home) = crate::config::home_dir() else {
+        return Vec::new();
+    };
+    vec![
+        home.join(".local").join("bin"),
+        home.join(".cargo").join("bin"),
+    ]
+}
+
+fn path_lookup(name: &str) -> impl Iterator<Item = PathBuf> {
+    let paths = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&paths)
+        .map(move |dir| dir.join(name))
+        .collect::<Vec<_>>()
+        .into_iter()
+}
+
+/// Copy text through zsync so a headless remote does not depend on OSC 52 / X11.
+pub fn copy_via_zsync(text: &str) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    let mut cmd = zsync_command();
+    cmd.arg("c")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    hide_windows_console(&mut cmd);
+    let Ok(mut child) = cmd.spawn() else {
+        return false;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        if stdin.write_all(text.as_bytes()).is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return false;
+        }
+    }
+    wait_child(&mut child, ZSYNC_TIMEOUT)
+}
+
+pub fn read_zsync_text() -> Option<String> {
+    let mut cmd = zsync_command();
+    cmd.args(["p", "--content"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    hide_windows_console(&mut cmd);
+    let mut child = cmd.spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+    if !wait_child(&mut child, ZSYNC_TIMEOUT) {
+        return None;
+    }
+    let mut buf = Vec::new();
+    stdout.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8(buf).ok()?;
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn hide_windows_console(cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let _ = cmd;
+}
+
+fn wait_child(child: &mut std::process::Child, timeout: Duration) -> bool {
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if start.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(15)),
+            Err(_) => return false,
+        }
+    }
 }
 
 fn looks_like_uri_list(text: &str) -> bool {
@@ -263,5 +386,32 @@ mod tests {
     fn raw_paths_are_newline_separated() {
         let raw = quote_paths(&["/a b".into(), "/c".into()], true).unwrap();
         assert_eq!(raw, "/a b\n/c");
+    }
+
+    #[test]
+    fn extra_zsync_dirs_live_under_home() {
+        let dirs = extra_zsync_dirs();
+        if crate::config::home_dir().is_some() {
+            assert!(dirs.iter().any(
+                |d| d.ends_with(std::path::Path::new(".local").join("bin"))
+            ));
+            assert!(dirs.iter().any(
+                |d| d.ends_with(std::path::Path::new(".cargo").join("bin"))
+            ));
+        }
+    }
+
+    #[test]
+    fn clipboard_item_from_text_reads_plain_and_uri_list() {
+        let item = clipboard_item_from_text("hello").unwrap().unwrap();
+        assert!(matches!(item, ClipboardItem::Text(t) if t == "hello"));
+        let item = clipboard_item_from_text("file:///tmp/a\n/tmp/b")
+            .unwrap()
+            .unwrap();
+        let ClipboardItem::Files(files) = item else {
+            panic!("expected files");
+        };
+        assert_eq!(files.len(), 2);
+        assert!(clipboard_item_from_text("").unwrap().is_none());
     }
 }

@@ -68,6 +68,11 @@ impl Osc52Tracker {
             let payload = &bytes[payload_start..payload_end];
             if is_valid_osc52_payload(payload) {
                 enqueue(queue, bytes[start..sequence_end].to_vec());
+                if let Some(text) = osc52_clipboard_text(payload) {
+                    std::thread::spawn(move || {
+                        let _ = crate::domain::clip::copy_via_zsync(&text);
+                    });
+                }
             }
             i = sequence_end;
         }
@@ -97,6 +102,21 @@ fn is_valid_osc52_payload(payload: &[u8]) -> bool {
         && encoded.iter().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(*byte, b'+' | b'/' | b'=')
         })
+}
+
+fn osc52_clipboard_text(payload: &[u8]) -> Option<String> {
+    let rest = payload.strip_prefix(b"52;")?;
+    let separator = rest.iter().position(|&byte| byte == b';')?;
+    let encoded = &rest[separator + 1..];
+    if encoded.is_empty() {
+        return None;
+    }
+    let bytes = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        encoded,
+    )
+    .ok()?;
+    String::from_utf8(bytes).ok().filter(|s| !s.is_empty())
 }
 
 fn enqueue(queue: &Arc<Mutex<VecDeque<Vec<u8>>>>, sequence: Vec<u8>) {
@@ -140,5 +160,14 @@ mod tests {
         tracker.process(b"\x1b]52;c;not valid!\x07", &queue);
 
         assert!(queue.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn decodes_base64_clipboard_text() {
+        assert_eq!(
+            osc52_clipboard_text(b"52;c;aGVsbG8=").as_deref(),
+            Some("hello")
+        );
+        assert_eq!(osc52_clipboard_text(b"52;c;"), None);
     }
 }
