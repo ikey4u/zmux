@@ -306,6 +306,9 @@ need_cmd zig "mise release installs zig via task tools"
 need_cmd cargo-zigbuild "mise release installs cargo-zigbuild via task tools"
 need_cmd zip
 
+echo "==> clean cargo target cache ${CARGO_TARGET_DIR}"
+rm -rf "${CARGO_TARGET_DIR}"
+
 export_build_env
 if ! cargo fetch -q; then
   echo "repairing broken registry in $CARGO_HOME_DIR" >&2
