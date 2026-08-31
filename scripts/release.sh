@@ -107,17 +107,12 @@ build_remap_flags() {
 }
 
 export_build_env() {
-  local extra="${1:-}"
   mkdir -p "$CARGO_HOME_DIR" "$CARGO_TARGET_DIR"
   export CARGO_HOME="$CARGO_HOME_DIR"
   export CARGO_TARGET_DIR
   local remap
   remap="$(build_remap_flags)"
-  if [[ -n "$extra" ]]; then
-    export RUSTFLAGS="${remap} ${extra}"
-  else
-    export RUSTFLAGS="${remap}"
-  fi
+  export RUSTFLAGS="${remap}"
 }
 
 use_native() {
@@ -246,7 +241,7 @@ build_one() {
   local triple="$1"
   local os_name="$2"
   local arch_name="$3"
-  local bin extra=""
+  local bin
 
   ensure_target "${triple}" || return 1
 
@@ -263,15 +258,8 @@ build_one() {
       echo "warning: SDKROOT unset; skipping ${os_name}-${arch_name}" >&2
       return 1
     fi
-    extra=""
-    if [[ "${os_name}" == "windows" && -n "${MINGW_DLLTOOL:-}" ]] \
-      && command -v "${MINGW_DLLTOOL}" >/dev/null 2>&1; then
-      extra="-C dlltool=${MINGW_DLLTOOL}"
-      export "CC_x86_64_pc_windows_gnu=${MINGW_CC:-x86_64-w64-mingw32-gcc}"
-      export "AR_x86_64_pc_windows_gnu=${MINGW_AR:-x86_64-w64-mingw32-ar}"
-    fi
     echo "==> cargo zigbuild --release --target ${zig_target}"
-    export_build_env "${extra}"
+    export_build_env
     cargo zigbuild --release --target "${zig_target}" || return 1
   fi
 
