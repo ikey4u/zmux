@@ -1977,6 +1977,18 @@ impl ClientApp {
                                 InputMode::Normal => {
                                     if (key.code, key.modifiers) == prefix_key {
                                         mode = InputMode::Prefix;
+                                    } else if key.kind == KeyEventKind::Press
+                                        && is_cloud_paste_key(key)
+                                    {
+                                        let message = tabs
+                                            .focused_client()
+                                            .paste_cloud()
+                                            .unwrap_or_else(|e| e);
+                                        status_notice = Some((
+                                            message,
+                                            Instant::now()
+                                                + Duration::from_secs(3),
+                                        ));
                                     } else if matches!(
                                         (key.code, key.modifiers),
                                         (KeyCode::Esc, _)
@@ -5742,17 +5754,11 @@ fn copy_to_clipboard(text: &str) -> ClipboardCopyResult {
     if text.is_empty() {
         return ClipboardCopyResult::Unavailable;
     }
-    let zsync = crate::domain::clip::copy_via_zsync(text);
-    let system = if should_prefer_osc52() {
-        false
-    } else {
-        copy_to_clipboard_via_arboard(text)
-    };
-    if system {
-        return ClipboardCopyResult::System;
-    }
-    if zsync {
+    if crate::domain::clip::copy_via_zsync(text) {
         return ClipboardCopyResult::Zsync;
+    }
+    if copy_to_clipboard_via_arboard(text) {
+        return ClipboardCopyResult::System;
     }
     if copy_to_clipboard_via_osc52(text).is_ok() {
         return ClipboardCopyResult::Osc52;
@@ -5777,14 +5783,12 @@ fn build_osc52_sequence(text: &str) -> String {
     format!("\x1b]52;c;{}\x07", STANDARD.encode(text.as_bytes()))
 }
 
-fn should_prefer_osc52() -> bool {
-    has_ssh_environment(|key| std::env::var(key).ok())
-}
-
-fn has_ssh_environment(lookup: impl Fn(&str) -> Option<String>) -> bool {
-    ["SSH_TTY", "SSH_CONNECTION", "SSH_CLIENT"]
-        .into_iter()
-        .any(|key| lookup(key).is_some_and(|value| !value.is_empty()))
+fn is_cloud_paste_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'))
+        && key.modifiers.contains(KeyModifiers::SUPER)
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
 }
 
 fn is_copy_plain_key(modifiers: KeyModifiers) -> bool {
@@ -6715,15 +6719,30 @@ mod tests {
             clipboard_copy_notice(ClipboardCopyResult::System, "ab"),
             "copied 2 chars"
         );
+        assert_eq!(
+            clipboard_copy_notice(ClipboardCopyResult::Osc52, "ab"),
+            "sent 2 chars via OSC 52"
+        );
     }
 
     #[test]
-    fn has_ssh_environment_detects_known_ssh_variables() {
-        assert!(has_ssh_environment(|key| match key {
-            "SSH_CONNECTION" => Some("1 2 3 4".to_string()),
-            _ => None,
-        }));
-        assert!(!has_ssh_environment(|_| None));
+    fn command_v_is_reserved_for_synced_clipboard_paste() {
+        assert!(is_cloud_paste_key(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::SUPER,
+        )));
+        assert!(is_cloud_paste_key(KeyEvent::new(
+            KeyCode::Char('V'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        )));
+        assert!(!is_cloud_paste_key(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(!is_cloud_paste_key(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::NONE,
+        )));
     }
 
     #[test]
