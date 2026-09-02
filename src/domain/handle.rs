@@ -217,7 +217,7 @@ fn local_paste_cloud(send_text: impl FnOnce(&str)) -> Result<String, String> {
                 .collect();
             let quoted = crate::domain::clip::quote_paths(&paths, false)?;
             send_text(&quoted);
-            Ok(format!("pasted {} local path(s)", paths.len()))
+            Ok(format!("pasted {} path(s)", paths.len()))
         }
     }
 }

@@ -1,6 +1,7 @@
 use std::{
+    fs,
     io::{Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -10,6 +11,7 @@ use crate::domain::{drop, paste::validate_paste_text, quote::posix_quote};
 
 pub const MAX_IMAGE_SIDE: u32 = 8192;
 pub const MAX_IMAGE_PIXELS: u64 = 16_000_000;
+const MAX_ZSYNC_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub enum ClipboardItem {
@@ -38,12 +40,12 @@ pub fn read_os_clipboard() -> Result<ClipboardItem, String> {
             return encode_clipboard_image(image);
         }
     }
-    if let Some(text) = read_zsync_text() {
-        if let Some(item) = clipboard_item_from_text(&text)? {
-            return Ok(item);
+    match read_zsync_clipboard() {
+        Ok(item) => return Ok(item),
+        Err(error) => {
+            return Err(format!("clipboard is unavailable: {error}"));
         }
     }
-    Err("clipboard is empty or unsupported".into())
 }
 
 fn clipboard_item_from_text(
@@ -119,25 +121,109 @@ pub fn copy_via_zsync(text: &str) -> bool {
     wait_child(&mut child, ZSYNC_TIMEOUT)
 }
 
-pub fn read_zsync_text() -> Option<String> {
+/// Read the synchronized clipboard on this host.
+///
+/// Plain `zsync p` deliberately has two output modes: text is written to
+/// stdout, while images/files are materialized in the current directory and
+/// their absolute paths are written to stdout. Running it in zmux's private
+/// drop directory gives the focused Linux pane a path that is valid on the
+/// Linux host instead of a path from the desktop that originated the copy.
+pub fn read_zsync_clipboard() -> Result<ClipboardItem, String> {
+    let drop_dir = drop::ensure_drop_dir().map_err(|e| e.to_string())?;
+    drop::gc_expired(&drop_dir).map_err(|e| e.to_string())?;
+
     let mut cmd = zsync_command();
-    cmd.args(["p", "--content"])
+    cmd.arg("p")
+        .current_dir(&drop_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     hide_windows_console(&mut cmd);
-    let mut child = cmd.spawn().ok()?;
-    let mut stdout = child.stdout.take()?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to run zsync paste: {e}"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "failed to capture zsync paste output".to_string())?;
+
+    // Drain stdout while the child is running. Waiting first can deadlock when
+    // a large text clipboard fills the OS pipe buffer.
+    let reader = thread::spawn(move || {
+        let mut buf = Vec::new();
+        stdout
+            .by_ref()
+            .take(MAX_ZSYNC_OUTPUT_BYTES + 1)
+            .read_to_end(&mut buf)
+            .map(|_| buf)
+    });
     if !wait_child(&mut child, ZSYNC_TIMEOUT) {
-        return None;
+        let _ = reader.join();
+        return Err("zsync paste timed out or failed".into());
     }
-    let mut buf = Vec::new();
-    stdout.read_to_end(&mut buf).ok()?;
-    let text = String::from_utf8(buf).ok()?;
+    let buf = reader
+        .join()
+        .map_err(|_| "zsync paste output reader failed".to_string())?
+        .map_err(|e| format!("failed to read zsync paste output: {e}"))?;
+    if buf.len() as u64 > MAX_ZSYNC_OUTPUT_BYTES {
+        return Err("zsync clipboard text exceeds 10MiB".into());
+    }
+    let text = String::from_utf8(buf)
+        .map_err(|_| "zsync paste returned invalid UTF-8".to_string())?;
     if text.is_empty() {
-        None
+        return Err("zsync clipboard is empty".into());
+    }
+
+    zsync_item_from_output(&text, &drop_dir)
+}
+
+fn zsync_item_from_output(
+    output: &str,
+    drop_dir: &Path,
+) -> Result<ClipboardItem, String> {
+    if let Some(paths) = zsync_output_paths(output, drop_dir)? {
+        return Ok(ClipboardItem::Files(paths));
+    }
+    Ok(ClipboardItem::Text(output.to_string()))
+}
+
+fn zsync_output_paths(
+    output: &str,
+    drop_dir: &Path,
+) -> Result<Option<Vec<PathBuf>>, String> {
+    let canonical_drop = fs::canonicalize(drop_dir)
+        .map_err(|e| format!("failed to resolve zmux drop directory: {e}"))?;
+    let mut paths = Vec::new();
+    for line in output.lines() {
+        if line.is_empty() || !Path::new(line).is_absolute() {
+            return Ok(None);
+        }
+        let Ok(path) = fs::canonicalize(line) else {
+            // Absolute clipboard text is still text unless it names a file
+            // that zsync just created inside the private drop directory.
+            return Ok(None);
+        };
+        if !path.starts_with(&canonical_drop) {
+            return Ok(None);
+        }
+        let metadata = fs::symlink_metadata(&path).map_err(|e| {
+            format!("failed to inspect synced clipboard file: {e}")
+        })?;
+        if !metadata.file_type().is_file() {
+            return Err("zsync paste returned a non-regular file".into());
+        }
+        if metadata.len() > drop::MAX_FILE_BYTES {
+            return Err("synced clipboard file exceeds 64MiB".into());
+        }
+        paths.push(path);
+        if paths.len() > drop::MAX_FILES {
+            return Err("zsync clipboard has too many files (max 128)".into());
+        }
+    }
+    if paths.is_empty() {
+        Ok(None)
     } else {
-        Some(text)
+        Ok(Some(paths))
     }
 }
 
@@ -384,5 +470,31 @@ mod tests {
         };
         assert_eq!(files.len(), 2);
         assert!(clipboard_item_from_text("").unwrap().is_none());
+    }
+
+    #[test]
+    fn zsync_output_only_becomes_paths_inside_drop_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "zmux-zsync-test-{}",
+            crate::domain::ids::new_instance_id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let image = dir.join("clipboard image.png");
+        fs::write(&image, b"png").unwrap();
+
+        let output = format!("{}\n", image.display());
+        let item = zsync_item_from_output(&output, &dir).unwrap();
+        let ClipboardItem::Files(paths) = item else {
+            panic!("expected synced file paths");
+        };
+        assert_eq!(paths, vec![fs::canonicalize(&image).unwrap()]);
+
+        let item = zsync_item_from_output("/not/a/synced/file", &dir).unwrap();
+        assert!(
+            matches!(item, ClipboardItem::Text(text) if text == "/not/a/synced/file")
+        );
+
+        fs::remove_file(image).unwrap();
+        fs::remove_dir(dir).unwrap();
     }
 }

@@ -34,6 +34,7 @@ prefix key first, then the action key. Pressing `Ctrl+a` twice sends a literal
 | `Prefix + b` | Toggle pane borders on or off |
 | `Prefix + H` | Set the current pane's current directory as the working directory for future splits |
 | `Prefix + ]` | Paste clipboard text, image, or files into the focused pane. Uses the OS clipboard when available, otherwise `zsync` |
+| `Cmd+V` / `Super+V` | Paste through the same clipboard path when the terminal forwards the key to zmux (see Remote Clipboard below) |
 | `Prefix + h` | Move focus to the pane on the left, in Vim style |
 | `Prefix + j` | Move focus to the pane below, in Vim style |
 | `Prefix + k` | Move focus to the pane above, in Vim style |
@@ -196,8 +197,40 @@ A headless Linux host has no OS clipboard. zmux uses [zsync](https://github.com/
 On both machines, run `zsync daemon`, then pair once (`zsync pair` on one side, `zsync connect <ticket>` on the other). After that:
 
 - Copy mode `y` / `Enter` writes into zsync (and into the local OS clipboard when one exists). Over a nested SSH session without a display, this is the path that reaches the laptop.
-- `Prefix + ]` reads the OS clipboard first; if that is empty (typical on the server), it falls back to `zsync p --content`.
+- `Prefix + ]` reads the OS clipboard first; if that is empty (typical on the server), it runs `zsync p` in `~/.zmux/drop`.
+- Synced text is pasted as text. For a synced image or file, zsync materializes the bytes under `~/.zmux/drop` and zmux pastes its shell-quoted, absolute Linux path. The private drop directory is also covered by zmux's 24-hour/1-GiB cleanup policy.
+- `Cmd+V` / `Super+V` invokes the same operation when the terminal forwards that key to zmux using the enhanced keyboard protocol. `Prefix + ]` remains the terminal-independent fallback.
 - Programs in a pane that emit OSC 52 (for example Neovim's osc52 provider) are still relayed to the attached terminal, and the decoded text is also copied into zsync.
+
+macOS terminal applications normally reserve `Cmd+V` for their own text paste
+action. That action cannot represent an image on the terminal byte stream, so
+the remote TUI never sees a key or a paste event. Override the terminal binding
+to forward `Cmd+V` to zmux instead. For example:
+
+WezTerm (`~/.wezterm.lua`, merge the entry into your existing `config.keys`):
+
+```lua
+local wezterm = require 'wezterm'
+local act = wezterm.action
+
+config.keys = config.keys or {}
+table.insert(config.keys, {
+  key = 'v',
+  mods = 'CMD',
+  action = act.SendKey { key = 'v', mods = 'SUPER' },
+})
+```
+
+kitty (`kitty.conf`):
+
+```conf
+map cmd+v send_key cmd+v
+```
+
+For another terminal, map `Cmd+V` to the kitty keyboard-protocol sequence
+`ESC [ 118 ; 9 u` (bytes `1b 5b 31 31 38 3b 39 75`). This represents
+Super+V. Without such a mapping, normal text still follows the terminal's
+native bracketed-paste path, while images should be pasted with `Prefix + ]`.
 
 OSC 52 remains a fallback when zsync is not installed or the daemon is down. It needs a terminal that implements OSC 52 (WezTerm does; macOS Terminal.app does not). See the [OSC 52 terminal compatibility list](https://can-i-use-terminal.github.io/features/osc52copy.html).
 
