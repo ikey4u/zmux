@@ -859,6 +859,16 @@ impl TabManager {
     }
 }
 
+/// A tab switch changes which server owns the physical terminal framebuffer.
+/// Inactive tabs only retain their latest incremental ANSI frame, so that
+/// cached frame cannot be replayed as a full-screen snapshot after an automatic
+/// switch (for example when the active tab is closed).
+fn request_active_tab_full_refresh(tabs: &TabManager) {
+    // REFRESH_FRAME carries a unique frame type, so SocketClient publishes it
+    // even when no PTY output arrived after the tab switch.
+    tabs.active_client().refresh_display();
+}
+
 fn tab_code(index: usize) -> String {
     let index = index % (26 * 26);
     let first = (b'A' + (index / 26) as u8) as char;
@@ -1524,6 +1534,7 @@ impl ClientApp {
                         mode = InputMode::Normal;
                         copy_mode_confirmed = false;
                         mouse_select = None;
+                        request_active_tab_full_refresh(&tabs);
                         last_drawn_counter = 0;
                         status_notice = Some((
                             "tab closed".to_string(),
@@ -2151,6 +2162,9 @@ impl ClientApp {
                                             mode = InputMode::Normal;
                                             copy_mode_confirmed = false;
                                             mouse_select = None;
+                                            request_active_tab_full_refresh(
+                                                &tabs,
+                                            );
                                             last_drawn_counter = 0;
                                         }
                                         (KeyCode::Char('W'), _) => {
@@ -3312,10 +3326,20 @@ impl ClientApp {
                                             let (cols, rows) = terminal::size()
                                                 .unwrap_or((80, 24));
                                             if tab.visible {
+                                                let active_socket_before =
+                                                    tabs.active_socket_name();
                                                 match tabs.hide_socket(
                                                     &tab.socket_name,
                                                 ) {
                                                     Ok(()) => {
+                                                        if tabs
+                                                            .active_socket_name()
+                                                            != active_socket_before
+                                                        {
+                                                            request_active_tab_full_refresh(
+                                                                &tabs,
+                                                            );
+                                                        }
                                                         status_notice = Some((
                                                             format!("hidden {}", tab_label(&tab)),
                                                             Instant::now() + Duration::from_secs(3),
@@ -3537,11 +3561,20 @@ impl ClientApp {
                                     match key.code {
                                         KeyCode::Char('y')
                                         | KeyCode::Char('Y') => {
+                                            let active_socket_before =
+                                                tabs.active_socket_name();
                                             match tabs.kill_socket(&socket_name)
                                             {
                                                 Ok(empty) => {
                                                     if empty {
                                                         break;
+                                                    }
+                                                    if tabs.active_socket_name()
+                                                        != active_socket_before
+                                                    {
+                                                        request_active_tab_full_refresh(
+                                                            &tabs,
+                                                        );
                                                     }
                                                     mode =
                                                         if return_to_tab_chooser
