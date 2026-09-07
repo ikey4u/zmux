@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Paragraph},
     Frame,
 };
 use serde::{Deserialize, Serialize};
@@ -96,29 +96,6 @@ pub struct WindowTabJson {
     pub active: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClientTabState {
-    Active,
-    Inactive,
-    Dead,
-}
-
-#[derive(Debug, Clone)]
-pub struct ClientTabView {
-    pub code: String,
-    pub title: String,
-    pub state: ClientTabState,
-    pub socket_name: String,
-    pub visible: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClientTabBarHit {
-    Tab(usize),
-    OverflowStart,
-    OverflowEnd,
-}
-
 pub fn render_frame(f: &mut Frame, fd: &FrameData, in_prefix: bool) {
     render_frame_ex(f, fd, in_prefix, false, false);
 }
@@ -139,35 +116,19 @@ pub fn active_scroll_ratio(fd: &FrameData) -> Option<f32> {
     active_scroll_ratio_in_layout(&fd.layout)
 }
 
-/// Write server-rendered pane ANSI directly to the terminal.
-/// Mark the pane layout region as skipped in ratatui's diff so stale buffer
-/// cells (e.g. after mouse selection) are not written over server ANSI output.
-pub fn skip_pane_area_for_ansi(
+pub fn skip_pane_area_for_ansi_in(
     f: &mut Frame,
     fd: &FrameData,
+    layout_area: Rect,
     hide_borders: bool,
 ) {
     if fd.ansi.is_none() {
         return;
     }
-    let area = f.area();
-    if area.height <= 1 {
+    if layout_area.width == 0 || layout_area.height == 0 {
         return;
     }
-    let frame_area = Rect {
-        x: area.x,
-        y: area.y + 1,
-        width: area.width,
-        height: area.height - 1,
-    };
-    if frame_area.height < 2 {
-        return;
-    }
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(frame_area);
-    mark_layout_area_skip(f, &fd.layout, chunks[0], hide_borders);
+    mark_layout_area_skip(f, &fd.layout, layout_area, hide_borders);
 }
 
 /// Repaint a screen rectangle from layout rows_v2 (used to undo selection overlay).
@@ -856,44 +817,218 @@ pub fn render_frame_ex(
     render_frame_area_ex(f, fd, in_prefix, hide_status, hide_borders, f.area());
 }
 
-pub fn render_tabbed_frame(
+pub fn render_frame_in_area(
     f: &mut Frame,
     fd: &FrameData,
-    tabs: &[ClientTabView],
-    tab_bar_offset: usize,
+    area: Rect,
     in_prefix: bool,
     hide_status: bool,
     hide_borders: bool,
 ) {
-    let area = f.area();
-    if area.height == 0 {
-        return;
-    }
-    let tab_area = Rect {
-        x: area.x,
-        y: area.y,
-        width: area.width,
-        height: 1,
-    };
-    f.render_widget(Clear, tab_area);
-    render_tab_bar(f, tabs, tab_area, tab_bar_offset);
-    if area.height <= 1 {
-        return;
-    }
-    let frame_area = Rect {
-        x: area.x,
-        y: area.y + 1,
-        width: area.width,
-        height: area.height - 1,
-    };
-    render_frame_area_ex(
-        f,
-        fd,
-        in_prefix,
-        hide_status,
-        hide_borders,
-        frame_area,
+    render_frame_area_ex(f, fd, in_prefix, hide_status, hide_borders, area);
+}
+
+pub fn render_loading_in_area(f: &mut Frame, area: Rect) {
+    f.render_widget(
+        Paragraph::new(" Starting zmux...")
+            .style(Style::default().fg(Color::Yellow)),
+        area,
     );
+}
+
+pub fn navigation_popup_rect(area: Rect) -> Rect {
+    centered_floating_panel(
+        area,
+        68.min(area.width.saturating_sub(4).max(1)),
+        26.min(area.height.saturating_sub(2).max(1)),
+    )
+}
+
+pub fn navigation_popup_content_rect(area: Rect) -> Rect {
+    Block::default()
+        .borders(Borders::ALL)
+        .inner(navigation_popup_rect(area))
+}
+
+pub fn render_navigation_popup(
+    f: &mut Frame,
+    entries: &[super::navigation::NavigationEntry],
+    selected: usize,
+) {
+    let panel = navigation_popup_rect(f.area());
+    begin_floating_panel(f, panel);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Rgb(96, 165, 250)))
+        .title(" Navigation · Esc close ");
+    let inner = block.inner(panel);
+    f.render_widget(block, panel);
+    render_navigation_sidebar(f, entries, selected, true, inner);
+}
+
+pub fn render_navigation_sidebar(
+    f: &mut Frame,
+    entries: &[super::navigation::NavigationEntry],
+    selected: usize,
+    focused: bool,
+    area: Rect,
+) {
+    use super::navigation::{MachineConnectionState, NavigationNodeKind};
+
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    const BG: Color = Color::Rgb(16, 20, 27);
+    const BG_SELECTED: Color = Color::Rgb(31, 41, 55);
+    const TEXT: Color = Color::Rgb(218, 225, 234);
+    const MUTED: Color = Color::Rgb(100, 116, 139);
+    const SUBTLE: Color = Color::Rgb(51, 65, 85);
+    const ACCENT: Color = Color::Rgb(96, 165, 250);
+    const ACTIVE: Color = Color::Rgb(74, 222, 128);
+    const WARNING: Color = Color::Rgb(251, 191, 36);
+    const ERROR: Color = Color::Rgb(248, 113, 113);
+
+    // Paint the full surface first. This avoids stale cells when the tree gets
+    // shorter and makes the sidebar feel like a distinct, stable workspace.
+    let blank = " ".repeat(area.width as usize);
+    for y in area.y..area.y.saturating_add(area.height) {
+        f.render_widget(
+            Paragraph::new(blank.clone()).style(Style::default().bg(BG)),
+            Rect::new(area.x, y, area.width, 1),
+        );
+    }
+
+    let divider_x = area.x.saturating_add(area.width.saturating_sub(1));
+    let divider = if focused { ACCENT } else { SUBTLE };
+    for y in area.y..area.y.saturating_add(area.height) {
+        f.render_widget(
+            Paragraph::new("│").style(Style::default().fg(divider).bg(BG)),
+            Rect::new(divider_x, y, 1, 1),
+        );
+    }
+
+    let content_width = area.width.saturating_sub(1);
+    if content_width == 0 {
+        return;
+    }
+
+    let selected = selected.min(entries.len().saturating_sub(1));
+    let (content_offset, viewport_height) =
+        super::navigation::sidebar_viewport(area.height);
+    let view_height = viewport_height as usize;
+    let scroll = super::navigation::sidebar_scroll_offset(
+        selected,
+        entries.len(),
+        view_height,
+    );
+    for row in 0..view_height {
+        let y = area.y + content_offset + row as u16;
+        let Some(entry) = entries.get(scroll + row) else {
+            continue;
+        };
+        let branch = if entry.expandable {
+            if entry.expanded {
+                "▾"
+            } else {
+                "▸"
+            }
+        } else {
+            " "
+        };
+        let (glyph, glyph_color) = match entry.kind {
+            NavigationNodeKind::Machine => match entry.connection {
+                Some(MachineConnectionState::Unavailable) => ("!", ERROR),
+                Some(MachineConnectionState::Probing) => ("◌", WARNING),
+                Some(MachineConnectionState::Disconnected) => ("○", MUTED),
+                Some(MachineConnectionState::Connected) => ("●", ACTIVE),
+                _ => ("●", if entry.active { ACTIVE } else { ACCENT }),
+            },
+            NavigationNodeKind::Workspace => ("▣", Color::Rgb(45, 212, 191)),
+            NavigationNodeKind::Session => ("◆", ACCENT),
+            NavigationNodeKind::Window => ("□", Color::Rgb(167, 139, 250)),
+            NavigationNodeKind::Pane => ("·", MUTED),
+        };
+        let indent = "  ".repeat(entry.depth as usize);
+        let is_selected = focused && scroll + row == selected;
+        let row_bg = if is_selected { BG_SELECTED } else { BG };
+        let row_width = content_width as usize;
+        f.render_widget(
+            Paragraph::new(" ".repeat(row_width))
+                .style(Style::default().bg(row_bg)),
+            Rect::new(area.x, y, content_width, 1),
+        );
+
+        let marker = if is_selected { "▌" } else { " " };
+        let prefix = format!("{indent}{branch} {glyph} ");
+        let meta = entry.meta.as_deref().unwrap_or("");
+        let reserved = 1
+            + unicode_display_width(&prefix)
+            + if meta.is_empty() {
+                0
+            } else {
+                unicode_display_width(meta) + 1
+            };
+        let label =
+            truncate_to_width(&entry.label, row_width.saturating_sub(reserved));
+        let used = reserved + unicode_display_width(&label);
+        let gap = row_width.saturating_sub(used);
+        let label_style = if entry.active {
+            Style::default()
+                .fg(if is_selected { Color::White } else { ACTIVE })
+                .bg(row_bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(if is_selected { Color::White } else { TEXT })
+                .bg(row_bg)
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(marker, Style::default().fg(ACCENT).bg(row_bg)),
+                Span::styled(
+                    format!("{indent}{branch} "),
+                    Style::default().fg(MUTED).bg(row_bg),
+                ),
+                Span::styled(
+                    glyph,
+                    Style::default().fg(glyph_color).bg(row_bg),
+                ),
+                Span::styled(" ", Style::default().bg(row_bg)),
+                Span::styled(label, label_style),
+                Span::styled(" ".repeat(gap), Style::default().bg(row_bg)),
+                Span::styled(meta, Style::default().fg(MUTED).bg(row_bg)),
+            ])),
+            Rect::new(area.x, y, content_width, 1),
+        );
+    }
+
+    if area.height >= 7 {
+        let footer_y = area.y + area.height - 2;
+        let key = if focused { "  j/k" } else { "  ^A m" };
+        let action = if focused {
+            " move  H help"
+        } else {
+            " open tree"
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(key, Style::default().fg(ACCENT).bg(BG)),
+                Span::styled(action, Style::default().fg(MUTED).bg(BG)),
+            ])),
+            Rect::new(area.x, footer_y, content_width, 1),
+        );
+        let second = if focused {
+            "  r rename  K delete"
+        } else {
+            "  Enter open"
+        };
+        f.render_widget(
+            Paragraph::new(truncate_to_width(second, content_width as usize))
+                .style(Style::default().fg(MUTED).bg(BG)),
+            Rect::new(area.x, footer_y + 1, content_width, 1),
+        );
+    }
 }
 
 fn render_frame_area_ex(
@@ -1219,36 +1354,6 @@ fn draw_border(f: &mut Frame, area: Rect, color: Color) {
     }
 }
 
-pub fn render_tabbed_loading(
-    f: &mut Frame,
-    tabs: &[ClientTabView],
-    tab_bar_offset: usize,
-) {
-    let area = f.area();
-    if area.height == 0 {
-        return;
-    }
-    let tab_area = Rect {
-        x: area.x,
-        y: area.y,
-        width: area.width,
-        height: 1,
-    };
-    render_tab_bar(f, tabs, tab_area, tab_bar_offset);
-    if area.height <= 1 {
-        return;
-    }
-    let body = Rect {
-        x: area.x,
-        y: area.y + 1,
-        width: area.width,
-        height: area.height - 1,
-    };
-    let para = Paragraph::new(" Starting zmux...")
-        .style(Style::default().fg(Color::Yellow));
-    f.render_widget(para, body);
-}
-
 pub fn status_bar_screen_row(
     screen_rows: u16,
     hide_status: bool,
@@ -1284,133 +1389,6 @@ pub fn status_window_tab_hit(
         used += label_width;
     }
     None
-}
-
-const TAB_BAR_ELLIPSIS: &str = " ... ";
-
-pub fn tab_bar_visible_range(
-    tabs: &[ClientTabView],
-    width: u16,
-    offset: usize,
-) -> std::ops::Range<usize> {
-    if tabs.is_empty() || offset >= tabs.len() {
-        return 0..0;
-    }
-    let max_width = width as usize;
-    let ellipsis_width = unicode_display_width(TAB_BAR_ELLIPSIS);
-    let mut used = if offset > 0 { ellipsis_width } else { 0 };
-    let mut end = offset;
-    while end < tabs.len() {
-        let last = end + 1 == tabs.len();
-        let segment_width = tab_segment_width(&tabs[end]);
-        if last {
-            if used + segment_width <= max_width {
-                return offset..tabs.len();
-            }
-            break;
-        }
-        if used + segment_width + ellipsis_width > max_width {
-            break;
-        }
-        used += segment_width;
-        end += 1;
-    }
-    if end == offset && offset < tabs.len() {
-        return offset..(offset + 1).min(tabs.len());
-    }
-    offset..end
-}
-
-pub fn tab_bar_hit(
-    tabs: &[ClientTabView],
-    width: u16,
-    col: u16,
-    offset: usize,
-) -> Option<ClientTabBarHit> {
-    if tabs.is_empty() {
-        return None;
-    }
-    let mut used = 0usize;
-    let max_width = width as usize;
-    let col = col as usize;
-    let ellipsis_width = unicode_display_width(TAB_BAR_ELLIPSIS);
-    let visible = tab_bar_visible_range(tabs, width, offset);
-    let has_trailing = visible.end < tabs.len();
-
-    if offset > 0 {
-        if used + ellipsis_width > max_width {
-            return None;
-        }
-        if col < used + ellipsis_width {
-            return Some(ClientTabBarHit::OverflowStart);
-        }
-        used += ellipsis_width;
-    }
-
-    for index in visible.start..visible.end {
-        let segment_width = tab_segment_width(&tabs[index]);
-        if col >= used && col < used + segment_width {
-            return Some(ClientTabBarHit::Tab(index));
-        }
-        used += segment_width;
-    }
-
-    if has_trailing && used + ellipsis_width <= max_width {
-        (col >= used && col < used + ellipsis_width)
-            .then_some(ClientTabBarHit::OverflowEnd)
-    } else {
-        None
-    }
-}
-
-pub fn last_visible_tab_index(
-    tabs: &[ClientTabView],
-    width: u16,
-    offset: usize,
-) -> Option<usize> {
-    let range = tab_bar_visible_range(tabs, width, offset);
-    range.end.checked_sub(1)
-}
-
-fn render_tab_bar(
-    f: &mut Frame,
-    tabs: &[ClientTabView],
-    area: Rect,
-    offset: usize,
-) {
-    if area.height == 0 {
-        return;
-    }
-    let bg = Style::default().fg(Color::White).bg(Color::Rgb(28, 28, 28));
-    f.render_widget(
-        Paragraph::new(" ".repeat(area.width as usize)).style(bg),
-        area,
-    );
-    if tabs.is_empty() {
-        return;
-    }
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut used = 0usize;
-    let max_width = area.width as usize;
-    let ellipsis_width = unicode_display_width(TAB_BAR_ELLIPSIS);
-    let visible = tab_bar_visible_range(tabs, area.width, offset);
-    let has_trailing = visible.end < tabs.len();
-
-    if offset > 0 && used + ellipsis_width <= max_width {
-        spans.push(Span::styled(TAB_BAR_ELLIPSIS.to_string(), bg));
-        used += ellipsis_width;
-    }
-
-    for index in visible.start..visible.end {
-        push_tab_spans(&mut spans, &tabs[index]);
-        used += tab_segment_width(&tabs[index]);
-    }
-
-    if has_trailing && used + ellipsis_width <= max_width {
-        spans.push(Span::styled(TAB_BAR_ELLIPSIS.to_string(), bg));
-    }
-
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 const PANEL_BG: Color = Color::Rgb(40, 40, 40);
@@ -1493,55 +1471,6 @@ pub fn centered_floating_panel(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
-/// Shared overlay size for tab/session choosers: ~75% width, capped height, stable
-/// while open (must not depend on list length or tree expand state).
-pub fn chooser_overlay_panel(area: Rect) -> Rect {
-    if area.width == 0 || area.height == 0 {
-        return area;
-    }
-    let width = area
-        .width
-        .saturating_mul(3)
-        .saturating_div(4)
-        .max(36)
-        .min(area.width);
-    let height = area
-        .height
-        .saturating_sub(2)
-        .max(8)
-        .min(24)
-        .min(area.height);
-    centered_floating_panel(area, width, height)
-}
-
-pub fn rename_tab_panel_rect(area: Rect) -> Rect {
-    if area.width == 0 || area.height == 0 {
-        return area;
-    }
-    let width = area
-        .width
-        .saturating_mul(2)
-        .saturating_div(3)
-        .max(44)
-        .min(area.width);
-    let height = 9.min(area.height).max(1);
-    centered_floating_panel(area, width, height)
-}
-
-pub fn tab_quick_switch_panel_rect(area: Rect) -> Rect {
-    if area.width == 0 || area.height == 0 {
-        return area;
-    }
-    let width = area
-        .width
-        .saturating_mul(2)
-        .saturating_div(5)
-        .max(36)
-        .min(area.width);
-    let height = 7.min(area.height).max(1);
-    centered_floating_panel(area, width, height)
-}
-
 pub fn options_panel_rect(area: Rect) -> Rect {
     if area.width == 0 || area.height == 0 {
         return area;
@@ -1554,376 +1483,6 @@ pub fn options_panel_rect(area: Rect) -> Rect {
         .min(area.width);
     let height = 7.min(area.height).max(1);
     centered_floating_panel(area, width, height)
-}
-
-fn fill_panel_row(f: &mut Frame, x: u16, y: u16, width: u16) {
-    if width == 0 {
-        return;
-    }
-    let padded = " ".repeat(width as usize);
-    f.render_widget(
-        Paragraph::new(padded).style(Style::default().bg(PANEL_BG)),
-        Rect {
-            x,
-            y,
-            width,
-            height: 1,
-        },
-    );
-}
-
-fn tab_segment_width(tab: &ClientTabView) -> usize {
-    let title_width = if tab.title.is_empty() {
-        0
-    } else {
-        1 + unicode_display_width(&tab.title)
-    };
-    2 + 1 + title_width + 1
-}
-
-fn push_tab_spans(spans: &mut Vec<Span<'static>>, tab: &ClientTabView) {
-    let active = tab.state == ClientTabState::Active;
-    let base_bg = if active {
-        Color::Rgb(42, 72, 120)
-    } else {
-        Color::Rgb(48, 48, 48)
-    };
-    let code_style = Style::default()
-        .fg(Color::White)
-        .bg(base_bg)
-        .add_modifier(Modifier::BOLD);
-    let text_style = Style::default().fg(Color::White).bg(base_bg);
-    let (status, status_style) = match tab.state {
-        ClientTabState::Active => (
-            "*",
-            Style::default()
-                .fg(Color::Green)
-                .bg(base_bg)
-                .add_modifier(Modifier::BOLD),
-        ),
-        ClientTabState::Inactive => {
-            ("-", Style::default().fg(Color::DarkGray).bg(base_bg))
-        }
-        ClientTabState::Dead => (
-            "!",
-            Style::default()
-                .fg(Color::Red)
-                .bg(base_bg)
-                .add_modifier(Modifier::BOLD),
-        ),
-    };
-    spans.push(Span::styled(tab.code.clone(), code_style));
-    spans.push(Span::styled(status.to_string(), status_style));
-    if !tab.title.is_empty() {
-        spans.push(Span::styled(format!(" {}", tab.title), text_style));
-    }
-    spans.push(Span::styled(
-        " ".to_string(),
-        Style::default().bg(Color::Rgb(28, 28, 28)),
-    ));
-}
-
-pub fn render_tab_chooser(
-    f: &mut Frame,
-    tabs: &[ClientTabView],
-    query: &str,
-    selected: usize,
-    search_active: bool,
-) {
-    use ratatui::widgets::{Block, Borders};
-
-    let area = f.area();
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let panel = chooser_overlay_panel(area);
-    begin_floating_panel(f, panel);
-    let block = Block::default()
-        .title(" Tabs  Space=show/hide  K=kill  R=rename  Enter=switch  /=search  Esc/q=close ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(PANEL_BG));
-    let inner = block.inner(panel);
-    f.render_widget(block, panel);
-    if inner.height == 0 {
-        return;
-    }
-
-    let search = if search_active {
-        format!(" search: {}", query)
-    } else if query.is_empty() {
-        " search: <press / or ?>".to_string()
-    } else {
-        format!(" search: {}", query)
-    };
-    let search_style = if search_active {
-        Style::default()
-            .fg(Color::Yellow)
-            .bg(PANEL_BG)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::DarkGray).bg(PANEL_BG)
-    };
-    f.render_widget(
-        Paragraph::new(truncate_to_width(&search, inner.width as usize))
-            .style(search_style),
-        Rect {
-            x: inner.x,
-            y: inner.y,
-            width: inner.width,
-            height: 1,
-        },
-    );
-
-    let matches: Vec<(usize, &ClientTabView)> = tabs
-        .iter()
-        .enumerate()
-        .filter(|(_, tab)| tab_matches(tab, query))
-        .collect();
-    if inner.height <= 1 {
-        return;
-    }
-    if matches.is_empty() {
-        f.render_widget(
-            Paragraph::new(" no matching tabs")
-                .style(Style::default().fg(Color::DarkGray).bg(PANEL_BG)),
-            Rect {
-                x: inner.x,
-                y: inner.y + 1,
-                width: inner.width,
-                height: 1,
-            },
-        );
-        return;
-    }
-
-    let list_height = inner.height.saturating_sub(1) as usize;
-    let selected = selected.min(matches.len().saturating_sub(1));
-    let scroll = selected.saturating_sub(list_height.saturating_sub(1));
-    for (row, (_, tab)) in
-        matches.iter().skip(scroll).take(list_height).enumerate()
-    {
-        let y = inner.y + 1 + row as u16;
-        let is_selected = scroll + row == selected;
-        let state = match tab.state {
-            ClientTabState::Active => "*",
-            ClientTabState::Inactive => "-",
-            ClientTabState::Dead => "!",
-        };
-        let title = if tab.title.is_empty() {
-            "(untitled)"
-        } else {
-            &tab.title
-        };
-        let checkbox = if tab.visible { "[x]" } else { "[ ]" };
-        let label = format!(" {} {}{} {}", checkbox, tab.code, state, title);
-        let style = if is_selected {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White).bg(PANEL_BG)
-        };
-        let text = format!(
-            "{:<width$}",
-            truncate_to_width(&label, inner.width as usize),
-            width = inner.width as usize
-        );
-        f.render_widget(
-            Paragraph::new(text).style(style),
-            Rect {
-                x: inner.x,
-                y,
-                width: inner.width,
-                height: 1,
-            },
-        );
-    }
-}
-
-fn tab_matches(tab: &ClientTabView, query: &str) -> bool {
-    let query = query.trim().to_lowercase();
-    query.is_empty()
-        || tab.code.to_lowercase().contains(&query)
-        || tab.title.to_lowercase().contains(&query)
-        || tab.socket_name.to_lowercase().contains(&query)
-}
-
-pub fn render_rename_tab_panel(
-    f: &mut Frame,
-    code: &str,
-    title: &str,
-    editing_code: bool,
-    error: Option<&str>,
-) {
-    use ratatui::widgets::{Block, Borders};
-
-    let area = f.area();
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let panel = rename_tab_panel_rect(area);
-    begin_floating_panel(f, panel);
-    let block = Block::default()
-        .title(" Rename Tab  (Tab=switch field  Enter=next/save  Esc=cancel) ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(PANEL_BG));
-    let inner = block.inner(panel);
-    f.render_widget(block, panel);
-    if inner.height == 0 {
-        return;
-    }
-
-    render_rename_field(f, inner, 0, "Code", code, editing_code);
-    if inner.height > 2 {
-        render_rename_field(f, inner, 2, "Title", title, !editing_code);
-    }
-    if let Some(error) = error {
-        if inner.height > 4 {
-            f.render_widget(
-                Paragraph::new(truncate_to_width(error, inner.width as usize))
-                    .style(Style::default().fg(Color::Red)),
-                Rect {
-                    x: inner.x,
-                    y: inner.y + 4,
-                    width: inner.width,
-                    height: 1,
-                },
-            );
-        }
-    }
-    if inner.height > 6 {
-        let help = "Code must be two unique uppercase letters.";
-        f.render_widget(
-            Paragraph::new(truncate_to_width(help, inner.width as usize))
-                .style(Style::default().fg(Color::DarkGray)),
-            Rect {
-                x: inner.x,
-                y: inner.y + 6,
-                width: inner.width,
-                height: 1,
-            },
-        );
-    }
-}
-
-pub fn render_tab_quick_switch_panel(
-    f: &mut Frame,
-    code: &str,
-    error: Option<&str>,
-) {
-    use ratatui::widgets::{Block, Borders};
-
-    let area = f.area();
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let panel = tab_quick_switch_panel_rect(area);
-    begin_floating_panel(f, panel);
-    let block = Block::default()
-        .title(" Switch Tab  (Enter=switch  Esc=cancel) ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(PANEL_BG));
-    let inner = block.inner(panel);
-    f.render_widget(block, panel);
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-
-    let field = format!(" Code: {}", code);
-    let field_text = format!(
-        "{:<width$}",
-        truncate_to_width(&field, inner.width as usize),
-        width = inner.width as usize
-    );
-    f.render_widget(
-        Paragraph::new(field_text).style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Rect {
-            x: inner.x,
-            y: inner.y,
-            width: inner.width,
-            height: 1,
-        },
-    );
-    let cursor_x = inner
-        .x
-        .saturating_add(7)
-        .saturating_add(code.chars().count() as u16)
-        .min(inner.x + inner.width.saturating_sub(1));
-    f.set_cursor_position((cursor_x, inner.y));
-
-    if let Some(error) = error {
-        if inner.height > 2 {
-            f.render_widget(
-                Paragraph::new(truncate_to_width(error, inner.width as usize))
-                    .style(Style::default().fg(Color::Red)),
-                Rect {
-                    x: inner.x,
-                    y: inner.y + 2,
-                    width: inner.width,
-                    height: 1,
-                },
-            );
-        }
-    }
-
-    if inner.height > 4 {
-        let help = "Enter the two-letter code shown in the tab bar.";
-        f.render_widget(
-            Paragraph::new(truncate_to_width(help, inner.width as usize))
-                .style(Style::default().fg(Color::DarkGray)),
-            Rect {
-                x: inner.x,
-                y: inner.y + 4,
-                width: inner.width,
-                height: 1,
-            },
-        );
-    }
-}
-
-fn render_rename_field(
-    f: &mut Frame,
-    area: Rect,
-    row: u16,
-    label: &str,
-    value: &str,
-    active: bool,
-) {
-    if row >= area.height {
-        return;
-    }
-    let text = format!(" {}: {}", label, value);
-    let style = if active {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::White)
-    };
-    let padded = format!(
-        "{:<width$}",
-        truncate_to_width(&text, area.width as usize),
-        width = area.width as usize
-    );
-    f.render_widget(
-        Paragraph::new(padded).style(style),
-        Rect {
-            x: area.x,
-            y: area.y + row,
-            width: area.width,
-            height: 1,
-        },
-    );
 }
 
 fn render_status_bar(
@@ -2202,9 +1761,256 @@ pub fn render_loading(f: &mut Frame) {
     f.render_widget(para, area);
 }
 
+const NAVIGATION_HELP: &[&str] = &[
+    "Machine > Workspace > Session > Window > Pane",
+    "",
+    "Prefix+m        Open/close floating navigation tree",
+    "Prefix+M        Toggle fixed sidebar (hidden by default)",
+    "Prefix+: help   Show all zmux shortcuts (:h also works)",
+    "H               Show this complete key reference",
+    "j/k, Down/Up    Select next/previous visible node",
+    "h, Left         Collapse branch, or select parent",
+    "l, Right        Expand, enter branch, or open pane",
+    "g, Home         Select first visible node",
+    "G, End          Select last visible node",
+    "Enter           Open selected node (including windows)",
+    "r               Rename selected node",
+    "K, d, Delete    Delete selected node (y confirms)",
+    "R               Refresh machine or active workspace",
+    "Prefix+h        Enter sidebar at left pane boundary",
+    "Prefix+l        Return focus to terminal",
+    "q, Esc          Close sidebar / floating tree",
+    "Click arrow     Expand/collapse branch",
+    "Click name      Open selected node",
+    "",
+    "Workspace close detaches only; sessions stay alive.",
+    "Machine delete removes its connections, not servers.",
+    "Machine/workspace rename is saved in machines.json.",
+];
+
+const PREFIX_HELP: &[&str] = &[
+    "ALL ZMUX SHORTCUTS",
+    "Prefix = Ctrl+a; press it, then the action key.",
+    "",
+    "[ Global / panes / windows / sessions ]",
+    "Prefix+H        Set Home for the current Workspace only",
+    "Prefix+: h/help Show this full shortcut reference",
+    "Prefix+Prefix   Send a literal Ctrl+a to the terminal",
+    "Prefix+m / M    Floating tree / toggle fixed sidebar",
+    "Prefix+%        Split into left and right panes",
+    "Prefix+\"        Split into top and bottom panes",
+    "Prefix+x        Close current pane",
+    "Prefix+z        Maximize/restore current pane",
+    "Prefix+b        Toggle pane borders",
+    "Prefix+K        Clear pane output and copy history",
+    "Prefix+h/j/k/l  Focus left/down/up/right pane",
+    "Prefix+arrows   Same directional pane navigation",
+    "Prefix+h        At left edge, enter the sidebar",
+    "Prefix+Alt+h/j/k/l  Resize left/down/up/right",
+    "  Keep Alt held to repeat; idle timeout is 500 ms.",
+    "Prefix+c        Create window",
+    "Prefix+n / p    Next / previous window",
+    "Prefix+,        Rename window",
+    "Prefix+$        Rename session",
+    "Prefix+( / )    Previous / next session",
+    "Prefix+d        Detach client; servers keep running",
+    "Prefix+:        Open command input",
+    "Prefix+O        Open runtime options",
+    "Prefix+[        Enter copy mode",
+    "Prefix+]        Paste clipboard text/image/files",
+    "Cmd+V / Super+V Paste if terminal forwards this key",
+    "",
+    "[ Sidebar ]",
+];
+
+const MODAL_HELP: &[&str] = &[
+    "",
+    "[ Copy mode ]",
+    "q, Esc          Exit copy mode",
+    "h/j/k/l, arrows Move left/down/up/right",
+    "b / w / e       Previous word / next word / word end",
+    "0, Home         Start of line",
+    "$, End          End of line",
+    "g / G           Top of loaded history / bottom",
+    "Ctrl+b, PageUp  Page up (loads older history)",
+    "Ctrl+f, PageDown Page down",
+    "/ / ?           Search forward / backward",
+    "n / N           Next / previous match",
+    "v, Space        Character selection",
+    "V               Line selection",
+    "Ctrl+v          Rectangular selection",
+    "y, Enter        Copy selection and exit",
+    "",
+    "[ Command / rename / search prompts ]",
+    "Enter / Esc     Confirm / cancel",
+    "Left / Right    Move input cursor",
+    "Backspace       Delete previous character",
+    "Typing / paste  Insert at input cursor",
+    "Command and machine/Workspace rename also support:",
+    "Home / End      Beginning / end of input",
+    "Delete / Ctrl+u Delete next character / clear to start",
+    "Copy search: q exits copy mode; Esc cancels search.",
+    "Close confirmation: y/Y confirms; Esc/n/N/Enter cancels.",
+    "",
+    "[ Runtime options: Prefix+O ]",
+    "Space, Enter    Toggle selected option",
+    "q, Esc          Close options",
+    "",
+    "[ Pane resize mode ]",
+    "Alt+h/j/k/l, Alt+arrows Resize in the given direction",
+    "Esc             Finish resizing",
+    "Prefix          Return to prefix commands",
+    "",
+    "[ Mouse ]",
+    "Click pane      Focus pane",
+    "Drag / double click Select text / select word",
+    "Ctrl+click URL  Open URL in the system browser",
+    "Mouse wheel     Scroll pane history",
+    "q, Esc          Return from scrolled display to bottom",
+    "Applications requesting mouse input receive events.",
+    "",
+    "[ Help popup ]",
+    "j/k, Down/Up    Scroll help",
+    "PageUp/PageDown Scroll by page",
+    "g/G, Home/End   Beginning / end of reference",
+    "Mouse wheel     Scroll help",
+    "q, Esc, H       Close help and return to previous mode",
+    "",
+    "[ Commands and shell keys ]",
+    "Workspace Home: Prefix+H (new sessions/windows/panes)",
+    "SSH machine:   Prefix+: then new -m <SSH_HOST>",
+    "Other terminal keys go to the shell/application.",
+    "Shell Ctrl+c/d/l/r/z behavior is not a zmux binding.",
+];
+
+fn all_shortcuts() -> Vec<&'static str> {
+    PREFIX_HELP
+        .iter()
+        .chain(NAVIGATION_HELP)
+        .chain(MODAL_HELP)
+        .copied()
+        .collect()
+}
+
+pub fn navigation_help_rect(area: Rect) -> Rect {
+    help_rect(area, NAVIGATION_HELP.len())
+}
+
+pub fn shortcuts_help_rect(area: Rect) -> Rect {
+    help_rect(area, all_shortcuts().len())
+}
+
+fn help_rect(area: Rect, line_count: usize) -> Rect {
+    let width = area.width.saturating_sub(2).min(68);
+    let height = area.height.saturating_sub(2).min((line_count + 2) as u16);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
+pub fn navigation_help_max_scroll(area: Rect) -> usize {
+    navigation_help_lines(area).len().saturating_sub(
+        navigation_help_rect(area).height.saturating_sub(2) as usize,
+    )
+}
+
+pub fn shortcuts_help_max_scroll(area: Rect) -> usize {
+    wrapped_help_lines(area, &all_shortcuts())
+        .len()
+        .saturating_sub(
+            shortcuts_help_rect(area).height.saturating_sub(2) as usize
+        )
+}
+
+fn navigation_help_lines(area: Rect) -> Vec<String> {
+    wrapped_help_lines(area, NAVIGATION_HELP)
+}
+
+fn wrapped_help_lines(area: Rect, source: &[&str]) -> Vec<String> {
+    let width =
+        navigation_help_rect(area).width.saturating_sub(2).max(1) as usize;
+    // Wrap the ASCII key reference explicitly so scroll bounds also work in
+    // narrow terminals; no shortcut disappears past the right edge.
+    source
+        .iter()
+        .flat_map(|line| {
+            if line.is_empty() {
+                return vec![String::new()];
+            }
+            line.chars()
+                .collect::<Vec<_>>()
+                .chunks(width)
+                .map(|chunk| chunk.iter().collect())
+                .collect::<Vec<String>>()
+        })
+        .collect()
+}
+
+pub fn render_navigation_help(f: &mut Frame, scroll: usize) {
+    render_help(f, scroll, false);
+}
+
+pub fn render_shortcuts_help(f: &mut Frame, scroll: usize) {
+    render_help(f, scroll, true);
+}
+
+fn render_help(f: &mut Frame, scroll: usize, all: bool) {
+    use ratatui::widgets::{Block, Borders};
+    let rect = if all {
+        shortcuts_help_rect(f.area())
+    } else {
+        navigation_help_rect(f.area())
+    };
+    begin_floating_panel(f, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(if all {
+            " zmux shortcuts - j/k scroll, Esc back "
+        } else {
+            " Sidebar keys - j/k scroll, Esc back "
+        })
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(PANEL_BG));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    let lines: Vec<Line> = (if all {
+        wrapped_help_lines(f.area(), &all_shortcuts())
+    } else {
+        navigation_help_lines(f.area())
+    })
+    .into_iter()
+    .map(Line::from)
+    .collect();
+    f.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().fg(Color::White).bg(PANEL_BG))
+            .scroll((
+                scroll.min(if all {
+                    shortcuts_help_max_scroll(f.area())
+                } else {
+                    navigation_help_max_scroll(f.area())
+                }) as u16,
+                0,
+            )),
+        inner,
+    );
+}
+
 pub fn render_prompt(f: &mut Frame, label: &str, buf: &str) {
+    render_prompt_input(f, label, buf, buf.chars().count());
+}
+
+pub fn render_prompt_input(
+    f: &mut Frame,
+    label: &str,
+    buf: &str,
+    cursor: usize,
+) {
     let area = f.area();
-    if area.height < 1 {
+    if area.height == 0 || area.width == 0 {
         return;
     }
 
@@ -2214,17 +2020,40 @@ pub fn render_prompt(f: &mut Frame, label: &str, buf: &str) {
         width: area.width,
         height: 1,
     };
-    // Pane ANSI may have run just before this draw; force the prompt row out.
+    // Paragraph applies styles but does not erase symbols painted by the
+    // sidebar/status widgets earlier in this frame. Reset the entire row.
+    for x in prompt_area.x..prompt_area.right() {
+        f.buffer_mut()[(x, prompt_area.y)].reset();
+    }
     prepare_overlay_draw(f, prompt_area);
 
+    let cursor_byte = buf
+        .char_indices()
+        .nth(cursor)
+        .map(|(i, _)| i)
+        .unwrap_or(buf.len());
+    let cursor_col = unicode_display_width(label)
+        + unicode_display_width(&buf[..cursor_byte]);
     let content = format!("{}{}", label, buf);
-    let para = Paragraph::new(content.clone())
+    let wanted_start =
+        cursor_col.saturating_sub(prompt_area.width.saturating_sub(1) as usize);
+    let mut start_col = 0;
+    let mut start_byte = 0;
+    for (at, ch) in content.char_indices() {
+        if start_col >= wanted_start {
+            break;
+        }
+        start_col += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        start_byte = at + ch.len_utf8();
+    }
+    let para = Paragraph::new(content[start_byte..].to_string())
         .style(Style::default().fg(Color::Black).bg(Color::Yellow));
     f.render_widget(para, prompt_area);
 
-    let cursor_x =
-        (prompt_area.x + label.len() as u16 + buf.chars().count() as u16)
-            .min(prompt_area.x + prompt_area.width - 1);
+    let cursor_x = prompt_area.x
+        + cursor_col
+            .saturating_sub(start_col)
+            .min(prompt_area.width.saturating_sub(1) as usize) as u16;
     f.set_cursor_position((cursor_x, prompt_area.y));
 }
 
@@ -2298,165 +2127,105 @@ pub fn render_options_panel(
     }
 }
 
-pub fn render_session_chooser(
-    f: &mut Frame,
-    entries: &[crate::server::SessionTreeEntry],
-    selected: usize,
-    collapsed: &std::collections::HashSet<String>,
-    collapsed_windows: &std::collections::HashSet<(String, usize)>,
-) {
-    use ratatui::widgets::{Block, Borders};
-
-    use crate::server::SessionTreeEntry;
-
-    let visible: Vec<&SessionTreeEntry> = entries
-        .iter()
-        .filter(|e| match e {
-            SessionTreeEntry::Session { .. } => true,
-            SessionTreeEntry::Window { session_name, .. } => {
-                !collapsed.contains(session_name)
-            }
-            SessionTreeEntry::Pane {
-                session_name,
-                window_index,
-                ..
-            } => {
-                !collapsed.contains(session_name)
-                    && !collapsed_windows
-                        .contains(&(session_name.clone(), *window_index))
-            }
-        })
-        .collect();
-
-    let area = f.area();
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let chooser_area = chooser_overlay_panel(area);
-
-    begin_floating_panel(f, chooser_area);
-    let block = Block::default()
-        .title(" Sessions  (Enter=select  q/Esc=close  j/k=nav  l=expand  h=collapse) ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(PANEL_BG));
-    let inner = block.inner(chooser_area);
-    f.render_widget(block, chooser_area);
-
-    let view_height = inner.height as usize;
-    let scroll = if view_height == 0 {
-        0
-    } else if selected >= view_height {
-        selected + 1 - view_height
-    } else {
-        0
-    }
-    .min(visible.len().saturating_sub(view_height));
-
-    let mut drawn_rows = 0usize;
-    for row in 0..view_height {
-        let i = scroll + row;
-        let Some(entry) = visible.get(i) else {
-            break;
-        };
-        drawn_rows = row + 1;
-        let row_y = inner.y + row as u16;
-        let is_sel = i == selected;
-
-        let (label, style) = match entry {
-            SessionTreeEntry::Session {
-                name,
-                window_count,
-                is_active,
-            } => {
-                let active_mark = if *is_active { "*" } else { " " };
-                let expand_mark = if collapsed.contains(name) {
-                    "▶"
-                } else {
-                    "▼"
-                };
-                let text = format!(
-                    " {} {} [{}]  {} windows",
-                    active_mark, expand_mark, name, window_count
-                );
-                let s = if is_sel {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD)
-                } else if *is_active {
-                    Style::default()
-                        .fg(Color::Green)
-                        .bg(PANEL_BG)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::White).bg(PANEL_BG)
-                };
-                (text, s)
-            }
-            SessionTreeEntry::Window {
-                session_name,
-                index,
-                name,
-                pane_count,
-                is_active,
-            } => {
-                let active_mark = if *is_active { ">" } else { " " };
-                let key_w = (session_name.clone(), *index);
-                let expand_mark = if collapsed_windows.contains(&key_w) {
-                    "▶"
-                } else {
-                    "▼"
-                };
-                let text = format!(
-                    "     {} {} [{}] {}  ({} panes)",
-                    active_mark, expand_mark, index, name, pane_count
-                );
-                let s = if is_sel {
-                    Style::default().fg(Color::Black).bg(Color::Cyan)
-                } else if *is_active {
-                    Style::default().fg(Color::Blue).bg(PANEL_BG)
-                } else {
-                    Style::default().fg(Color::White).bg(PANEL_BG)
-                };
-                (text, s)
-            }
-            SessionTreeEntry::Pane {
-                index, is_active, ..
-            } => {
-                let active_mark = if *is_active { "●" } else { "○" };
-                let text = format!("           {} pane {}", active_mark, index);
-                let s = if is_sel {
-                    Style::default().fg(Color::Black).bg(Color::Cyan)
-                } else if *is_active {
-                    Style::default().fg(Color::Yellow).bg(PANEL_BG)
-                } else {
-                    Style::default().fg(Color::DarkGray).bg(PANEL_BG)
-                };
-                (text, s)
-            }
-        };
-
-        let padded = format!("{:<width$}", label, width = inner.width as usize);
-        let para = Paragraph::new(padded).style(style);
-        f.render_widget(
-            para,
-            Rect {
-                x: inner.x,
-                y: row_y,
-                width: inner.width,
-                height: 1,
-            },
-        );
-    }
-    for row in drawn_rows..view_height {
-        fill_panel_row(f, inner.x, inner.y + row as u16, inner.width);
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn floating_navigation_geometry_stays_inside_tiny_and_large_terminals() {
+        for (width, height) in
+            [(0, 0), (1, 1), (8, 3), (50, 12), (120, 28), (240, 80)]
+        {
+            let area = Rect::new(4, 5, width, height);
+            let panel = navigation_popup_rect(area);
+            let content = navigation_popup_content_rect(area);
+            assert_eq!(panel.intersection(area), panel);
+            assert_eq!(content.intersection(panel), content);
+            assert!(panel.width <= 68 && panel.height <= 26);
+        }
+    }
+
     use super::*;
+
+    #[test]
+    fn navigation_starts_with_machine_without_title_or_count_rows() {
+        use super::super::navigation::{
+            build_navigation_entries, NavigationState,
+        };
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let entries = build_navigation_entries(
+            "local",
+            "MACHINE-01",
+            &[],
+            &NavigationState::default(),
+        );
+        for popup in [false, true] {
+            for focused in [false, true] {
+                let mut terminal =
+                    Terminal::new(TestBackend::new(80, 24)).unwrap();
+                let area = if popup {
+                    navigation_popup_content_rect(Rect::new(0, 0, 80, 24))
+                } else {
+                    Rect::new(0, 0, 30, 24)
+                };
+                terminal
+                    .draw(|frame| {
+                        if popup {
+                            render_navigation_popup(frame, &entries, 0);
+                        } else {
+                            render_navigation_sidebar(
+                                frame, &entries, 0, focused, area,
+                            );
+                        }
+                    })
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let first_row: String = (area.x..area.right())
+                    .map(|x| buffer[(x, area.y)].symbol())
+                    .collect();
+                assert!(first_row.contains("MACHINE-01"), "{first_row}");
+                let content: String = (area.y..area.bottom())
+                    .flat_map(|y| {
+                        (area.x..area.right())
+                            .map(move |x| buffer[(x, y)].symbol())
+                    })
+                    .collect();
+                for removed in ["ZMUX", "NAV", "WORKSPACES"] {
+                    assert!(
+                        !content.contains(removed),
+                        "unexpected header: {removed}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn full_help_covers_all_modes_without_truncating_narrow_lines() {
+        let full = all_shortcuts();
+        for section in [
+            "[ Sidebar ]",
+            "[ Copy mode ]",
+            "[ Command / rename / search prompts ]",
+            "[ Runtime options: Prefix+O ]",
+            "[ Pane resize mode ]",
+            "[ Mouse ]",
+            "[ Help popup ]",
+        ] {
+            assert!(full.contains(&section), "missing {section}");
+        }
+        assert!(full
+            .iter()
+            .any(|line| line.starts_with("Prefix+H")
+                && line.contains("Workspace")));
+        assert!(full.iter().any(|line| line.contains("h/help")));
+        let area = Rect::new(0, 0, 30, 12);
+        let wrapped = wrapped_help_lines(area, &full);
+        assert_eq!(wrapped.concat(), full.concat());
+        assert!(wrapped.iter().all(|line| line.len() <= 26));
+        assert!(
+            shortcuts_help_max_scroll(area) > navigation_help_max_scroll(area)
+        );
+    }
 
     #[test]
     fn write_server_ansi_wraps_synchronized_update() {
@@ -2481,26 +2250,6 @@ mod tests {
         let mut out = Vec::new();
         write_server_ansi(&mut out, &b64).unwrap();
         assert!(out.is_empty(), "empty ansi must not emit sync markers");
-    }
-
-    #[test]
-    fn chooser_overlay_panel_is_stable_for_same_terminal_size() {
-        let area = Rect::new(0, 1, 120, 20);
-        let first = chooser_overlay_panel(area);
-        let second = chooser_overlay_panel(area);
-        assert_eq!(first, second);
-        assert_eq!(first.width, 90);
-        assert_eq!(first.height, 18);
-    }
-
-    #[test]
-    fn rename_panel_is_smaller_than_tab_chooser_panel() {
-        let area = Rect::new(0, 0, 120, 24);
-        let chooser = chooser_overlay_panel(area);
-        let rename = rename_tab_panel_rect(area);
-        assert!(rename.width <= chooser.width);
-        assert!(rename.height < chooser.height);
-        assert_ne!(chooser, rename);
     }
 
     #[test]

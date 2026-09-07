@@ -125,10 +125,18 @@ impl<W: Write> Backend for TerminalBackend<W> {
     }
 
     fn clear(&mut self) -> io::Result<()> {
-        self.clear_region(ClearType::All)
+        // Ratatui calls this on every viewport resize. Pane cells are drawn by
+        // server ANSI and skipped in Ratatui's buffer, so a physical ED2 would
+        // erase them until a later server frame arrives. Ratatui still resets
+        // its own diff buffers; chrome repaints normally and the server owns
+        // clearing/repainting its viewport after the matching RESIZE.
+        Ok(())
     }
 
     fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+        if clear_type == ClearType::All {
+            return self.clear();
+        }
         execute!(
             self.writer,
             Clear(match clear_type {

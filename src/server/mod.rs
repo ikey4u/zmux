@@ -132,6 +132,7 @@ pub enum SessionTreeEntry {
         window_index: usize,
         pane_id: usize,
         index: usize,
+        title: String,
         is_active: bool,
     },
 }
@@ -337,11 +338,17 @@ impl InProcessServer {
                                 is_active: is_active_win,
                             });
                             for (pi, &pane_id) in pane_ids.iter().enumerate() {
+                                let title = crate::layout::find_pane_by_id(
+                                    &win.root, pane_id,
+                                )
+                                .map(|pane| pane.title.clone())
+                                .unwrap_or_default();
                                 entries.push(SessionTreeEntry::Pane {
                                     session_name: sess.name.clone(),
                                     window_index: wi,
                                     pane_id,
                                     index: pi,
+                                    title,
                                     is_active: is_active_win
                                         && Some(pane_id) == active_pane_id,
                                 });
@@ -649,8 +656,11 @@ where
     use crate::ipc::{recv_line, send_frame, send_resp};
 
     log_server("new client connection");
+    stream.set_read_timeout(Some(crate::ipc::HANDSHAKE_TIMEOUT))?;
     let mut write_stream = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
+    crate::ipc::server_handshake(&mut reader, &mut write_stream)?;
+    reader.get_ref().set_read_timeout(None)?;
 
     let hello = recv_line(&mut reader)?;
     log_server(&format!("hello line: {:?}", hello));
@@ -663,9 +673,16 @@ where
             return Ok(());
         }
         "SESSION_TREE" => {
-            let json = build_session_tree_json(&state);
-            send_resp(&mut write_stream, &json)?;
-            log_server("SESSION_TREE served, closing");
+            // Tree polling does not attach a terminal or resize any panes.
+            // Keep this read-only connection alive for subsequent requests;
+            // one-shot clients remain compatible by closing after the reply.
+            loop {
+                let json = build_session_tree_json(&state);
+                send_resp(&mut write_stream, &json)?;
+                if recv_line(&mut reader)?.as_str() != "SESSION_TREE" {
+                    break;
+                }
+            }
             return Ok(());
         }
         "OPTIONS" => {
@@ -726,8 +743,8 @@ where
 
     let sz_line = recv_line(&mut reader)?;
     log_server(&format!("size line: {:?}", sz_line));
-    let (rows, cols) = parse_size_line(&sz_line).unwrap_or((24, 80));
-    let new_size = Size::new(rows, cols);
+    let new_size =
+        parse_size_line(&sz_line).unwrap_or_else(|| Size::new(24, 80));
     let mut last_frame_sequence =
         latest_frame.lock().map(|store| store.sequence).unwrap_or(0);
     {
@@ -819,8 +836,7 @@ where
             }
         } else if line.starts_with("RESIZE ") {
             let rest = &line["RESIZE ".len()..];
-            if let Some((rows, cols)) = parse_size_line(rest) {
-                let new_size = Size::new(rows, cols);
+            if let Some(new_size) = parse_size_line(rest) {
                 if let Ok(mut sz) = size_arc.lock() {
                     *sz = new_size;
                 }
@@ -1361,12 +1377,16 @@ fn build_session_tree_json(state: &Arc<Mutex<Server>>) -> String {
             ));
 
             for (pi, &pane_id) in pane_ids.iter().enumerate() {
+                let title = crate::layout::find_pane_by_id(&win.root, pane_id)
+                    .map(|pane| pane.title.as_str())
+                    .unwrap_or_default();
                 out.push_str(&format!(
-                    ",{{\"type\":\"pane\",\"session_name\":{},\"window_index\":{},\"pane_id\":{},\"index\":{},\"is_active\":{}}}",
+                    ",{{\"type\":\"pane\",\"session_name\":{},\"window_index\":{},\"pane_id\":{},\"index\":{},\"title\":{},\"is_active\":{}}}",
                     serde_json::to_string(&sess.name).unwrap_or_default(),
                     wi,
                     pane_id,
                     pi,
+                    serde_json::to_string(title).unwrap_or_default(),
                     is_active_win && Some(pane_id) == active_pane_id
                 ));
             }
@@ -1488,11 +1508,16 @@ fn write_pty_input(writer: &mut dyn Write, bytes: &[u8]) -> io::Result<()> {
     writer.flush()
 }
 
-fn parse_size_line(s: &str) -> Option<(u16, u16)> {
-    let mut parts = s.split('x');
-    let rows: u16 = parts.next()?.parse().ok()?;
-    let cols: u16 = parts.next()?.parse().ok()?;
-    Some((rows, cols))
+fn parse_size_line(s: &str) -> Option<Size> {
+    let (dimensions, origin) = s.split_once('+').unwrap_or((s, ""));
+    let (rows, cols) = dimensions.split_once('x')?;
+    let rows = rows.parse().ok()?;
+    let cols = cols.parse().ok()?;
+    if origin.is_empty() {
+        return Some(Size::new(rows, cols));
+    }
+    let (x, y) = origin.split_once('+')?;
+    Some(Size::viewport(rows, cols, x.parse().ok()?, y.parse().ok()?))
 }
 
 fn decode_hex(s: &str) -> Result<Vec<u8>, ()> {
@@ -1562,7 +1587,7 @@ fn render_loop(
     state: Arc<Mutex<Server>>,
     latest_frame: Arc<Mutex<FrameStore>>,
     size: Arc<Mutex<Size>>,
-    socket_name: Option<String>,
+    _socket_name: Option<String>,
 ) {
     let mut first = true;
     let mut last_layout_fp = 0u64;
@@ -1608,7 +1633,7 @@ fn render_loop(
         if should_exit {
             log_server("render loop found server empty, exiting");
             #[cfg(unix)]
-            if let Some(socket_name) = socket_name.as_deref() {
+            if let Some(socket_name) = _socket_name.as_deref() {
                 if let Ok(path) = crate::ipc::socket_path(socket_name) {
                     let _ = std::fs::remove_file(path);
                 }
@@ -2038,6 +2063,10 @@ fn dispatch_command_output(
             cmd_rename_window(state, cmd);
             String::new()
         }
+        "rename-pane" | "renamep" => {
+            cmd_rename_pane(state, cmd);
+            String::new()
+        }
         "rename-session" | "rename-s" => {
             cmd_rename_session(state, cmd);
             String::new()
@@ -2064,6 +2093,7 @@ fn dispatch_command_output(
         }
         "list-sessions" | "ls" => cmd_list_sessions(state),
         "set-pane-start-dir" => cmd_set_pane_start_dir(state),
+        "set-workspace-home" => cmd_set_workspace_home(state),
         "zoom-pane" | "zoomp" => {
             cmd_zoom_pane(state, sz);
             String::new()
@@ -2227,8 +2257,9 @@ fn cmd_new_session(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
         return;
     }
     let start_dir = state
-        .active_session()
-        .and_then(active_window_start_dir)
+        .workspace_home
+        .clone()
+        .or_else(|| state.active_session().and_then(active_window_start_dir))
         .or_else(crate::pty::default_start_dir);
     if make_session_with_start_dir(state, &name, sz, start_dir).is_err() {
         return;
@@ -2310,6 +2341,7 @@ fn cmd_list_sessions(state: &Server) -> String {
 }
 
 fn cmd_split_window(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
+    let workspace_home = state.workspace_home.clone();
     let direction = if cmd.flag("h") {
         SplitDirection::Horizontal
     } else {
@@ -2343,9 +2375,8 @@ fn cmd_split_window(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
                 Some(w) => w,
                 None => return,
             };
-            let start_dir = win
-                .default_start_dir
-                .clone()
+            let start_dir = workspace_home
+                .or_else(|| win.default_start_dir.clone())
                 .or_else(|| active_pane_start_dir(win))
                 .or_else(crate::pty::default_start_dir);
             if let Some(p) =
@@ -2404,6 +2435,7 @@ fn cmd_split_window(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
 }
 
 fn cmd_new_window(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
+    let workspace_home = state.workspace_home.clone();
     let scroll_on_erase_in_display = state.options.scroll_on_erase_in_display;
     let history_limit = state.options.history_limit;
     let zmux_socket = state.socket_name.clone();
@@ -2415,7 +2447,8 @@ fn cmd_new_window(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
         let pane_id = session.alloc_pane_id();
         let window_id = session.alloc_window_id();
         let name = cmd.flag_value("n").unwrap_or("shell").to_string();
-        let start_dir = active_window_start_dir(session);
+        let start_dir =
+            workspace_home.or_else(|| active_window_start_dir(session));
 
         let (rows, cols) = root_pane_size(sz);
         let pane = match spawn_pane(SpawnOptions {
@@ -2455,6 +2488,16 @@ fn cmd_new_window(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
     }
 
     resize_all_panes(state, sz);
+}
+
+fn cmd_set_workspace_home(state: &mut Server) -> String {
+    let cwd = state
+        .active_session()
+        .and_then(|session| session.windows.get(session.active_window_idx))
+        .and_then(active_pane_start_dir);
+    let Some(cwd) = cwd else { return String::new() };
+    state.workspace_home = Some(cwd.clone());
+    cwd
 }
 
 fn cmd_set_pane_start_dir(state: &mut Server) -> String {
@@ -2690,8 +2733,28 @@ fn cmd_rename_window(state: &mut Server, cmd: &ParsedCommand) {
     }
 }
 
+fn cmd_rename_pane(state: &mut Server, cmd: &ParsedCommand) {
+    let session = match active_session_mut(state) {
+        Some(session) => session,
+        None => return,
+    };
+    let window = match session.windows.get_mut(session.active_window_idx) {
+        Some(window) => window,
+        None => return,
+    };
+    let path = window.active_pane_path.clone();
+    let pane = match crate::layout::active_pane_mut(&mut window.root, &path) {
+        Some(pane) => pane,
+        None => return,
+    };
+    if let Some(name) = cmd.args.first() {
+        pane.title = name.clone();
+        pane.title_locked = true;
+    }
+}
+
 fn cmd_rename_session(state: &mut Server, cmd: &ParsedCommand) {
-    let session = match state.sessions.first_mut() {
+    let session = match active_session_mut(state) {
         Some(s) => s,
         None => return,
     };
@@ -2963,6 +3026,20 @@ fn json_escape_status(s: &str, out: &mut String) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn size_line_supports_viewport_origin_and_legacy_clients() {
+        let viewport = parse_size_line("24x90+30+0").unwrap();
+        assert_eq!(
+            (viewport.rows, viewport.cols, viewport.x, viewport.y),
+            (24, 90, 30, 0)
+        );
+        let legacy = parse_size_line("23x120").unwrap();
+        assert_eq!(
+            (legacy.rows, legacy.cols, legacy.x, legacy.y),
+            (23, 120, 0, 0)
+        );
+    }
+
     fn test_frame() -> FrameData {
         serde_json::from_str(
             r#"{"type":"frame","layout":{"type":"leaf","id":1,"rows":1,"cols":1,"cursor_row":0,"cursor_col":0,"hide_cursor":false,"alternate_screen":false,"mouse_mode":0,"in_copy_mode":false,"cursor_shape":0,"active":true,"rows_v2":[]},"ansi":""}"#,
@@ -3056,6 +3133,38 @@ mod tests {
                 .remove(0);
         assert!(cmd_set_option(&mut state, &invalid).contains("between 0"));
         assert_eq!(state.options.history_limit, 23);
+        kill_all_panes(&mut state);
+        Ok(())
+    }
+
+    #[test]
+    fn rename_commands_update_the_active_session_and_pane() -> io::Result<()> {
+        let sz = Size::new(24, 80);
+        let mut state = Server::new();
+        make_session(&mut state, "first", sz)?;
+        make_session(&mut state, "second", sz)?;
+        state.active_session_idx = 1;
+
+        let rename_session =
+            ParsedCommand::parse("rename-session workspace").remove(0);
+        cmd_rename_session(&mut state, &rename_session);
+        assert_eq!(state.sessions[0].name, "first");
+        assert_eq!(state.sessions[1].name, "workspace");
+
+        let rename_pane = ParsedCommand::parse("rename-pane editor").remove(0);
+        cmd_rename_pane(&mut state, &rename_pane);
+        let pane = state.sessions[1]
+            .active_window()
+            .and_then(|window| {
+                crate::layout::active_pane(
+                    &window.root,
+                    &window.active_pane_path,
+                )
+            })
+            .unwrap();
+        assert_eq!(pane.title, "editor");
+        assert!(pane.title_locked);
+
         kill_all_panes(&mut state);
         Ok(())
     }

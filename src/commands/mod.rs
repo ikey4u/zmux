@@ -1,10 +1,5 @@
 use std::collections::HashMap;
 
-use crate::types::{
-    events::ServerMsg,
-    session::{ClientId, SessionId},
-};
-
 #[derive(Debug, Clone)]
 pub struct ParsedCommand {
     pub name: String,
@@ -82,7 +77,7 @@ fn parse_single(s: &str) -> Option<ParsedCommand> {
     let mut args = Vec::new();
     let mut flags: HashMap<String, Option<String>> = HashMap::new();
 
-    let mut remaining: Vec<String> = it.collect();
+    let remaining: Vec<String> = it.collect();
     let mut i = 0;
     while i < remaining.len() {
         let tok = &remaining[i];
@@ -123,7 +118,8 @@ fn parse_single(s: &str) -> Option<ParsedCommand> {
 }
 
 const FLAG_HAS_VALUE: &[char] = &[
-    't', 's', 'n', 'c', 'F', 'f', 'l', 'w', 'h', 'e', 'p', 'T', 'C', 'L', 'I',
+    't', 's', 'm', 'n', 'c', 'F', 'f', 'l', 'w', 'h', 'e', 'p', 'T', 'C', 'L',
+    'I',
 ];
 
 fn tokenize(s: &str) -> Vec<String> {
@@ -166,4 +162,17 @@ fn tokenize(s: &str) -> Vec<String> {
         tokens.push(current);
     }
     tokens
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_machine_flag_consumes_ssh_host() {
+        let command = ParsedCommand::parse("new -m user@prod").remove(0);
+        assert_eq!(command.name, "new");
+        assert_eq!(command.flag_value("m"), Some("user@prod"));
+        assert!(command.args.is_empty());
+    }
 }

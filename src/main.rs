@@ -11,7 +11,7 @@ use zmux::{
     name = "zmux",
     version = ZMUX_VERSION,
     about = "Cross-platform terminal multiplexer",
-    after_help = "Examples:\n  Start or attach to the default zmux server:\n    zmux\n\n  Start an isolated test instance without touching your current session:\n    zmux --clean -L test-scroll\n\n  Attach to all running servers as tabs:\n    zmux a\n\n  Attach only to the selected socket:\n    zmux -L test-scroll a --single\n\n  List sessions for that isolated test instance:\n    zmux -L test-scroll ls\n\n  Start in a specific working directory:\n    zmux -c /path/to/project\n\n  Open the runtime options panel inside zmux:\n    Prefix + O"
+    after_help = "Examples:\n  Start or attach to the default zmux server:\n    zmux\n\n  Start an isolated test instance without touching your current session:\n    zmux --clean -L test-scroll\n\n  Show all running servers in the machine tree:\n    zmux a\n\n  Attach only to the selected socket:\n    zmux -L test-scroll a --single\n\n  List sessions for that isolated test instance:\n    zmux -L test-scroll ls\n\n  Start in a specific working directory:\n    zmux -c /path/to/project\n\n  Open the runtime options panel inside zmux:\n    Prefix + O"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -36,8 +36,6 @@ enum Cmd {
     New {
         #[arg(short = 's', long)]
         session: Option<String>,
-        #[arg(short = 't', long = "tab")]
-        tab: Option<String>,
     },
     #[command(name = "a", alias = "attach", alias = "attach-session")]
     Attach {
@@ -59,6 +57,16 @@ enum Cmd {
     },
     #[command(name = "server")]
     Server,
+    /// Print a machine-readable protocol declaration; does not start a server.
+    #[command(name = "protocol-info")]
+    ProtocolInfo,
+    #[command(name = "mux", hide = true)]
+    Mux {
+        #[arg(long)]
+        stdio: bool,
+        #[arg(long)]
+        start_if_missing: bool,
+    },
     #[clap(external_subcommand)]
     External(Vec<String>),
 }
@@ -70,6 +78,12 @@ fn main() -> io::Result<()> {
     let socket = cli.socket.clone();
 
     match cli.command {
+        Some(Cmd::ProtocolInfo) => {
+            println!(
+                "{}",
+                serde_json::to_string(&zmux::ipc::ProtocolInfo::current())?
+            );
+        }
         Some(Cmd::Server) => {
             run_server_daemon(
                 &socket,
@@ -77,15 +91,21 @@ fn main() -> io::Result<()> {
                 cli.directory.as_deref(),
             )?;
         }
-        Some(Cmd::New { session, tab }) => {
-            ClientApp::new_with_initial_tab_title(
-                &socket,
-                session,
-                cli.clean,
-                cli.directory.clone(),
-                tab,
-            )
-            .run()?;
+        Some(Cmd::Mux {
+            stdio,
+            start_if_missing,
+        }) => {
+            if !stdio {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "mux currently requires --stdio",
+                ));
+            }
+            run_stdio_mux(&socket, start_if_missing)?;
+        }
+        Some(Cmd::New { session }) => {
+            ClientApp::new(&socket, session, cli.clean, cli.directory.clone())
+                .run()?;
         }
         Some(Cmd::Attach { target, single, .. }) => {
             if single {
@@ -123,6 +143,71 @@ fn main() -> io::Result<()> {
     }
 
     Ok(())
+}
+
+fn run_stdio_mux(socket_name: &str, start_if_missing: bool) -> io::Result<()> {
+    use std::{io::Read, thread, time::Duration};
+    use zmux::ipc::connect_client;
+
+    let mut stream = match connect_client(socket_name) {
+        Ok(stream) => stream,
+        Err(first_error)
+            if start_if_missing
+                && matches!(
+                    first_error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) =>
+        {
+            let exe = std::env::current_exe()?;
+            zmux::platform::spawn_server_background(
+                &exe,
+                socket_name,
+                "0",
+                None,
+            )?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                match connect_client(socket_name) {
+                    Ok(stream) => break stream,
+                    Err(error) if std::time::Instant::now() < deadline => {
+                        let _ = error;
+                        thread::sleep(Duration::from_millis(25));
+                    }
+                    Err(_) => return Err(first_error),
+                }
+            }
+        }
+        Err(error) => return Err(error),
+    };
+    let mut server_reader = stream.try_clone()?;
+    // Let server EOF end the bridge even when SSH stdin remains open (for
+    // example after a one-shot response or a remote server shutdown).
+    thread::spawn(move || -> io::Result<()> {
+        let mut stdin = io::stdin().lock();
+        let mut buffer = [0u8; 8192];
+        loop {
+            let read = stdin.read(&mut buffer)?;
+            if read == 0 {
+                let _ = stream.write_all(b"CMD detach\n");
+                let _ = stream.flush();
+                return Ok(());
+            }
+            stream.write_all(&buffer[..read])?;
+            stream.flush()?;
+        }
+    });
+    let mut stdout = io::stdout().lock();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = server_reader.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(());
+        }
+        stdout.write_all(&buffer[..read])?;
+        // Protocol JSON bodies have no newline. Line-buffered stdout can hold
+        // a short tree response indefinitely unless each read is flushed.
+        stdout.flush()?;
+    }
 }
 
 fn run_server_daemon(
@@ -181,8 +266,17 @@ fn list_server_sessions(socket_name: &str) -> io::Result<Option<String>> {
 
     let stream = match connect_client(socket_name) {
         Ok(s) => s,
-        Err(_) => return Ok(None),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(None)
+        }
+        Err(error) => return Err(error),
     };
+    let stream = zmux::ipc::negotiate_client(stream)?;
     let mut write_stream = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
     write_stream.write_all(b"LIST\n")?;
@@ -234,8 +328,17 @@ fn kill_server(socket_name: &str) -> io::Result<bool> {
 
     let stream = match connect_client(socket_name) {
         Ok(s) => s,
-        Err(_) => return Ok(false),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(false)
+        }
+        Err(error) => return Err(error),
     };
+    let stream = zmux::ipc::negotiate_client(stream)?;
     let mut write_stream = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
     write_stream.write_all(b"KILL_SERVER\n")?;

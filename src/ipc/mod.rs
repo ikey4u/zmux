@@ -30,6 +30,13 @@ pub trait IpcStream: io::Read + io::Write + Send + 'static {
     fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
 }
 
+pub fn negotiate_client<S: IpcStream>(mut stream: S) -> io::Result<S> {
+    stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    client_handshake(&mut stream)?;
+    stream.set_read_timeout(None)?;
+    Ok(stream)
+}
+
 #[cfg(unix)]
 impl IpcStream for std::os::unix::net::UnixStream {
     fn try_clone(&self) -> io::Result<Self> {

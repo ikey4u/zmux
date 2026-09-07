@@ -1,16 +1,153 @@
 # zmux
 
-`zmux` is a cross-platform terminal multiplexer written in Rust. It is designed for fast, keyboard-driven terminal workflows with a lightweight client/server architecture and a focused feature set for everyday interactive use.
+`zmux` is a cross-platform terminal multiplexer written in Rust. It brings local
+and SSH terminal work into one keyboard-driven workspace explorer, backed by
+lightweight client/server connections that keep sessions alive after detach.
 
-It currently supports pane, window, and session management, detach and attach workflows, command mode, copy mode, cwd-aware splits, and Vim-style pane navigation. The project aims to stay compact, predictable, and easy to extend while providing the core ergonomics expected from a modern terminal multiplexer.
+The new UI replaces the flat tab bar with a left navigation tree:
+`Machine → Workspace → Session → Window → Pane`. Former tabs live on as
+Workspace nodes; they are not flattened into machines or confused with windows.
 
 ## Highlights
 
 - Cross-platform terminal multiplexer implemented in Rust
-- Keyboard-first workflow for panes, windows, and sessions
-- Background server model with clean attach and detach behavior
+- One navigation tree for local and SSH machines, with independent Workspaces
+- NERDTree-inspired navigation, node operations, and built-in shortcut help
+- Automatic remote session-tree discovery after connecting through zmux's SSH workflow
+- Show/hide the sidebar without leaving the current terminal workflow
+- Persistent machine and Workspace display names, separate from connection identities
+- Background servers with clean attach/detach behavior and surviving sessions
 - Built-in command mode and copy mode for interactive terminal work
 - Working-directory-aware splits and practical default shortcuts
+
+## Design: a workspace explorer, not a tab strip
+
+Each level has a distinct responsibility:
+
+| Level | Responsibility |
+|-------|----------------|
+| Machine | A local host or an explicitly connected SSH destination |
+| Workspace | An independent zmux server/socket, containing one or more sessions; replaces the former client Tab |
+| Session | A named collection of windows within a Workspace |
+| Window | A terminal layout within a session |
+| Pane | An individual terminal/shell in that layout (sometimes called a panel) |
+
+For example, an expanded tree can look like this; labels are illustrative:
+
+```text
+MACHINE-01 (local)
+├── WORKSPACE-01
+│   └── SESSION-01
+│       └── WINDOW-01
+│           ├── PANE-01
+│           └── PANE-02
+└── WORKSPACE-02
+    └── SESSION-02
+        └── WINDOW-02
+            └── PANE-01
+MACHINE-02 (SSH)
+└── WORKSPACE-01
+    └── SESSION-01
+        └── WINDOW-01
+            └── PANE-01
+```
+
+Names may repeat across machines or Workspaces without identifying the same
+session or pane. Opening a node targets its owning Workspace;
+renaming a machine or Workspace changes its display label, not its SSH address
+or server socket. Closing a Workspace detaches this client from it, while its
+server and sessions remain available for reattachment. Closing a session,
+window, or pane is a different operation and can end the processes inside it.
+
+The sidebar is a navigation surface, not another terminal pane, and is **hidden
+by default** on client startup. `Prefix+m` opens the same tree in a centered
+popup without resizing terminal panes. `Esc`, `q`, a click outside, or
+`Prefix+m` closes the popup; opening a node closes it and activates that target.
+`Prefix+M` toggles the fixed left sidebar across the current client's Workspaces.
+These shortcuts work globally, including when connected through SSH. Dismissing
+the popup or toggling the fixed sidebar preserves unfinished command input.
+
+In the fixed sidebar, `q` or `Esc` hides it and returns focus to the terminal.
+Hiding either navigation surface does not disconnect machines
+or close sessions. Only fixed-sidebar visibility changes resize the server viewport;
+popup navigation overlays it and restores covered panes when dismissed.
+
+Navigation borrows NERDTree's hierarchy-oriented workflow: `j/k` to select,
+`l` to expand, `h`/`←` to collapse or select the parent, and `r`/`K` to rename
+or delete a node (confirmation required). `H` opens the navigation shortcut reference.
+See
+[Machine Navigation](#machine-navigation) for the full key map.
+
+## SSH: connect once, discover remote sessions automatically
+
+The default Prefix is `Ctrl+a`. Start a local client with `zmux`, press
+`Prefix+:`, then enter this **zmux command** (not a shell command):
+
+```text
+new -m user@server
+```
+
+An SSH config alias works too, for example `new -m production`.
+
+1. zmux adds the destination as a peer Machine root and probes it asynchronously.
+2. The system SSH client reads `zmux protocol-info` and checks the wire-version
+   contract and required capabilities, including the stdio bridge.
+3. zmux attaches through the bridge and negotiates again with the **running
+   server** before sending commands or resizing panes. If the socket is absent,
+   the bridge starts a server with an initial session named `0`.
+4. Once attached, zmux automatically loads and displays that Workspace's
+   sessions, windows, and panes under the remote Machine. There is no separate
+   nested remote TUI to open or list of sessions to enter manually.
+5. The tree refreshes in the background as sessions and layouts change. Select
+   a remote node and use the same navigation, rename, close, split, and focus
+   controls as for local work.
+
+`Prefix+m` opens the floating explorer; `Prefix+M` shows the fixed sidebar.
+`R` on the remote Machine
+re-probes the connection. Unexpected disconnections retry with bounded
+exponential backoff. Missing zmux/PATH, invalid protocol declarations, incompatible
+wire versions, and missing capabilities stop automatic retries; fix the cause,
+then press `R` or run `new -m` again. Deliberately closing a connection detaches it.
+Local and remote machine/Workspace labels are saved in the same
+[display-name configuration](#display-name-persistence).
+
+### Requirements and discovery scope
+
+Compatibility is independent of the application version. Both endpoints must
+use the same protocol major, meet each other's minimum minor, and support each
+other's required capabilities. Every socket/stdio connection enforces a handshake,
+including control, frames, tree queries, `ls`, and `kill-server`. The current wire
+protocol is **2.0**; unnegotiated legacy clients/servers are rejected, not silently
+downgraded. Inspect the declaration with `zmux protocol-info` (or
+`ssh host zmux protocol-info`). Updating the binary does not update an already
+running server: save its work and restart it safely using its compatible old
+client, or use a fresh Workspace socket. No automatic installation, server
+replacement, or session termination occurs on incompatibility; `--clean` also
+refuses a live socket. See [protocol design and upgrade rules](docs/protocol.md).
+
+- The remote host needs a POSIX-compatible shell and a compatible `zmux` on
+  the **non-interactive SSH command PATH**. zmux does not install itself remotely.
+- SSH uses batch mode: authentication must already work without interactive
+  password prompts, for example through keys or an SSH agent. Host-key trust
+  must also be established. OpenSSH handles aliases, `ProxyJump`, `ProxyCommand`,
+  `IdentityFile`, authentication, and host-key checking.
+- The remote Workspace uses the client's base socket name: `default` for
+  `zmux`, or `dev` when the client was started with `zmux -L dev`. Discovery
+  includes all sessions in that remote Workspace, **not every server socket
+  on the remote host**. Local `zmux a` can discover multiple local Workspaces.
+- Automatic discovery begins after `new -m` connects. A plain `ssh host`
+  typed inside a pane remains a normal shell command; it does **not** currently
+  create a Machine node automatically. zmux also does not import every host
+  from `~/.ssh/config` or modify remote shell startup files.
+- Display names persist, but the remote connection list is not restored on
+  client restart. Run `new -m` again to reconnect and reuse the saved labels.
+
+If the remote node reports unavailable, verify authentication and the remote
+command environment from your shell:
+
+```sh
+ssh user@server 'command -v zmux && zmux mux --help'
+```
 
 ## Shortcuts
 
@@ -19,6 +156,14 @@ It currently supports pane, window, and session management, detach and attach wo
 The default prefix key is `Ctrl+a`. All prefix shortcuts require pressing the
 prefix key first, then the action key. Pressing `Ctrl+a` twice sends a literal
 `Ctrl+a` to the current pane.
+
+Enter command mode with `Prefix+:`, then type `h` or `help` (`:h` / `:help`)
+to open the full zmux shortcut reference in a popup, including pane,
+window, session, sidebar, copy-mode, prompt, mouse, and options controls.
+Use `j/k`, arrows, PageUp/PageDown, or the mouse wheel to scroll, and
+`g/G` or Home/End to jump to either end. `Esc`, `q`, or `H`
+closes it and restores the terminal view.
+The sidebar's bare `H` still opens its navigation-only help.
 
 ---
 
@@ -32,7 +177,7 @@ prefix key first, then the action key. Pressing `Ctrl+a` twice sends a literal
 | `Prefix + z` | Maximize the current pane, or restore it when pressed again |
 | `Prefix + K` | Completely clear the current pane output history, including copy mode history |
 | `Prefix + b` | Toggle pane borders on or off |
-| `Prefix + H` | Set the current pane's current directory as the working directory for future splits |
+| `Prefix + H` | Set the current pane's cwd as Home for this Workspace only |
 | `Prefix + ]` | Paste clipboard text, image, or files into the focused pane. Uses the OS clipboard when available, otherwise `zsync` |
 | `Cmd+V` / `Super+V` | Paste through the same clipboard path when the terminal forwards the key to zmux (see Remote Clipboard below) |
 | `Prefix + h` | Move focus to the pane on the left, in Vim style |
@@ -58,20 +203,51 @@ prefix key first, then the action key. Pressing `Ctrl+a` twice sends a literal
 
 ---
 
-### Tab Operations
+### Machine Navigation
 
-Each tab is backed by an independent server. Sessions, windows, and panes are isolated between tabs.
+The local Machine is the first root, followed by explicitly connected SSH
+machines. Workspace labels default to socket names. `zmux -L <name>` starts or
+attaches a Workspace; `zmux a` discovers running local Workspaces, including
+legacy tab server sockets. All levels use the same tree controls below.
 
 | Shortcut / Action | Action |
 |-------------------|--------|
-| `Prefix + t` | Open the tab chooser. Use `↑`/`↓` or `j`/`k` to move, `/` or `?` to search by tab code/title, `Ctrl+j`/`Ctrl+k` to move within search results while search is active, `R` to rename the selected tab, `Enter` to switch, and `q` or `Esc` to close |
-| `Prefix + /` | Open a centered quick-switch input. Enter a two-letter tab code, then press `Enter` to switch directly to that tab. Hidden tabs are shown automatically before switching. If the code is invalid or not found, the input stays open with an error so you can re-enter it. Press `Esc` to cancel |
-| `Prefix + Tab` | Switch to the next tab |
-| `Prefix + Shift+Tab` | Switch to the previous tab |
-| `Prefix + T` | Open the tab rename dialog. Use `Tab` to switch between the code and title fields. The two-letter code must be unique; press `Enter` to move from code to title and press `Enter` again to save, or `Esc` to cancel |
-| `Prefix + w` | Close the current tab |
-| Click a visible tab in the top tab bar | Switch to that tab |
-| Click `...` in the top tab bar | Open the searchable tab chooser |
+| `Prefix + m` | Open/close the floating sidebar tree without resizing panes |
+| `Prefix + M` | Toggle the fixed sidebar, hidden by default |
+| `H` (sidebar focused) | Show the complete shortcut reference; `j/k`, PageUp/PageDown or mouse wheel scroll, `Esc` or `H` returns |
+| `Prefix + h` | Move to the pane on the left; when already at the left edge, enter the machine tree |
+| `Prefix + l` (tree focused) | Return focus to the terminal |
+| `↑`/`↓` or `j`/`k` | Move through visible tree nodes |
+| `←`/`h` | Collapse the selected node, or move to its parent |
+| `→`/`l` | Expand the selected node, move to its first child, or open a leaf pane |
+| `Enter` | Open the selected machine, workspace, session, window, or pane |
+| `Home`/`g`, `End`/`G` | Jump to the first or last visible node |
+| `r` | Rename any selected machine (including local/offline machines), workspace, session, window, or pane |
+| `K` (also `d` / `Delete`) | Delete the selected node after confirmation; only `y/Y` confirms, `n`, `Esc`, or Enter cancels |
+| `R` | Re-probe the selected machine, or refresh the active workspace |
+| `q` or `Esc` | Close the navigation popup, or hide the focused fixed sidebar |
+| Click `▸`/`▾` | Expand or collapse that branch |
+| Click a node name | Connect or open that machine, workspace, session, window, or pane |
+
+Deletion applies to every node level. Removing an SSH Machine removes its tree
+node and detaches its Workspace connections without killing remote servers.
+Removing a Workspace detaches it; sessions remain available for reattachment.
+Deleting a Session, Window, or Panel ends the processes it owns. Existing guards
+protect the local Machine root and the last Session/Window/Panel.
+
+The tab bar and old tab commands remain removed; workspace nodes replace their
+organization role. The old `Prefix+t/T/S` shortcuts are removed. Sidebar navigation
+no longer binds `T`, `p/P`, `J`, Space, `o`, Tab, or `Prefix+j/k`; bare `K` now deletes.
+Pane-direction shortcuts outside the sidebar are unchanged. Direction keys also work if Ctrl is still
+held after the prefix (including Ctrl+h / Backspace).
+
+#### Display-name persistence
+
+Machine and workspace display names are persisted in `~/.config/zmux/machines.json` (or
+`$XDG_CONFIG_HOME/zmux/machines.json`). When `ZMUX_CONFIG` is set, `machines.json`
+is stored beside that configuration file. Renaming changes only the display
+name, never the SSH destination. Names survive detach/restart; remote roots
+are added again with `:new -m <SSH_HOST>` and reuse their saved names.
 
 ---
 
@@ -83,7 +259,6 @@ Each tab is backed by an independent server. Sessions, windows, and panes are is
 | `Prefix + $` | Rename the current session, then press Enter to confirm or Esc to cancel |
 | `Prefix + (` | Switch to the previous session |
 | `Prefix + )` | Switch to the next session |
-| `Prefix + s` | Open the interactive tree view of all sessions and windows. Use Enter to select, `j` or `k` to navigate, `l` to expand, `h` to collapse, and `q` or `Esc` to close |
 | `Prefix + :` | Enter command mode. Type a zmux command and press Enter to execute it, or Esc to cancel |
 
 ---
@@ -93,10 +268,9 @@ Each tab is backed by an independent server. Sessions, windows, and panes are is
 | Command | Action |
 |---------|--------|
 | `zmux` | Start zmux. If a background server already exists, it attaches automatically |
-| `zmux new -t <title>` | Start zmux with an initial client-side tab title |
-| `zmux a` / `zmux attach` | Attach to an existing background server. Client-side tab layout is not restored from another client |
-| `zmux ls` / `zmux list-sessions` | List sessions for the base socket and its tab server sockets such as `<socket>.tab.*` |
-| `zmux -L <name>` | Specify the base socket name, defaulting to `default`. New tabs use derived socket names like `<name>.tab.<pid>.<id>` |
+| `zmux a` / `zmux attach` | Attach to running servers and show their sessions in the machine tree; use `--single` for only the selected socket |
+| `zmux ls` / `zmux list-sessions` | List sessions for the base socket and any legacy derived server sockets |
+| `zmux -L <name>` | Specify the server socket name, defaulting to `default` |
 | `zmux -s <name>` | Specify the name of the new session |
 | `zmux server` | Start the server in daemon mode. This is usually invoked automatically by zmux and does not need to be run manually |
 | `zmux kill-server [SOCKET]...` | Stop one or more background servers. Without arguments it stops the current `-L` socket |
@@ -106,11 +280,7 @@ Each tab is backed by an independent server. Sessions, windows, and panes are is
 
 | Command | Action |
 |---------|--------|
-| `new -t <title>` / `new-tab -t <title>` | Create a new tab backed by an independent server and set its title. Use `new -t ""` for an empty title |
-| `select-tab -t <code\|index\|title>` | Switch to a client-side tab by code, zero-based index, or exact title |
-| `rename-tab -c <code> -t <title>` | Rename the active tab's code and title. The code must be unique two uppercase letters |
-| `next-tab` / `prev-tab` | Switch to the next or previous client-side tab |
-| `list-tabs` | Show a compact summary of client-side tabs |
+| `new -m <SSH_HOST>` | Add/connect an SSH machine in the navigation tree |
 | `new -s <name>` | Create a new session and switch to it |
 | `new -s <name> -d` | Create a new session in the background without switching to it |
 | `kill-session` | Close the current session |
@@ -127,6 +297,8 @@ Each tab is backed by an independent server. Sessions, windows, and panes are is
 | `set-option -g history-limit <lines>` | Set the in-memory scrollback limit for existing and future panes (`0`–`100000`) |
 | `show-options` | Show the current server options |
 | `set-pane-start-dir` | Save the current pane's current directory as the working directory for future splits |
+| `set-workspace-home` | Set the current pane's cwd as Home for this Workspace (same as `Prefix+H`) |
+| `h`, `help` | Open the full shortcut popup in client command mode |
 | `paste-cloud` | Same as `Prefix + ]`: paste clipboard contents into the focused pane |
 
 ---
@@ -255,10 +427,17 @@ vim.opt.clipboard = "unnamedplus"
 
 ### Keys Passed Through to the Shell
 
-New panes and windows inherit the current working directory by default. Splits
-follow the current pane's cwd unless one is explicitly set. After pressing
-`Prefix + H`, future splits use the pinned working directory instead. The
-following keys are not intercepted by zmux and are passed directly to the shell
+`Prefix+H` sets the active pane's current working directory as **Workspace Home**.
+New sessions, windows, and split panes in that Workspace start there, even after
+an existing shell changes directory. Other Workspaces (local or SSH) are unaffected;
+existing shells are not moved and their `HOME` environment variable is unchanged.
+Home is held by the Workspace server: it survives client detach/reattach, but not
+server shutdown. Without Workspace Home, the existing cwd/window-start-directory
+inheritance applies. The legacy `:set-pane-start-dir` remains window-scoped;
+Workspace Home takes precedence when set. Global help is available via `:h` or
+`:help`, while bare `H` inside the sidebar shows only navigation help.
+
+The following keys are not intercepted by zmux and are passed directly to the shell
 or program running in the active pane. By default, zsh panes start with the
 Emacs line editor keymap. On Windows, default PowerShell panes initialize
 PSReadLine in Emacs mode when PSReadLine is available for cross-platform
@@ -295,3 +474,20 @@ and may define their own bindings.
 - If you press the prefix key and do not follow it with an action key, prefix mode stays active until the next key press.
 - The prefix key itself will be configurable through a config file in the future.
 - Mouse support and more configurable key bindings will be improved in future versions, and this document will be updated accordingly.
+
+### Automated regression tests
+
+Run `cargo test` for the full suite, or `cargo test --test tui` for the Unix
+PTY integration tests. These drive the compiled client and server, decode ANSI
+frames, and cover command editing, tree focus, machine/Workspace-name persistence,
+Workspace switching and detach, default-hidden sidebar, floating tree node
+operations/mouse/resize, global toggles and command-input restoration, help, window/session
+switching, repeated split/close, refresh, and terminal resizing.
+They check for lost pane content at completed synchronized frames and avoid
+global screen clears. Test servers and configuration live in isolated temporary
+directories; the runner must allow local PTYs and Unix sockets.
+
+Remote tests replace SSH with a local shim while exercising the real stdio
+bridge and a second isolated server. They do not validate real SSH networking,
+authentication, Linux execution, font rendering, or every terminal emulator's
+synchronized-update support.
