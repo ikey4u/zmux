@@ -17,6 +17,7 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
 use zmux::ipc::{client_handshake, recv_line, recv_resp, ProtocolInfo};
 
 const BIN: &str = env!("CARGO_BIN_EXE_zmux");
@@ -201,7 +202,11 @@ fn local_cli_never_replaces_or_kills_a_legacy_server_socket() {
             match listener.accept() {
                 Ok((stream, _)) => {
                     stream
-                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        // The full suite runs many PTY/process tests in
+                        // parallel. Give a just-spawned CLI enough scheduling
+                        // time to write its HELLO before treating the legacy
+                        // connection as empty.
+                        .set_read_timeout(Some(Duration::from_secs(5)))
                         .unwrap();
                     if let Ok(line) = recv_line(&mut BufReader::new(stream)) {
                         worker_requests.lock().unwrap().push(line);

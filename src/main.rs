@@ -147,6 +147,7 @@ fn main() -> io::Result<()> {
 
 fn run_stdio_mux(socket_name: &str, start_if_missing: bool) -> io::Result<()> {
     use std::{io::Read, thread, time::Duration};
+
     use zmux::ipc::connect_client;
 
     let mut stream = match connect_client(socket_name) {

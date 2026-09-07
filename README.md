@@ -90,8 +90,10 @@ new -m user@server
 An SSH config alias works too, for example `new -m production`.
 
 1. zmux adds the destination as a peer Machine root and probes it asynchronously.
-2. The system SSH client reads `zmux protocol-info` and checks the wire-version
-   contract and required capabilities, including the stdio bridge.
+2. The system SSH client resolves zmux from `ZMUX_BIN`, the SSH command
+   environment, the user's login/interactive shell, and standard user install
+   locations. It validates `protocol-info` and retains the verified absolute
+   executable path.
 3. zmux attaches through the bridge and negotiates again with the **running
    server** before sending commands or resizing panes. If the socket is absent,
    the bridge starts a server with an initial session named `0`.
@@ -105,7 +107,7 @@ An SSH config alias works too, for example `new -m production`.
 `Prefix+m` opens the floating explorer; `Prefix+M` shows the fixed sidebar.
 `R` on the remote Machine
 re-probes the connection. Unexpected disconnections retry with bounded
-exponential backoff. Missing zmux/PATH, invalid protocol declarations, incompatible
+exponential backoff. Missing zmux, invalid protocol declarations, incompatible
 wire versions, and missing capabilities stop automatic retries; fix the cause,
 then press `R` or run `new -m` again. Deliberately closing a connection detaches it.
 Local and remote machine/Workspace labels are saved in the same
@@ -125,8 +127,13 @@ client, or use a fresh Workspace socket. No automatic installation, server
 replacement, or session termination occurs on incompatibility; `--clean` also
 refuses a live socket. See [protocol design and upgrade rules](docs/protocol.md).
 
-- The remote host needs a POSIX-compatible shell and a compatible `zmux` on
-  the **non-interactive SSH command PATH**. zmux does not install itself remotely.
+- The remote host needs a POSIX-compatible shell and a compatible `zmux`.
+  Discovery checks the direct SSH environment first, then login and interactive
+  shell environments, followed by standard Cargo, local-bin, mise, asdf, and Nix
+  locations. `ZMUX_BIN` can provide an absolute path in the remote environment.
+  Once discovered, the quoted absolute path is used for every stdio bridge, so
+  bridge startup does not depend on a different SSH `PATH`. zmux does not install
+  or modify anything remotely.
 - SSH uses batch mode: authentication must already work without interactive
   password prompts, for example through keys or an SSH agent. Host-key trust
   must also be established. OpenSSH handles aliases, `ProxyJump`, `ProxyCommand`,
@@ -142,11 +149,11 @@ refuses a live socket. See [protocol design and upgrade rules](docs/protocol.md)
 - Display names persist, but the remote connection list is not restored on
   client restart. Run `new -m` again to reconnect and reuse the saved labels.
 
-If the remote node reports unavailable, verify authentication and the remote
-command environment from your shell:
+If the remote node reports unavailable, verify authentication and the same login
+environment used by discovery:
 
 ```sh
-ssh user@server 'command -v zmux && zmux mux --help'
+ssh user@server '$SHELL -lic "command -v zmux; zmux protocol-info"'
 ```
 
 ## Shortcuts
@@ -160,7 +167,7 @@ prefix key first, then the action key. Pressing `Ctrl+a` twice sends a literal
 Enter command mode with `Prefix+:`, then type `h` or `help` (`:h` / `:help`)
 to open the full zmux shortcut reference in a popup, including pane,
 window, session, sidebar, copy-mode, prompt, mouse, and options controls.
-Use `j/k`, arrows, PageUp/PageDown, or the mouse wheel to scroll, and
+Use `j/k`, arrows, `Ctrl+b`/`Ctrl+f`, PageUp/PageDown, or the mouse wheel to scroll, and
 `g/G` or Home/End to jump to either end. `Esc`, `q`, or `H`
 closes it and restores the terminal view.
 The sidebar's bare `H` still opens its navigation-only help.
@@ -214,7 +221,7 @@ legacy tab server sockets. All levels use the same tree controls below.
 |-------------------|--------|
 | `Prefix + m` | Open/close the floating sidebar tree without resizing panes |
 | `Prefix + M` | Toggle the fixed sidebar, hidden by default |
-| `H` (sidebar focused) | Show the complete shortcut reference; `j/k`, PageUp/PageDown or mouse wheel scroll, `Esc` or `H` returns |
+| `H` (sidebar focused) | Show the complete shortcut reference; `j/k`, `Ctrl+b/f`, PageUp/PageDown or mouse wheel scroll, `Esc` or `H` returns |
 | `Prefix + h` | Move to the pane on the left; when already at the left edge, enter the machine tree |
 | `Prefix + l` (tree focused) | Return focus to the terminal |
 | `↑`/`↓` or `j`/`k` | Move through visible tree nodes |
@@ -235,8 +242,9 @@ Removing a Workspace detaches it; sessions remain available for reattachment.
 Deleting a Session, Window, or Panel ends the processes it owns. Existing guards
 protect the local Machine root and the last Session/Window/Panel.
 
-The tab bar and old tab commands remain removed; workspace nodes replace their
-organization role. The old `Prefix+t/T/S` shortcuts are removed. Sidebar navigation
+The tab bar remains removed; Workspace nodes replace its organization role.
+The former `new -t` spelling now creates a Workspace instead of a visual tab.
+The old `Prefix+t/T/S` shortcuts are removed. Sidebar navigation
 no longer binds `T`, `p/P`, `J`, Space, `o`, Tab, or `Prefix+j/k`; bare `K` now deletes.
 Pane-direction shortcuts outside the sidebar are unchanged. Direction keys also work if Ctrl is still
 held after the prefix (including Ctrl+h / Backspace).
@@ -280,6 +288,7 @@ are added again with `:new -m <SSH_HOST>` and reuse their saved names.
 
 | Command | Action |
 |---------|--------|
+| `new -t <WORKSPACE_NAME>` | Create a local Workspace, persist its display name, and switch to it |
 | `new -m <SSH_HOST>` | Add/connect an SSH machine in the navigation tree |
 | `new -s <name>` | Create a new session and switch to it |
 | `new -s <name> -d` | Create a new session in the background without switching to it |

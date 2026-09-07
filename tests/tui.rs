@@ -2,9 +2,6 @@
 //! No user configuration, shells, SSH hosts, or existing servers are modified.
 #![cfg(unix)]
 
-use portable_pty::{
-    native_pty_system, Child, CommandBuilder, MasterPty, PtySize,
-};
 use std::{
     fs,
     io::{Read, Write},
@@ -13,6 +10,10 @@ use std::{
     sync::mpsc,
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use portable_pty::{
+    native_pty_system, Child, CommandBuilder, MasterPty, PtySize,
 };
 use zmux::terminal::AlacrittyTermState;
 
@@ -89,9 +90,27 @@ impl Tui {
         // second isolated socket directory.
         fs::create_dir_all(root.join("bin")).unwrap();
         fs::create_dir_all(root.join("remote")).unwrap();
+        fs::create_dir_all(root.join("login bin")).unwrap();
         fs::write(
             root.join("bin/zmux"),
             "#!/bin/sh\nexport PS1='READY> '\nexec \"$ZMUX_TEST_BIN\" \"$@\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("login bin/zmux"),
+            "#!/bin/sh\nexport PS1='READY> '\nexec \"$ZMUX_TEST_BIN\" \"$@\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("bin/login-shell"),
+            r#"#!/bin/sh
+printf 'interactive startup banner that discovery must ignore\n'
+last=''
+for argument do last=$argument; done
+PATH="$ZMUX_TEST_ROOT/login bin:/usr/bin:/bin"
+export PATH
+exec /bin/sh -c "$last"
+"#,
         )
         .unwrap();
         fs::write(
@@ -104,19 +123,30 @@ for argument do
     last=$argument
 done
 printf '%s\n' "$previous" >> "$ZMUX_TEST_ROOT/ssh-hosts"
+printf '\n---COMMAND---\n%s\n' "$last" >> "$ZMUX_TEST_ROOT/ssh-commands"
 if [ "$previous" = unavailable ]; then exit 255; fi
 case "$previous" in
+    login-path)
+        PATH=/usr/bin:/bin
+        case "$last" in
+            *'ZMUX DISCOVERY 1'*) SHELL="$ZMUX_TEST_ROOT/bin/login-shell" ;;
+            *) SHELL=/bin/sh ;;
+        esac
+        export PATH SHELL ;;
     protocol-missing)
         if [ ! -f "$ZMUX_TEST_ROOT/repair-missing" ]; then exit 127; fi ;;
     protocol-legacy)
         printf 'unknown command protocol-info\n' >&2
         exit 2 ;;
     protocol-major|protocol-caps|protocol-schema|protocol-noisy)
+        printf 'ZMUX DISCOVERY 1\n%s\n' "$ZMUX_TEST_ROOT/bin/zmux"
         cat "$ZMUX_TEST_ROOT/$previous.json"
         exit 0 ;;
     stale-server)
         case "$last" in
-            *protocol-info*) exec "$ZMUX_TEST_BIN" protocol-info ;;
+            *protocol-info*)
+                printf 'ZMUX DISCOVERY 1\n%s\n' "$ZMUX_TEST_ROOT/bin/zmux"
+                exec "$ZMUX_TEST_BIN" protocol-info ;;
             *) printf 'ZMUX REJECT {"code":"protocol_version_mismatch","message":"running server is older than the installed binary"}\n'; exit 0 ;;
         esac ;;
 esac
@@ -136,6 +166,16 @@ exec /bin/sh -c "$last"
         .unwrap();
         fs::set_permissions(
             root.join("bin/ssh"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        fs::set_permissions(
+            root.join("bin/login-shell"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        fs::set_permissions(
+            root.join("login bin/zmux"),
             fs::Permissions::from_mode(0o700),
         )
         .unwrap();
@@ -347,6 +387,32 @@ impl Drop for Tui {
             .status();
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+#[test]
+fn remote_login_shell_path_is_discovered_and_reused_by_the_bridge() {
+    let mut tui = Tui::start();
+    tui.ready();
+    tui.command("new -m login-path");
+    tui.wait("remote zmux found through login shell", |rows| {
+        rows.iter().any(|line| line.contains("● login-path"))
+            && rows.iter().filter(|line| line.contains("▣ ui")).count() == 2
+            && rows.iter().any(|line| line.contains("*[0] shell*"))
+    });
+    tui.send(b"echo LOGIN_PATH_REMOTE\r");
+    tui.wait("absolute-path bridge carries terminal input", |rows| {
+        rows.iter()
+            .filter(|line| line.contains("LOGIN_PATH_REMOTE"))
+            .count()
+            >= 2
+    });
+    let commands = fs::read_to_string(tui.root.join("ssh-commands")).unwrap();
+    let executable = tui.root.join("login bin/zmux");
+    assert!(
+        commands
+            .contains(&format!("exec '{}' -L ui mux", executable.display())),
+        "bridge did not reuse discovered absolute path:\n{commands}"
+    );
 }
 
 #[test]
@@ -896,6 +962,47 @@ fn multiple_workspaces_switch_detach_and_keep_independent_sessions() {
 }
 
 #[test]
+fn command_new_t_creates_names_and_switches_to_a_workspace() {
+    let mut tui = Tui::start();
+    tui.ready();
+    tui.send(b"echo ORIGINAL_WORKSPACE\r");
+    tui.wait("original workspace output", |rows| {
+        rows.iter()
+            .filter(|line| line.contains("ORIGINAL_WORKSPACE"))
+            .count()
+            >= 2
+    });
+    tui.command("new -t workbench");
+    tui.wait("new -t opens named Workspace", |rows| {
+        rows.iter().any(|line| line.contains("▣ workbench"))
+            && rows.iter().filter(|line| line.contains("pane 0")).count() == 2
+            && rows.last().unwrap().contains(" [0] ")
+            && !rows.iter().any(|line| line.contains("ORIGINAL_WORKSPACE"))
+    });
+    tui.send(b"echo WORKBENCH_WORKSPACE\r");
+    tui.wait("new Workspace accepts input", |rows| {
+        rows.iter()
+            .filter(|line| line.contains("WORKBENCH_WORKSPACE"))
+            .count()
+            >= 2
+    });
+    let names = zmux::config::machines::MachineNames::load(
+        &tui.root.join("machines.json"),
+    )
+    .unwrap();
+    let workbench_socket = names
+        .workspaces
+        .get("local")
+        .and_then(|workspaces| {
+            workspaces.iter().find_map(|(socket, name)| {
+                (name == "workbench").then_some(socket.as_str())
+            })
+        })
+        .expect("new Workspace name was not persisted");
+    assert!(workbench_socket.starts_with("ui.tab."));
+}
+
+#[test]
 fn workspace_home_is_shared_within_workspace_and_isolated_across_workspaces() {
     let mut original = Tui::start();
     original.ready();
@@ -1294,6 +1401,15 @@ fn global_shortcuts_help_aliases_restore_split_panes() {
     tui.wait("global shortcut popup", |rows| {
         rows.iter().any(|l| l.contains("ALL ZMUX SHORTCUTS"))
             && rows.iter().any(|l| l.contains("Prefix+%"))
+    });
+    tui.send(b"\x06");
+    tui.wait("Ctrl+f pages help down", |rows| {
+        !rows.iter().any(|l| l.contains("ALL ZMUX SHORTCUTS"))
+            && rows.iter().any(|l| l.contains("[ Sidebar ]"))
+    });
+    tui.send(b"\x02");
+    tui.wait("Ctrl+b pages help up", |rows| {
+        rows.iter().any(|l| l.contains("ALL ZMUX SHORTCUTS"))
     });
     tui.send(b"G");
     tui.wait("full reference scrolls to last section", |rows| {

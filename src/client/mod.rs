@@ -149,6 +149,8 @@ struct WorkspaceManager {
     workspaces: Vec<WorkspaceConnection>,
     active: usize,
     base_socket: String,
+    start_dir: Option<String>,
+    next_workspace_id: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,6 +165,7 @@ struct RemoteMachine {
     host: String,
     id: String,
     route: Vec<String>,
+    executable: Option<String>,
     state: RemoteMachineState,
     error: Option<String>,
     retry_attempt: u32,
@@ -172,10 +175,14 @@ struct RemoteMachine {
 
 struct RemoteRegistry {
     machines: Vec<RemoteMachine>,
-    result_tx:
-        std::sync::mpsc::Sender<(String, Result<(), remote::RemoteFailure>)>,
-    result_rx:
-        std::sync::mpsc::Receiver<(String, Result<(), remote::RemoteFailure>)>,
+    result_tx: std::sync::mpsc::Sender<(
+        String,
+        Result<remote::RemoteProbe, remote::RemoteFailure>,
+    )>,
+    result_rx: std::sync::mpsc::Receiver<(
+        String,
+        Result<remote::RemoteProbe, remote::RemoteFailure>,
+    )>,
 }
 
 fn remote_machine_id(route: &[String]) -> String {
@@ -212,6 +219,7 @@ impl RemoteRegistry {
                 host: host.to_string(),
                 id: id.clone(),
                 route,
+                executable: None,
                 state: RemoteMachineState::Disconnected,
                 error: None,
                 retry_attempt: 0,
@@ -235,6 +243,7 @@ impl RemoteRegistry {
         }
         machine.state = RemoteMachineState::Probing;
         machine.error = None;
+        machine.executable = None;
         machine.retry_at = None;
         machine.activate_after_probe |= activate;
         let id = alias.to_string();
@@ -342,15 +351,23 @@ fn open_navigation_entry(
         .find(|machine| machine.id == *machine_id)
         .is_some_and(|machine| machine.state == RemoteMachineState::Connected);
     if connected {
-        let route = remotes
+        let connection = remotes
             .machines
             .iter()
             .find(|machine| machine.id == *machine_id)
-            .map(|machine| machine.route.clone())
-            .unwrap_or_default();
-        return match workspaces
-            .connect_remote_machine(machine_id, &route, size, true)
-        {
+            .map(|machine| (machine.route.clone(), machine.executable.clone()));
+        let Some((route, Some(executable))) = connection else {
+            return NavigationOpenResult::Failed(
+                "remote zmux executable has not been discovered".to_string(),
+            );
+        };
+        return match workspaces.connect_remote_machine(
+            machine_id,
+            &route,
+            &executable,
+            size,
+            true,
+        ) {
             Ok(()) => NavigationOpenResult::Opened,
             Err(error) => NavigationOpenResult::Failed(format!(
                 "failed to open {}: {error}",
@@ -593,6 +610,8 @@ impl WorkspaceManager {
             sidebar_visible: false,
             active: 0,
             base_socket: base_socket.to_string(),
+            start_dir,
+            next_workspace_id: 1,
         })
     }
 
@@ -601,6 +620,7 @@ impl WorkspaceManager {
         socket_names: Vec<String>,
         target_session: Option<&str>,
         size: Size,
+        start_dir: Option<String>,
     ) -> io::Result<Self> {
         let mut workspaces = Vec::new();
         let mut connection_error = None;
@@ -638,11 +658,57 @@ impl WorkspaceManager {
             ));
         }
         Ok(Self {
+            next_workspace_id: workspaces.len().max(1),
             workspaces,
             sidebar_visible: false,
             active: 0,
             base_socket: base_socket.to_string(),
+            start_dir,
         })
+    }
+
+    fn create_workspace(&mut self, size: Size) -> io::Result<String> {
+        for _ in 0..1024 {
+            let id = self.next_workspace_id;
+            self.next_workspace_id = self.next_workspace_id.saturating_add(1);
+            let socket_name = format!(
+                "{}.tab.{}.{}",
+                self.base_socket,
+                std::process::id(),
+                id
+            );
+            if self
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.socket_name == socket_name)
+            {
+                continue;
+            }
+            match ensure_server_and_connect(
+                &socket_name,
+                "0",
+                size,
+                true,
+                self.start_dir.as_deref(),
+            ) {
+                Ok((client, _)) => {
+                    self.workspaces.push(WorkspaceConnection::local(
+                        socket_name.clone(),
+                        client,
+                    ));
+                    self.active = self.workspaces.len() - 1;
+                    return Ok(socket_name);
+                }
+                Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate a unique Workspace socket",
+        ))
     }
 
     fn active_client(&self) -> &dyn DomainHandle {
@@ -1023,6 +1089,7 @@ impl WorkspaceManager {
         &mut self,
         machine_id: &str,
         route: &[String],
+        executable: &str,
         size: Size,
         activate: bool,
     ) -> io::Result<()> {
@@ -1038,7 +1105,8 @@ impl WorkspaceManager {
             return Ok(());
         }
         let socket_name = self.base_socket.clone();
-        let client = remote::connect_remote(route, &socket_name, size)?;
+        let client =
+            remote::connect_remote(route, executable, &socket_name, size)?;
         let previous_active = self.active;
         self.workspaces.push(WorkspaceConnection {
             socket_name: format!("ssh://{machine_id}/{socket_name}"),
@@ -1218,6 +1286,7 @@ impl ClientApp {
                 socket_names,
                 self.session_name.as_deref(),
                 size,
+                self.start_dir.clone(),
             ) {
                 Ok(workspaces) => workspaces,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -1320,25 +1389,26 @@ impl ClientApp {
                     }
                     let machine_label = remotes.display_name(&alias);
                     match probe_result {
-                        Ok(_) => {
-                            let route = remotes
+                        Ok(probe) => {
+                            let (route, activate) = remotes
                                 .machines
-                                .iter()
+                                .iter_mut()
                                 .find(|machine| machine.id == alias)
-                                .map(|machine| machine.route.clone())
+                                .map(|machine| {
+                                    machine.executable =
+                                        Some(probe.executable.clone());
+                                    (
+                                        machine.route.clone(),
+                                        machine.activate_after_probe,
+                                    )
+                                })
                                 .unwrap_or_default();
-                            let activate = remotes
-                                .machines
-                                .iter()
-                                .find(|machine| machine.id == alias)
-                                .is_some_and(|machine| {
-                                    machine.activate_after_probe
-                                });
                             let (cols, rows) =
                                 terminal::size().unwrap_or((80, 24));
                             match workspaces.connect_remote_machine(
                                 &alias,
                                 &route,
+                                &probe.executable,
                                 server_content_size(
                                     cols,
                                     rows,
@@ -2681,30 +2751,50 @@ sidebar_visible,
                                                 .unwrap_or(InputMode::Navigator)
                                         }
                                         _ => {
-                                            scroll = match key.code {
-                                                KeyCode::Down
-                                                | KeyCode::Char('j') => {
-                                                    scroll.saturating_add(1)
+                                            scroll =
+                                                match (key.code, key.modifiers)
+                                                {
+                                                    (
+                                                        KeyCode::Down
+                                                        | KeyCode::Char('j'),
+                                                        _,
+                                                    ) => {
+                                                        scroll.saturating_add(1)
+                                                    }
+                                                    (
+                                                        KeyCode::Up
+                                                        | KeyCode::Char('k'),
+                                                        _,
+                                                    ) => {
+                                                        scroll.saturating_sub(1)
+                                                    }
+                                                    (KeyCode::PageDown, _)
+                                                    | (
+                                                        KeyCode::Char('f'),
+                                                        KeyModifiers::CONTROL,
+                                                    ) => {
+                                                        scroll.saturating_add(8)
+                                                    }
+                                                    (KeyCode::PageUp, _)
+                                                    | (
+                                                        KeyCode::Char('b'),
+                                                        KeyModifiers::CONTROL,
+                                                    ) => {
+                                                        scroll.saturating_sub(8)
+                                                    }
+                                                    (
+                                                        KeyCode::Home
+                                                        | KeyCode::Char('g'),
+                                                        _,
+                                                    ) => 0,
+                                                    (
+                                                        KeyCode::End
+                                                        | KeyCode::Char('G'),
+                                                        _,
+                                                    ) => max_scroll,
+                                                    _ => scroll,
                                                 }
-                                                KeyCode::Up
-                                                | KeyCode::Char('k') => {
-                                                    scroll.saturating_sub(1)
-                                                }
-                                                KeyCode::PageDown => {
-                                                    scroll.saturating_add(8)
-                                                }
-                                                KeyCode::PageUp => {
-                                                    scroll.saturating_sub(8)
-                                                }
-                                                KeyCode::Home
-                                                | KeyCode::Char('g') => 0,
-                                                KeyCode::End
-                                                | KeyCode::Char('G') => {
-                                                    max_scroll
-                                                }
-                                                _ => scroll,
-                                            }
-                                            .min(max_scroll);
+                                                .min(max_scroll);
                                             mode = match return_mode {
                                                 Some(return_mode) => {
                                                     InputMode::ShortcutsHelp {
@@ -2773,6 +2863,8 @@ sidebar_visible,
                                             match run_client_command(
                                                 &mut workspaces,
                                                 &mut remotes,
+                                                &mut machine_names,
+                                                &machine_config,
                                                 &trimmed,
                                                 server_content_size(cols, rows, sidebar_visible),
                                             ) {
@@ -5495,8 +5587,10 @@ fn handle_prefix_key(
 fn run_client_command(
     workspaces: &mut WorkspaceManager,
     remotes: &mut RemoteRegistry,
+    machine_names: &mut crate::config::machines::MachineNames,
+    machine_config: &std::path::Path,
     raw: &str,
-    _size: Size,
+    size: Size,
 ) -> ClientCommandResult {
     let mut parsed = ParsedCommand::parse(raw);
     if parsed.len() != 1 {
@@ -5516,13 +5610,47 @@ fn run_client_command(
         "set-workspace-home" => {
             ClientCommandResult::Handled(set_workspace_home(workspaces))
         }
-        "new"
-            if cmd.flags.contains_key("t") && !cmd.flags.contains_key("m") =>
-        {
-            ClientCommandResult::Handled(Some(
-                "tab creation was removed; use new -s <session> or new-window"
-                    .to_string(),
-            ))
+        "new" if cmd.flags.contains_key("t") => {
+            if cmd.flags.contains_key("m") {
+                return ClientCommandResult::Handled(Some(
+                    "usage: new -t <WORKSPACE_NAME> or new -m <SSH_HOST>"
+                        .to_string(),
+                ));
+            }
+            let Some(name) = cmd.flag_value("t") else {
+                return ClientCommandResult::Handled(Some(
+                    "usage: new -t <WORKSPACE_NAME>".to_string(),
+                ));
+            };
+            let name =
+                match crate::config::machines::MachineNames::validate_name(name)
+                {
+                    Ok(name) => name.to_string(),
+                    Err(error) => {
+                        return ClientCommandResult::Handled(Some(format!(
+                            "invalid Workspace name: {error}"
+                        )));
+                    }
+                };
+            match workspaces.create_workspace(size) {
+                Ok(socket_name) => {
+                    let message = match machine_names.rename_workspace(
+                        machine_config,
+                        "local",
+                        &socket_name,
+                        &name,
+                    ) {
+                        Ok(()) => format!("created Workspace {name}"),
+                        Err(error) => format!(
+                            "created Workspace {name}, but could not save its name: {error}"
+                        ),
+                    };
+                    ClientCommandResult::Handled(Some(message))
+                }
+                Err(error) => ClientCommandResult::Handled(Some(format!(
+                    "failed to create Workspace {name}: {error}"
+                ))),
+            }
         }
         "new" if cmd.flags.contains_key("m") => {
             let Some(host) = cmd.flag_value("m") else {
@@ -6176,8 +6304,7 @@ fn cleanup_stale_socket(_socket_name: &str, _error: &io::Error) {}
 
 #[cfg(unix)]
 fn discover_all_socket_names(socket_name: &str) -> io::Result<Vec<String>> {
-    use std::collections::BTreeSet;
-    use std::os::unix::fs::FileTypeExt;
+    use std::{collections::BTreeSet, os::unix::fs::FileTypeExt};
 
     let socket_path = crate::ipc::socket_path(socket_name)?;
     let Some(dir) = socket_path.parent() else {
@@ -6497,6 +6624,7 @@ mod tests {
                 host: "prod".to_string(),
                 id: id.clone(),
                 route: vec!["prod".to_string()],
+                executable: None,
                 state: RemoteMachineState::Probing,
                 error: None,
                 retry_attempt: 0,

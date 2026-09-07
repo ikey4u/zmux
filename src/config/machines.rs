@@ -37,6 +37,17 @@ pub fn config_path() -> io::Result<PathBuf> {
 }
 
 impl MachineNames {
+    pub fn validate_name(name: &str) -> io::Result<&str> {
+        let name = name.trim();
+        if name.is_empty() || name.chars().any(char::is_control) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "name must be nonempty and contain no control characters",
+            ));
+        }
+        Ok(name)
+    }
+
     pub fn load(path: &Path) -> io::Result<Self> {
         match std::fs::read(path) {
             Ok(data) => serde_json::from_slice(&data).map_err(|error| {
@@ -93,13 +104,7 @@ impl MachineNames {
         name: &str,
         update: impl FnOnce(&mut Self, &str),
     ) -> io::Result<()> {
-        let name = name.trim();
-        if name.is_empty() || name.chars().any(char::is_control) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "name must be nonempty and contain no control characters",
-            ));
-        }
+        let name = Self::validate_name(name)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -140,8 +145,9 @@ fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
 
     struct TestConfig(PathBuf);
     impl TestConfig {
@@ -244,6 +250,7 @@ mod tests {
 #[cfg(windows)]
 fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
+
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };

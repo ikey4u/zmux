@@ -179,8 +179,12 @@ pub fn parse_protocol_info(
             "protocol declaration exceeds size limit",
         ));
     }
-    let info: ProtocolInfo = serde_json::from_slice(json).map_err(|_| incompatible(
-        "invalid_protocol_info", "expected protocol-info JSON; upgrade remote zmux and ensure non-interactive SSH stdout has no shell banners"))?;
+    let info: ProtocolInfo = serde_json::from_slice(json).map_err(|_| {
+        incompatible(
+            "invalid_protocol_info",
+            "expected protocol-info JSON; upgrade remote zmux and ensure the executable itself emits only its protocol declaration",
+        )
+    })?;
     validate_info(&info)?;
     Ok(info)
 }
@@ -289,14 +293,23 @@ pub fn client_handshake(
     stream: &mut (impl Read + Write + ?Sized),
 ) -> io::Result<NegotiatedProtocol> {
     let local = ProtocolInfo::current();
-    send_protocol_message(stream, "HELLO", &local)?;
+    send_protocol_message(stream, "HELLO", &local)
+        .map_err(classify_pre_negotiation_transport_error)?;
     // Never discard a temporary BufReader's read-ahead: the next bytes belong
     // to the business protocol and must remain available to its own reader.
-    let line = read_handshake_line(stream).map_err(|error| match error.kind() {
-        io::ErrorKind::UnexpectedEof => io::Error::from(incompatible("handshake_required", "server closed before negotiation; it may be a legacy zmux server. Upgrade/restart it after saving sessions; no commands were sent")),
-        io::ErrorKind::InvalidData => io::Error::from(incompatible("invalid_handshake", error.to_string())),
-        _ => error,
-    })?;
+    let line =
+        read_handshake_line(stream).map_err(|error| match error.kind() {
+            io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset => {
+                classify_pre_negotiation_transport_error(error)
+            }
+            io::ErrorKind::InvalidData => io::Error::from(incompatible(
+                "invalid_handshake",
+                error.to_string(),
+            )),
+            _ => error,
+        })?;
     if let Some(json) = line.strip_prefix("ZMUX REJECT ") {
         let error: CompatibilityError =
             serde_json::from_str(json).map_err(|_| {
@@ -321,6 +334,18 @@ pub fn client_handshake(
         return Err(incompatible("invalid_handshake", "server selected a protocol/capability set outside the negotiated contract").into());
     }
     Ok(negotiated)
+}
+
+fn classify_pre_negotiation_transport_error(error: io::Error) -> io::Error {
+    match error.kind() {
+        io::ErrorKind::UnexpectedEof
+        | io::ErrorKind::BrokenPipe
+        | io::ErrorKind::ConnectionReset => io::Error::from(incompatible(
+            "handshake_required",
+            "server closed before negotiation; it may be a legacy zmux server. Upgrade/restart it after saving sessions; no commands were sent",
+        )),
+        _ => error,
+    }
 }
 
 pub fn send_ok(

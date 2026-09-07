@@ -64,16 +64,20 @@ for its lifetime; its peer cannot change versions mid-stream.
 
 Unix sockets and Windows named pipes use the same handshake. SSH stdio is a
 transparent transport for that exchange, not an alternative protocol. The
-remote executable is checked before launching the bridge, **and the running
-server is checked again over the actual stream**. Replacing a remote binary
-does not upgrade an already-running server.
+remote executable is resolved from the SSH command environment, the user's
+login/interactive shell, or standard user install locations. Discovery returns
+a framed, validated absolute executable path plus `protocol-info`; shell startup
+noise outside that frame is ignored. Every bridge then invokes that quoted
+absolute path instead of searching a potentially different `PATH`. The running
+server is checked again over the actual stream. Replacing a remote binary does
+not upgrade an already-running server.
 
 Negotiation is a compatibility check, not authentication. Local IPC permissions
 and SSH host-key verification/authentication remain the trust boundary.
 
 ## Failure handling and upgrades
 
-Missing remote zmux/PATH, missing protocol-info, invalid declarations, version
+Missing remote zmux, missing protocol-info, invalid declarations, version
 mismatches, and missing capabilities are permanent until configuration or
 software changes. The machine remains visible with an error, without automatic
 probe retries. `R` or `:new -m host` explicitly retries after repair. SSH transport
@@ -90,7 +94,8 @@ To upgrade legacy deployments safely:
 
 1. Save work in old sessions and arrange their shutdown using the old compatible
    client; the new client deliberately cannot issue legacy kill commands.
-2. Install compatible client/server binaries (including SSH non-interactive PATH).
+2. Install compatible client/server binaries. Ensure the executable is visible
+   from the remote login shell or expose its absolute path as `ZMUX_BIN`.
 3. Restart the old server when safe, or create an independent Workspace with a
    fresh `-L` name. Do not unlink a live server's socket to force an upgrade.
 4. Check `zmux protocol-info` on both machines, then reconnect. Live handshake

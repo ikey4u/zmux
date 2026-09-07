@@ -1871,13 +1871,14 @@ const MODAL_HELP: &[&str] = &[
     "",
     "[ Help popup ]",
     "j/k, Down/Up    Scroll help",
-    "PageUp/PageDown Scroll by page",
+    "Ctrl+b/f, PageUp/PageDown Scroll up/down by page",
     "g/G, Home/End   Beginning / end of reference",
     "Mouse wheel     Scroll help",
     "q, Esc, H       Close help and return to previous mode",
     "",
     "[ Commands and shell keys ]",
     "Workspace Home: Prefix+H (new sessions/windows/panes)",
+    "New Workspace: Prefix+: then new -t <WORKSPACE_NAME>",
     "SSH machine:   Prefix+: then new -m <SSH_HOST>",
     "Other terminal keys go to the shell/application.",
     "Shell Ctrl+c/d/l/r/z behavior is not a zmux binding.",
@@ -2147,10 +2148,11 @@ mod tests {
 
     #[test]
     fn navigation_starts_with_machine_without_title_or_count_rows() {
+        use ratatui::{backend::TestBackend, Terminal};
+
         use super::super::navigation::{
             build_navigation_entries, NavigationState,
         };
-        use ratatui::{backend::TestBackend, Terminal};
 
         let entries = build_navigation_entries(
             "local",
