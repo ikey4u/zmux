@@ -88,6 +88,10 @@ pub(crate) trait SocketConnector: Send + Sync {
     fn initial_read_timeout(&self) -> Duration {
         Duration::from_secs(2)
     }
+
+    fn connect_for_shutdown(&self) -> io::Result<Box<dyn ClientStream>> {
+        self.connect_compatible()
+    }
 }
 
 struct LocalConnector {
@@ -728,7 +732,7 @@ impl SocketClient {
 }
 
 fn kill_server_with(connector: &Arc<dyn SocketConnector>) -> io::Result<()> {
-    let stream = connector.connect_compatible()?;
+    let stream = connector.connect_for_shutdown()?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let mut ws = stream.try_clone_box()?;
     let reader = BufReader::new(stream);

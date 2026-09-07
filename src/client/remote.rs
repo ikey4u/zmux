@@ -68,6 +68,14 @@ impl SocketConnector for SshConnector {
     fn initial_read_timeout(&self) -> Duration {
         Duration::from_secs(10)
     }
+
+    fn connect_for_shutdown(&self) -> io::Result<Box<dyn ClientStream>> {
+        let connector = Self {
+            start_if_missing: false,
+            ..self.clone()
+        };
+        connector.connect_compatible()
+    }
 }
 
 pub fn connect_remote(

@@ -242,11 +242,13 @@ legacy tab server sockets. All levels use the same tree controls below.
 | Click `▸`/`▾` | Expand or collapse that branch |
 | Click a node name | Connect or open that machine, workspace, session, window, or pane |
 
-Deletion applies to every node level. Removing an SSH Machine removes its tree
-node and detaches its Workspace connections without killing remote servers.
-Removing a Workspace detaches it; sessions remain available for reattachment.
-Deleting a Session, Window, or Panel ends the processes it owns. Existing guards
-protect the local Machine root and the last Session/Window/Panel.
+Deletion applies to every node level. Removing an SSH Machine stops every
+currently connected Workspace server under that Machine and removes the tree
+node. Removing a Workspace stops its server and all sessions. Deleting a
+Session, Window, or Pane ends its processes; when it is the last child, deletion
+cascades through the now-empty parents and stops the Workspace. The local
+Machine root remains protected. Every destructive action requires explicit
+`y/Y` confirmation.
 
 The tab bar remains removed; Workspace nodes replace its organization role.
 The former `new -t` spelling now creates a Workspace instead of a visual tab.

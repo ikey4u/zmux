@@ -1783,8 +1783,8 @@ const NAVIGATION_HELP: &[&str] = &[
     "Click arrow     Expand/collapse branch",
     "Click name      Open selected node",
     "",
-    "Workspace close detaches only; sessions stay alive.",
-    "Machine delete removes its connections, not servers.",
+    "Delete cascades through empty parent nodes.",
+    "Machine/Workspace delete stops their servers.",
     "Machine/workspace rename is saved in machines.json.",
 ];
 

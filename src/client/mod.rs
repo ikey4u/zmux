@@ -412,7 +412,6 @@ fn navigation_rename_value(entry: &navigation::NavigationEntry) -> String {
 }
 
 fn navigation_close_block_reason(
-    entries: &[navigation::NavigationEntry],
     entry: &navigation::NavigationEntry,
 ) -> Option<String> {
     use navigation::NavigationNodeId;
@@ -420,26 +419,82 @@ fn navigation_close_block_reason(
         NavigationNodeId::Machine(machine) if machine == "local" => {
             Some("the local machine cannot be closed".to_string())
         }
-        NavigationNodeId::Session {
-            machine, workspace, ..
-        } => {
-            let count = entries
-                .iter()
-                .filter(|candidate| {
-                    matches!(
-                        &candidate.id,
-                        NavigationNodeId::Session {
-                            machine: other_machine,
-                            workspace: other_workspace,
-                            ..
-                        } if other_machine == machine && other_workspace == workspace
-                    )
-                })
-                .count();
-            (count <= 1).then(|| {
-                "cannot close the last session; close its workspace instead"
-                    .to_string()
+        _ => None,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum NavigationDeleteTarget {
+    Machine(String),
+    Workspace { machine: String, workspace: String },
+    Command(String),
+}
+
+fn navigation_delete_target(
+    entries: &[navigation::NavigationEntry],
+    entry: &navigation::NavigationEntry,
+) -> NavigationDeleteTarget {
+    use navigation::NavigationNodeId;
+
+    let workspace_target =
+        |machine: &str, workspace: &str| NavigationDeleteTarget::Workspace {
+            machine: machine.to_string(),
+            workspace: workspace.to_string(),
+        };
+    let session_count = |machine: &str, workspace: &str| {
+        entries
+            .iter()
+            .filter(|candidate| {
+                matches!(
+                    &candidate.id,
+                    NavigationNodeId::Session {
+                        machine: other_machine,
+                        workspace: other_workspace,
+                        ..
+                    } if other_machine == machine && other_workspace == workspace
+                )
             })
+            .count()
+    };
+    let window_count = |machine: &str, workspace: &str, session: &str| {
+        entries
+            .iter()
+            .filter(|candidate| {
+                matches!(
+                    &candidate.id,
+                    NavigationNodeId::Window {
+                        machine: other_machine,
+                        workspace: other_workspace,
+                        session: other_session,
+                        ..
+                    } if other_machine == machine
+                        && other_workspace == workspace
+                        && other_session == session
+                )
+            })
+            .count()
+    };
+
+    match &entry.id {
+        NavigationNodeId::Machine(machine) => {
+            NavigationDeleteTarget::Machine(machine.clone())
+        }
+        NavigationNodeId::Workspace { machine, workspace } => {
+            workspace_target(machine, workspace)
+        }
+        NavigationNodeId::Session {
+            machine,
+            workspace,
+            name,
+        } => {
+            if session_count(machine, workspace) <= 1 {
+                workspace_target(machine, workspace)
+            } else {
+                NavigationDeleteTarget::Command(format!(
+                    "kill-session -t {}",
+                    shell_quote(name)
+                ))
+            }
         }
         NavigationNodeId::Window {
             machine,
@@ -447,25 +502,16 @@ fn navigation_close_block_reason(
             session,
             ..
         } => {
-            let count = entries
-                .iter()
-                .filter(|candidate| {
-                    matches!(
-                        &candidate.id,
-                        NavigationNodeId::Window {
-                            machine: other_machine,
-                            workspace: other_workspace,
-                            session: other_session,
-                            ..
-                        } if other_machine == machine
-                            && other_workspace == workspace
-                            && other_session == session
-                    )
-                })
-                .count();
-            (count <= 1).then(|| {
-                "cannot close the last window in a session".to_string()
-            })
+            if window_count(machine, workspace, session) > 1 {
+                NavigationDeleteTarget::Command("kill-window".to_string())
+            } else if session_count(machine, workspace) > 1 {
+                NavigationDeleteTarget::Command(format!(
+                    "kill-session -t {}",
+                    shell_quote(session)
+                ))
+            } else {
+                workspace_target(machine, workspace)
+            }
         }
         NavigationNodeId::Pane {
             machine,
@@ -492,97 +538,81 @@ fn navigation_close_block_reason(
                     )
                 })
                 .count();
-            let window_count = entries
-                .iter()
-                .filter(|candidate| {
-                    matches!(
-                        &candidate.id,
-                        NavigationNodeId::Window {
-                            machine: other_machine,
-                            workspace: other_workspace,
-                            session: other_session,
-                            ..
-                        } if other_machine == machine
-                            && other_workspace == workspace
-                            && other_session == session
-                    )
-                })
-                .count();
-            (pane_count <= 1 && window_count <= 1).then(|| {
-                "cannot close the only pane in the last window".to_string()
-            })
+            if pane_count > 1 {
+                NavigationDeleteTarget::Command("kill-pane".to_string())
+            } else if window_count(machine, workspace, session) > 1 {
+                NavigationDeleteTarget::Command("kill-window".to_string())
+            } else if session_count(machine, workspace) > 1 {
+                NavigationDeleteTarget::Command(format!(
+                    "kill-session -t {}",
+                    shell_quote(session)
+                ))
+            } else {
+                workspace_target(machine, workspace)
+            }
         }
-        NavigationNodeId::Machine(_) | NavigationNodeId::Workspace { .. } => {
-            None
+    }
+}
+
+fn navigation_delete_effect(
+    entries: &[navigation::NavigationEntry],
+    entry: &navigation::NavigationEntry,
+) -> &'static str {
+    match navigation_delete_target(entries, entry) {
+        NavigationDeleteTarget::Machine(_) => "stop all Workspace servers",
+        NavigationDeleteTarget::Workspace { .. } => {
+            "stop its Workspace server and processes"
         }
+        NavigationDeleteTarget::Command(_) => "end its processes",
     }
 }
 
 fn close_navigation_entry(
     workspaces: &mut WorkspaceManager,
     remotes: &mut RemoteRegistry,
+    entries: &[navigation::NavigationEntry],
     entry: &navigation::NavigationEntry,
     size: Size,
 ) -> Result<bool, String> {
-    use navigation::{NavigationNodeId, NavigationNodeKind};
-
-    if let NavigationNodeId::Workspace { machine, workspace } = &entry.id {
-        let Some(index) = workspaces.workspaces.iter().position(|connection| {
-            connection.machine_id == *machine
-                && connection.socket_name == *workspace
-        }) else {
-            return Err("workspace is unavailable".to_string());
-        };
-        workspaces.active = index;
-        let empty = workspaces.close_active();
-        if machine != "local"
-            && !workspaces
+    match navigation_delete_target(entries, entry) {
+        NavigationDeleteTarget::Machine(machine_id) => {
+            if machine_id == "local" {
+                return Err("the local machine cannot be closed".to_string());
+            }
+            while let Some(workspace) = workspaces
                 .workspaces
                 .iter()
-                .any(|connection| connection.machine_id == *machine)
-        {
-            remotes.mark_detached(machine);
-        }
-        return Ok(empty);
-    }
-
-    if let NavigationNodeId::Machine(machine_id) = &entry.id {
-        if machine_id == "local" {
-            return Err("the local machine cannot be closed".to_string());
-        }
-        while let Some(index) = workspaces
-            .workspaces
-            .iter()
-            .position(|workspace| workspace.machine_id == *machine_id)
-        {
-            workspaces.active = index;
-            if workspaces.close_active() {
-                remotes.machines.retain(|machine| machine.id != *machine_id);
-                return Ok(true);
+                .find(|workspace| workspace.machine_id == machine_id)
+                .map(|workspace| workspace.socket_name.clone())
+            {
+                if workspaces.kill_workspace(&machine_id, &workspace)? {
+                    remotes.machines.retain(|machine| machine.id != machine_id);
+                    return Ok(true);
+                }
             }
+            remotes.machines.retain(|machine| machine.id != machine_id);
+            Ok(false)
         }
-        remotes.machines.retain(|machine| machine.id != *machine_id);
-        return Ok(false);
-    }
-
-    if !workspaces.activate_navigation_entry(entry, size) {
-        return Err("navigation target is unavailable".to_string());
-    }
-    let command = match entry.kind {
-        NavigationNodeKind::Session => match &entry.id {
-            NavigationNodeId::Session { name, .. } => {
-                format!("kill-session -t {}", shell_quote(name))
+        NavigationDeleteTarget::Workspace { machine, workspace } => {
+            let empty = workspaces.kill_workspace(&machine, &workspace)?;
+            if machine != "local"
+                && !workspaces
+                    .workspaces
+                    .iter()
+                    .any(|connection| connection.machine_id == machine)
+            {
+                remotes.mark_detached(&machine);
             }
-            _ => unreachable!(),
-        },
-        NavigationNodeKind::Window => "kill-window".to_string(),
-        NavigationNodeKind::Pane => "kill-pane".to_string(),
-        NavigationNodeKind::Machine | NavigationNodeKind::Workspace => {
-            unreachable!()
+            Ok(empty)
         }
-    };
-    workspaces.active_client().run_command(&command);
-    Ok(false)
+        NavigationDeleteTarget::Command(command) => {
+            if !workspaces.activate_navigation_entry(entry, size) {
+                return Err("navigation target is unavailable".to_string());
+            }
+            workspaces.active_client().run_command(&command);
+            Ok(false)
+        }
+    }
 }
 
 impl WorkspaceManager {
@@ -937,9 +967,26 @@ impl WorkspaceManager {
         }
     }
 
-    fn close_active(&mut self) -> bool {
-        self.workspaces[self.active].client.detach();
-        self.remove_active()
+    fn kill_workspace(
+        &mut self,
+        machine_id: &str,
+        socket_name: &str,
+    ) -> Result<bool, String> {
+        let Some(index) = self.workspaces.iter().position(|workspace| {
+            workspace.machine_id == machine_id
+                && workspace.socket_name == socket_name
+        }) else {
+            return Err("workspace is unavailable".to_string());
+        };
+        self.workspaces[index]
+            .client
+            .kill_server()
+            .map_err(|error| {
+                format!("failed to stop Workspace {socket_name}: {error}")
+            })?;
+        self.workspaces[index].client.shutdown();
+        self.active = index;
+        Ok(self.remove_active())
     }
 
     fn close_dead_active(&mut self) -> bool {
@@ -1875,11 +1922,10 @@ impl ClientApp {
                                         "Close {} '{}' ({})? [y/N] ",
                                         navigation_kind_label(entry.kind),
                                         entry.label,
-                                        match entry.kind {
-                                            navigation::NavigationNodeKind::Machine => "detach connections",
-                                            navigation::NavigationNodeKind::Workspace => "detach only",
-                                            _ => "end processes",
-                                        }
+                                        navigation_delete_effect(
+                                            &navigation_entries,
+                                            entry,
+                                        )
                                     ),
                                     "",
                                 )
@@ -2683,10 +2729,7 @@ sidebar_visible,
                                                     .cloned()
                                             {
                                                 if let Some(reason) =
-                                                    navigation_close_block_reason(
-                                                        &navigation_entries,
-                                                        &entry,
-                                                    )
+                                                    navigation_close_block_reason(&entry)
                                                 {
                                                     status_notice = Some((
                                                         reason,
@@ -3450,6 +3493,7 @@ sidebar_visible,
                                             match close_navigation_entry(
                                                 &mut workspaces,
                                                 &mut remotes,
+                                                &navigation_entries,
                                                 &entry,
                                                 server_content_size(
                                                     cols,

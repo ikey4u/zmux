@@ -763,15 +763,87 @@ fn remote_tree_focus_rename_split_close_and_offline_rename() {
         }) && rows.iter().any(|l| l.contains("▣ ui"))
             && rows.last().unwrap().contains("[main]")
     });
-    let alive = Command::new(BIN)
+    let stopped = Command::new(BIN)
         .args(["-L", "ui", "ls"])
         .env("TMPDIR", tui.root.join("remote"))
         .output()
         .unwrap();
     assert!(
-        alive.status.success()
-            && String::from_utf8_lossy(&alive.stdout).contains("0:"),
-        "removing a machine must not kill its remote server"
+        stopped.status.success()
+            && String::from_utf8_lossy(&stopped.stdout)
+                .contains("no server running"),
+        "removing a machine must stop all of its remote Workspace servers"
+    );
+}
+
+#[test]
+fn floating_remote_tree_k_removes_child_and_machine_nodes() {
+    let mut tui = Tui::start_hidden();
+    tui.wait("hidden startup", |rows| {
+        rows[0].starts_with('┌')
+            && rows.iter().any(|line| line.contains("READY>"))
+    });
+    tui.command("new -m loopback");
+    tui.wait("remote connected", |rows| {
+        rows.last().is_some_and(|line| line.contains(" [0] "))
+    });
+    tui.command("new -t disposable-remote");
+    tui.pump_for(Duration::from_secs(1));
+
+    tui.send(b"\x01m");
+    tui.wait(
+        "new remote Workspace is focused in the floating tree",
+        |rows| {
+            rows.iter()
+                .any(|line| line.contains("Navigation · Esc close"))
+                && rows.iter().any(|line| line.contains("▣ disposable-remote"))
+                && rows
+                    .iter()
+                    .any(|line| line.contains('▌') && line.contains("pane 0"))
+        },
+    );
+    tui.send(b"K");
+    tui.wait("remote pane asks for confirmation", |rows| {
+        rows.last()
+            .is_some_and(|line| line.starts_with("Close pane"))
+    });
+    tui.send(b"y");
+    tui.wait("last pane cascades through its remote Workspace", |rows| {
+        !rows.iter().any(|line| line.contains("disposable-remote"))
+            && rows.iter().any(|line| line.contains("loopback"))
+            && rows
+                .iter()
+                .any(|line| line.contains("Navigation · Esc close"))
+    });
+
+    // Expanded local Machine contributes five entries; the remote Machine is
+    // the sixth entry in a fresh two-Machine tree.
+    tui.send(b"g");
+    tui.send(b"jjjjj");
+    tui.wait("remote Machine selected in floating tree", |rows| {
+        rows.iter()
+            .any(|line| line.contains('▌') && line.contains("loopback"))
+    });
+    tui.send(b"K");
+    tui.wait("remote Machine asks for confirmation", |rows| {
+        rows.last()
+            .is_some_and(|line| line.starts_with("Close machine"))
+    });
+    tui.send(b"y");
+    tui.wait("remote Machine is removed from floating tree", |rows| {
+        !rows.iter().any(|line| line.contains("loopback"))
+            && rows
+                .iter()
+                .any(|line| line.contains("Navigation · Esc close"))
+    });
+    let remote = Command::new(BIN)
+        .args(["-L", "ui", "ls"])
+        .env("TMPDIR", tui.root.join("remote"))
+        .output()
+        .unwrap();
+    assert!(remote.status.success());
+    assert!(
+        String::from_utf8_lossy(&remote.stdout).contains("no server running")
     );
 }
 
@@ -995,7 +1067,7 @@ fn windows_sessions_and_repeated_splits_restore_full_content() {
 }
 
 #[test]
-fn multiple_workspaces_switch_detach_and_keep_independent_sessions() {
+fn multiple_workspaces_switch_delete_and_keep_independent_sessions() {
     let mut original = Tui::start();
     original.ready();
     original.send(b"echo FIRST_WORKSPACE\r");
@@ -1039,7 +1111,7 @@ fn multiple_workspaces_switch_detach_and_keep_independent_sessions() {
             >= 2
     });
     tui.send(b"\x01h\x01hkkkK");
-    tui.wait("workspace detach confirmation", |rows| {
+    tui.wait("Workspace delete confirmation", |rows| {
         rows.last().unwrap().starts_with("Close workspace")
     });
     tui.send(b"\r");
@@ -1053,19 +1125,19 @@ fn multiple_workspaces_switch_detach_and_keep_independent_sessions() {
         rows.last().unwrap().starts_with("Close workspace")
     });
     tui.send(b"y");
-    tui.wait("detach restores first workspace completely", |rows| {
+    tui.wait("delete restores first Workspace completely", |rows| {
         rows.iter().any(|l| l.contains("FIRST_WORKSPACE"))
             && !rows.iter().any(|l| l.contains("SECOND_WORKSPACE"))
             && !rows.iter().any(|l| l.contains("▣ second"))
     });
-    let alive = Command::new(BIN)
+    let stopped = Command::new(BIN)
         .args(["-L", "second", "ls"])
         .env("TMPDIR", &tui.root)
         .output()
         .unwrap();
     assert!(
-        String::from_utf8_lossy(&alive.stdout).contains("main"),
-        "workspace close must not kill sessions"
+        String::from_utf8_lossy(&stopped.stdout).contains("no server running"),
+        "Workspace deletion must stop its server and sessions"
     );
 }
 
