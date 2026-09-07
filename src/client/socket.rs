@@ -1,5 +1,5 @@
 use std::{
-    io::{self, BufReader, Write},
+    io::{self, BufReader, Read, Write},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc, Mutex,
@@ -33,15 +33,83 @@ fn log_socket(msg: &str) {
 
 const INPUT_CHUNK_SIZE: usize = 4096;
 
+pub(crate) trait ClientStream: Read + Write + Send {
+    fn try_clone_box(&self) -> io::Result<Box<dyn ClientStream>>;
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
+}
+
+#[cfg(unix)]
+impl ClientStream for crate::ipc::UnixStream {
+    fn try_clone_box(&self) -> io::Result<Box<dyn ClientStream>> {
+        Ok(Box::new(crate::ipc::IpcStream::try_clone(self)?))
+    }
+
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        crate::ipc::IpcStream::set_read_timeout(self, timeout)
+    }
+}
+
+#[cfg(windows)]
+impl ClientStream for crate::ipc::PipeStream {
+    fn try_clone_box(&self) -> io::Result<Box<dyn ClientStream>> {
+        Ok(Box::new(crate::ipc::IpcStream::try_clone(self)?))
+    }
+
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        crate::ipc::IpcStream::set_read_timeout(self, timeout)
+    }
+}
+
+impl ClientStream for std::net::TcpStream {
+    fn try_clone_box(&self) -> io::Result<Box<dyn ClientStream>> {
+        Ok(Box::new(self.try_clone()?))
+    }
+
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        std::net::TcpStream::set_read_timeout(self, timeout)
+    }
+}
+
+pub(crate) trait SocketConnector: Send + Sync {
+    fn connect(&self) -> io::Result<Box<dyn ClientStream>>;
+
+    fn connect_compatible(&self) -> io::Result<Box<dyn ClientStream>> {
+        let mut stream = self.connect()?;
+        stream.set_read_timeout(Some(self.initial_read_timeout()))?;
+        crate::ipc::client_handshake(stream.as_mut())?;
+        stream.set_read_timeout(None)?;
+        Ok(stream)
+    }
+
+    fn is_remote(&self) -> bool {
+        false
+    }
+
+    fn initial_read_timeout(&self) -> Duration {
+        Duration::from_secs(2)
+    }
+}
+
+struct LocalConnector {
+    socket_name: String,
+}
+
+impl SocketConnector for LocalConnector {
+    fn connect(&self) -> io::Result<Box<dyn ClientStream>> {
+        Ok(Box::new(connect_client(&self.socket_name)?))
+    }
+}
+
 enum ControlWrite {
     Line(String),
     Input(Vec<u8>),
 }
 
 pub struct SocketClient {
-    socket_name: String,
+    connector: Arc<dyn SocketConnector>,
     frame_slot: Arc<Mutex<FrameSlot>>,
-    write_stream: Arc<Mutex<Box<dyn Write + Send>>>,
+    session_tree_cache: Arc<Mutex<Vec<SessionTreeEntry>>>,
+    session_tree_refresh: Arc<AtomicBool>,
     control_tx: mpsc::Sender<ControlWrite>,
     shutdown: Arc<AtomicBool>,
 }
@@ -97,20 +165,39 @@ fn store_exit_frame(frame_slot: &Arc<Mutex<FrameSlot>>, reason: &str) {
 
 impl SocketClient {
     pub fn connect(socket_name: &str, size: Size) -> io::Result<Self> {
+        Self::connect_with(
+            socket_name,
+            size,
+            Arc::new(LocalConnector {
+                socket_name: socket_name.to_string(),
+            }),
+        )
+    }
+
+    pub(crate) fn connect_with(
+        socket_name: &str,
+        size: Size,
+        connector: Arc<dyn SocketConnector>,
+    ) -> io::Result<Self> {
         log_socket(&format!(
             "connect socket='{}' size={}x{}",
             socket_name, size.rows, size.cols
         ));
 
-        let stream = connect_client(socket_name)?;
-        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let stream = connector.connect_compatible()?;
+        let initial_timeout = connector.initial_read_timeout();
+        stream.set_read_timeout(Some(initial_timeout))?;
 
-        let reader_stream = stream.try_clone()?;
-        let write_clone = stream.try_clone()?;
+        let reader_stream = stream.try_clone_box()?;
+        let write_clone = stream.try_clone_box()?;
         let mut writer = write_clone;
 
         writer.write_all(
-            format!("ATTACH\n{}x{}\nFRAME?\n", size.rows, size.cols).as_bytes(),
+            format!(
+                "ATTACH\n{}x{}+{}+{}\nFRAME?\n",
+                size.rows, size.cols, size.x, size.y
+            )
+            .as_bytes(),
         )?;
         writer.flush()?;
         log_socket("sent ATTACH + FRAME?");
@@ -142,7 +229,7 @@ impl SocketClient {
                 Err(e) => {
                     log_socket(&format!("first frame timeout/error: {}", e));
                     return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
+                        e.kind(),
                         format!(
                             "server did not respond to first FRAME?: {}",
                             e
@@ -153,11 +240,15 @@ impl SocketClient {
 
         probe_reader
             .get_ref()
-            .set_read_timeout(Some(Duration::from_secs(2)))?;
+            .set_read_timeout(Some(initial_timeout))?;
 
-        let mut control_stream = connect_client(socket_name)?;
+        let mut control_stream = connector.connect_compatible()?;
         control_stream.write_all(
-            format!("ATTACH\n{}x{}\n", size.rows, size.cols).as_bytes(),
+            format!(
+                "ATTACH\n{}x{}+{}+{}\n",
+                size.rows, size.cols, size.x, size.y
+            )
+            .as_bytes(),
         )?;
         control_stream.flush()?;
         log_socket("opened control connection");
@@ -171,21 +262,33 @@ impl SocketClient {
             Arc::new(Mutex::new(Box::new(control_stream)));
         let frame_write_arc: Arc<Mutex<Box<dyn Write + Send>>> =
             Arc::new(Mutex::new(Box::new(writer)));
+        let shutdown: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         let (control_tx, control_rx) = mpsc::channel();
         let control_write = Arc::clone(&write_arc);
+        let control_shutdown = Arc::clone(&shutdown);
+        let control_frame_slot = Arc::clone(&frame_slot);
         thread::spawn(move || {
             for msg in control_rx {
-                match msg {
+                let sent = match msg {
                     ControlWrite::Line(line) => {
-                        let _ = send_line_on(&control_write, &line);
+                        send_line_on(&control_write, &line)
                     }
                     ControlWrite::Input(bytes) => {
-                        pump_input_chunks(&control_write, &bytes);
+                        pump_input_chunks(&control_write, &bytes)
                     }
+                };
+                if !sent {
+                    control_shutdown.store(true, Ordering::Relaxed);
+                    store_exit_frame(
+                        &control_frame_slot,
+                        "control connection write failed",
+                    );
+                    break;
                 }
             }
         });
-        let shutdown: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        let session_tree_cache = Arc::new(Mutex::new(Vec::new()));
+        let session_tree_refresh = Arc::new(AtomicBool::new(false));
 
         let frame_slot_poll = Arc::clone(&frame_slot);
         let ws_poll = Arc::clone(&frame_write_arc);
@@ -220,6 +323,9 @@ impl SocketClient {
                 }
                 match recv_frame(&mut reader) {
                     Ok(json) => {
+                        if shutdown_poll.load(Ordering::Relaxed) {
+                            break;
+                        }
                         if json == last_frame_json {
                             thread::sleep(Duration::from_millis(16));
                             if shutdown_poll.load(Ordering::Relaxed) {
@@ -271,10 +377,26 @@ impl SocketClient {
             }
         });
 
+        {
+            let connector_tree = Arc::clone(&connector);
+            let cache_tree = Arc::clone(&session_tree_cache);
+            let refresh_tree = Arc::clone(&session_tree_refresh);
+            let shutdown_tree = Arc::clone(&shutdown);
+            thread::spawn(move || {
+                poll_session_tree(
+                    connector_tree,
+                    cache_tree,
+                    refresh_tree,
+                    shutdown_tree,
+                )
+            });
+        }
+
         Ok(Self {
-            socket_name: socket_name.to_string(),
+            connector,
             frame_slot,
-            write_stream: write_arc,
+            session_tree_cache,
+            session_tree_refresh,
             control_tx,
             shutdown,
         })
@@ -312,22 +434,21 @@ impl SocketClient {
     }
 
     pub fn kill_server_socket(socket_name: &str) -> io::Result<()> {
-        let stream = connect_client(socket_name)?;
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-        let mut ws = stream.try_clone()?;
-        let reader = BufReader::new(stream);
-        ws.write_all(b"KILL_SERVER\n")?;
-        ws.flush()?;
-        let mut buf_reader = reader;
-        match recv_resp(&mut buf_reader) {
-            Ok(_) => {
+        let connector: Arc<dyn SocketConnector> = Arc::new(LocalConnector {
+            socket_name: socket_name.to_string(),
+        });
+        match kill_server_with(&connector) {
+            Ok(()) => {
                 cleanup_killed_socket(socket_name);
                 Ok(())
             }
-            Err(e) => {
+            Err(error) if crate::ipc::is_compatibility_error(&error) => {
+                Err(error)
+            }
+            Err(error) => {
                 thread::sleep(Duration::from_millis(50));
                 if server_reachable(socket_name) {
-                    Err(e)
+                    Err(error)
                 } else {
                     cleanup_killed_socket(socket_name);
                     Ok(())
@@ -336,13 +457,17 @@ impl SocketClient {
         }
     }
 
+    pub fn kill_server(&self) -> io::Result<()> {
+        kill_server_with(&self.connector)
+    }
+
     pub fn run_command_with_output(&self, cmd: &str) -> String {
-        let stream = match connect_client(&self.socket_name) {
+        let stream = match self.connector.connect_compatible() {
             Ok(s) => s,
             Err(_) => return String::new(),
         };
         let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-        let mut ws = match stream.try_clone() {
+        let mut ws = match stream.try_clone_box() {
             Ok(s) => s,
             Err(_) => return String::new(),
         };
@@ -359,7 +484,10 @@ impl SocketClient {
     }
 
     pub fn resize(&self, size: Size) {
-        self.send_line(&format!("RESIZE {}x{}", size.rows, size.cols));
+        self.send_line(&format!(
+            "RESIZE {}x{}+{}+{}",
+            size.rows, size.cols, size.x, size.y
+        ));
     }
 
     /// Request a complete pane repaint after a client-side overlay has covered
@@ -376,12 +504,12 @@ impl SocketClient {
     }
 
     pub fn scroll_on_erase_in_display(&self) -> bool {
-        let stream = match connect_client(&self.socket_name) {
+        let stream = match self.connector.connect_compatible() {
             Ok(s) => s,
             Err(_) => return false,
         };
         let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-        let mut ws = match stream.try_clone() {
+        let mut ws = match stream.try_clone_box() {
             Ok(s) => s,
             Err(_) => return false,
         };
@@ -460,25 +588,14 @@ impl SocketClient {
     }
 
     pub fn session_tree(&self) -> Vec<SessionTreeEntry> {
-        let stream = match connect_client(&self.socket_name) {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-        let mut ws = match stream.try_clone() {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-        let reader = BufReader::new(stream);
-        if ws.write_all(b"SESSION_TREE\n").is_err() || ws.flush().is_err() {
-            return Vec::new();
-        }
-        let mut buf_reader = reader;
-        let json = match crate::ipc::recv_resp(&mut buf_reader) {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-        parse_session_tree_json(&json)
+        self.session_tree_cache
+            .lock()
+            .map(|tree| tree.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn refresh_session_tree(&self) {
+        self.session_tree_refresh.store(true, Ordering::Release);
     }
 
     pub fn scroll_up(&self, lines: usize) {
@@ -592,12 +709,12 @@ impl SocketClient {
     }
 
     pub fn copy_yank_selection(&self) -> String {
-        let stream = match connect_client(&self.socket_name) {
+        let stream = match self.connector.connect_compatible() {
             Ok(s) => s,
             Err(_) => return String::new(),
         };
         let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-        let mut ws = match stream.try_clone() {
+        let mut ws = match stream.try_clone_box() {
             Ok(s) => s,
             Err(_) => return String::new(),
         };
@@ -607,6 +724,72 @@ impl SocketClient {
         }
         let mut buf_reader = reader;
         recv_resp(&mut buf_reader).unwrap_or_default()
+    }
+}
+
+fn kill_server_with(connector: &Arc<dyn SocketConnector>) -> io::Result<()> {
+    let stream = connector.connect_compatible()?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let mut ws = stream.try_clone_box()?;
+    let reader = BufReader::new(stream);
+    ws.write_all(b"KILL_SERVER\n")?;
+    ws.flush()?;
+    let mut buf_reader = reader;
+    recv_resp(&mut buf_reader).map(|_| ())
+}
+
+fn poll_session_tree(
+    connector: Arc<dyn SocketConnector>,
+    cache: Arc<Mutex<Vec<SessionTreeEntry>>>,
+    refresh: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
+) {
+    while !shutdown.load(Ordering::Relaxed) {
+        let connected = match connector.connect_compatible() {
+            Err(error) if crate::ipc::is_compatibility_error(&error) => {
+                log_socket(&format!(
+                    "session tree protocol rejected; stopping retries: {error}"
+                ));
+                return;
+            }
+            other => other,
+        };
+        let Some((mut writer, mut reader)) =
+            connected.ok().and_then(|stream| {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let writer = stream.try_clone_box().ok()?;
+                Some((writer, BufReader::new(stream)))
+            })
+        else {
+            thread::sleep(Duration::from_millis(500));
+            continue;
+        };
+        while !shutdown.load(Ordering::Relaxed) {
+            if writer.write_all(b"SESSION_TREE\n").is_err()
+                || writer.flush().is_err()
+            {
+                break;
+            }
+            let Ok(json) = crate::ipc::recv_resp(&mut reader) else {
+                break;
+            };
+            if let Ok(mut current) = cache.lock() {
+                *current = parse_session_tree_json(&json);
+            }
+            let ticks = if connector.is_remote() { 15 } else { 3 };
+            for _ in 0..ticks {
+                if shutdown.load(Ordering::Relaxed) {
+                    return;
+                }
+                if refresh.swap(false, Ordering::AcqRel) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+        if !shutdown.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(250));
+        }
     }
 }
 
@@ -624,17 +807,18 @@ fn send_line_on(
 fn pump_input_chunks(
     write_stream: &Arc<Mutex<Box<dyn Write + Send>>>,
     bytes: &[u8],
-) {
+) -> bool {
     let mut chunks = bytes.chunks(INPUT_CHUNK_SIZE).peekable();
     while let Some(chunk) = chunks.next() {
         if !send_line_on(write_stream, &format!("INPUT {}", encode_hex(chunk)))
         {
-            break;
+            return false;
         }
         if chunks.peek().is_some() {
             thread::sleep(Duration::from_millis(1));
         }
     }
+    true
 }
 
 fn server_reachable(socket_name: &str) -> bool {
@@ -666,6 +850,25 @@ mod tests {
         let (frame, counter) = slot.snapshot();
         assert_eq!(counter, 8);
         assert!(frame.is_some_and(|frame| frame.exit));
+    }
+
+    #[test]
+    fn session_tree_parser_keeps_pane_titles_and_accepts_legacy_payloads() {
+        let titled = parse_session_tree_json(
+            r#"[{"type":"pane","session_name":"main","window_index":0,"pane_id":7,"index":0,"title":"editor","is_active":true}]"#,
+        );
+        assert!(matches!(
+            &titled[0],
+            SessionTreeEntry::Pane { title, .. } if title == "editor"
+        ));
+
+        let legacy = parse_session_tree_json(
+            r#"[{"type":"pane","session_name":"main","window_index":0,"pane_id":7,"index":0,"is_active":true}]"#,
+        );
+        assert!(matches!(
+            &legacy[0],
+            SessionTreeEntry::Pane { title, .. } if title.is_empty()
+        ));
     }
 }
 
@@ -702,6 +905,11 @@ pub(crate) fn parse_session_tree_json(json: &str) -> Vec<SessionTreeEntry> {
                     window_index: v.get("window_index")?.as_u64()? as usize,
                     pane_id: v.get("pane_id")?.as_u64()? as usize,
                     index: v.get("index")?.as_u64()? as usize,
+                    title: v
+                        .get("title")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
                     is_active: v.get("is_active")?.as_bool()?,
                 }),
                 _ => None,

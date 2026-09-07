@@ -5,10 +5,9 @@ use std::{
 
 use crossterm::event::{KeyCode, KeyModifiers};
 
-use crate::types::{
-    mode::{Action, KeyBinding},
-    options::GlobalOptions,
-};
+use crate::types::mode::{Action, KeyBinding};
+
+pub mod machines;
 
 pub fn find_config_file() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("ZMUX_CONFIG") {

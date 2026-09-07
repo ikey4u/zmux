@@ -71,7 +71,11 @@ pub struct PartFile {
 impl PartFile {
     pub fn create(ext: &str) -> io::Result<Self> {
         let dir = ensure_drop_dir()?;
-        gc_expired(&dir)?;
+        Self::create_in(&dir, ext)
+    }
+
+    fn create_in(dir: &Path, ext: &str) -> io::Result<Self> {
+        gc_expired(dir)?;
         let id = crate::domain::ids::new_instance_id();
         let ext = sanitize_ext(ext);
         let final_path = dir.join(format!("{id}.{ext}"));
@@ -192,6 +196,29 @@ pub fn write_bytes_atomic(ext: &str, data: &[u8]) -> io::Result<PathBuf> {
 mod tests {
     use super::*;
 
+    struct TestDropDir(PathBuf);
+
+    impl TestDropDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "zmux-drop-test-{}",
+                crate::domain::ids::new_instance_id()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn create_part(&self) -> PartFile {
+            PartFile::create_in(&self.0, "bin").unwrap()
+        }
+    }
+
+    impl Drop for TestDropDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn strips_path_traversal_from_names() {
         assert_eq!(display_name("../../etc/passwd"), "passwd");
@@ -203,7 +230,8 @@ mod tests {
 
     #[test]
     fn rejects_oversize_chunk_sequence() {
-        let mut part = PartFile::create("bin").unwrap();
+        let dir = TestDropDir::new();
+        let mut part = dir.create_part();
         let chunk = vec![0u8; 1024];
         let mut wrote = 0u64;
         let mut hit_limit = false;
@@ -222,7 +250,8 @@ mod tests {
 
     #[test]
     fn finish_rejects_sha256_mismatch() {
-        let mut part = PartFile::create("bin").unwrap();
+        let dir = TestDropDir::new();
+        let mut part = dir.create_part();
         part.write_chunk(b"hello").unwrap();
         let err = part.finish(Some("deadbeef")).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);

@@ -18,9 +18,11 @@ pub trait DomainHandle: Send {
     fn set_scroll_on_erase_in_display(&self, enabled: bool);
     fn shutdown(&self);
     fn detach(&self);
+    fn kill_server(&self) -> std::io::Result<()>;
     fn active_window_name(&self) -> String;
     fn session_name(&self) -> String;
     fn session_tree(&self) -> Vec<SessionTreeEntry>;
+    fn refresh_session_tree(&self);
     fn scroll_up(&self, lines: usize);
     fn scroll_down(&self, lines: usize);
     fn scroll_pane(&self, pane_id: usize, direction: &str, lines: usize);
@@ -91,6 +93,9 @@ macro_rules! impl_common_handle {
         fn detach(&self) {
             Self::detach(self)
         }
+        fn kill_server(&self) -> std::io::Result<()> {
+            Self::kill_server(self)
+        }
         fn active_window_name(&self) -> String {
             Self::active_window_name(self)
         }
@@ -99,6 +104,9 @@ macro_rules! impl_common_handle {
         }
         fn session_tree(&self) -> Vec<SessionTreeEntry> {
             Self::session_tree(self)
+        }
+        fn refresh_session_tree(&self) {
+            Self::refresh_session_tree(self)
         }
         fn scroll_up(&self, lines: usize) {
             Self::scroll_up(self, lines)

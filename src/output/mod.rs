@@ -255,12 +255,13 @@ fn write_terminal_row(
     anchor_each_cell: bool,
     out: &mut String,
 ) {
-    // Ordinary shell output is anchored at every grid column so host-side
-    // width disagreement or automatic wrapping cannot carry text across a
-    // pane boundary. Alternate-screen TUIs stream matching-width cells to
-    // avoid turning every nvim redraw into thousands of CUP sequences; they
-    // re-anchor after a glyph whose host display width may disagree with the
-    // Alacritty grid (most commonly a Nerd Font PUA glyph).
+    // Meaningful ordinary-shell cells are individually anchored so host-side
+    // width disagreement cannot carry later text across a pane boundary.
+    // Alternate-screen TUIs stream matching-width cells to avoid turning every
+    // nvim redraw into thousands of CUP sequences; they re-anchor after a glyph
+    // whose host display width may disagree with the Alacritty grid (most
+    // commonly a Nerd Font PUA glyph). Trailing blank padding is handled as one
+    // bounded run below for both modes.
     vte_goto(x, y, out);
     let mut current_styles = DEFAULT_STYLES;
     let paint_end = row_paint_end(cells, cols);
@@ -273,15 +274,28 @@ fn write_terminal_row(
     let mut col = 0u16;
     let mut resync_next_cell = false;
     while col < cols {
+        // Once the meaningful part of the row has been painted, padding is
+        // always single-width spaces with one style.  Writing one absolute
+        // cursor position per padding cell made geometry changes (split/close,
+        // sidebar resize) generate tens of thousands of escape sequences and
+        // visibly delayed the shell prompt.  A single contiguous run is safe:
+        // it starts inside this pane and is followed by an explicit CUP that
+        // clears any wrap-pending state at the physical right edge.
+        if paint_end.is_none_or(|end| col > end) {
+            // The last glyph can disagree with the host's width (Nerd Font
+            // icons). Anchor the start of padding once before streaming it.
+            if col > 0 && (anchor_each_cell || resync_next_cell) {
+                vte_cup(x + col, y, out);
+            }
+            write_style_diff(&mut current_styles, reset_pad, out);
+            for _ in col..cols {
+                out.push(' ');
+            }
+            break;
+        }
         if col > 0 && (anchor_each_cell || resync_next_cell) {
             vte_cup(x + col, y, out);
             resync_next_cell = false;
-        }
-        if paint_end.is_none_or(|end| col > end) {
-            write_style_diff(&mut current_styles, reset_pad, out);
-            out.push(' ');
-            col += 1;
-            continue;
         }
         if let Some(cell) = cells.get(col as usize).and_then(|c| c.as_ref()) {
             active_bg = color_to_ansi_or_reset(cell.bg);
@@ -564,6 +578,15 @@ fn write_pane(
     };
     for row_idx in 0..inner.height as usize {
         let cells = rows.get(row_idx).cloned().unwrap_or_default();
+        // `clear_display` already blanked the complete viewport. Repainting an
+        // empty row only duplicates that work. Keep the old path for custom
+        // pane backgrounds because those spaces carry the background colour.
+        if opts.clear_display
+            && pane_bg.is_none()
+            && row_paint_end(&cells, inner.width).is_none()
+        {
+            continue;
+        }
         write_terminal_row(
             &cells,
             inner.width,
@@ -853,7 +876,7 @@ fn hash_layout_node(
     }
 }
 
-/// Clear only the pane region, preserving the client tab bar (row 0) and status bar.
+/// Clear only the pane viewport, preserving the sidebar and status bar.
 ///
 /// Must not use `\x1b[K` (EL): that clears to the physical line end and would wipe
 /// every pane on the row. Space-fill the rect instead (same as per-pane erase).
@@ -929,9 +952,14 @@ fn serialize_frame_ansi_with_mode(
     out
 }
 
-/// Pane-only ANSI area on the client screen (below tab bar, above status bar).
+/// Pane-only ANSI area in the client-provided viewport, above the status bar.
 pub fn frame_ansi_area(size: crate::types::session::Size) -> Rect {
-    Rect::new(0, 1, size.cols.max(1), size.rows.saturating_sub(1).max(1))
+    Rect::new(
+        size.x,
+        size.y,
+        size.cols.max(1),
+        size.rows.saturating_sub(1).max(1),
+    )
 }
 
 pub fn encode_ansi_base64(ansi: &str) -> String {
@@ -984,8 +1012,8 @@ mod tests {
     }
 
     #[test]
-    fn clear_display_preserves_chrome_rows() {
-        let pane = Rect::new(0, 1, 80, 22);
+    fn clear_display_preserves_sidebar_and_status_row() {
+        let pane = Rect::new(30, 0, 50, 23);
         let mut out = String::new();
         write_clear_pane_area(&mut out, pane);
         assert!(
@@ -1001,12 +1029,12 @@ mod tests {
             "must not EL to line end (would wipe sibling panes), got {out:?}"
         );
         assert!(
-            out.contains("\x1b[2;1H\x1b[m"),
+            out.contains("\x1b[1;31H\x1b[m"),
             "must clear pane lines by space-fill from the area origin, got {out:?}"
         );
         assert!(
-            !out.contains("\x1b[1;"),
-            "tab bar row must be preserved, got {out:?}"
+            !out.contains(";1H"),
+            "sidebar columns must be preserved, got {out:?}"
         );
         assert!(
             !out.contains("\x1b[24;"),
@@ -1230,9 +1258,8 @@ mod tests {
         );
     }
 
-    /// Shell rows are re-anchored at every grid column. This prevents a glyph
-    /// width mismatch or host-side automatic wrap in one pane from carrying
-    /// later `ls` output across the split into its neighbour.
+    /// Meaningful shell cells are re-anchored at every grid column. Trailing
+    /// padding is emitted as one run to keep full redraws responsive.
     #[test]
     fn write_terminal_row_anchors_every_shell_grid_column() {
         let cells = vec![
@@ -1259,7 +1286,14 @@ mod tests {
         );
         assert!(
             out.contains("\x1b[6;13H"),
-            "trailing shell padding must stay inside the pane: {out:?}"
+            "padding must start at its grid coordinate: {out:?}"
+        );
+        let mut wide = String::new();
+        write_terminal_row(&cells, 200, 10, 5, None, None, true, &mut wide);
+        assert!(wide.contains(&" ".repeat(198)));
+        assert!(
+            !wide.contains("\x1b[6;14H"),
+            "padding must not use per-cell CUP"
         );
     }
 

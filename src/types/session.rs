@@ -29,11 +29,23 @@ pub type ClientId = u64;
 pub struct Size {
     pub rows: u16,
     pub cols: u16,
+    /// Absolute client-screen origin used by server-rendered ANSI.
+    pub x: u16,
+    pub y: u16,
 }
 
 impl Size {
     pub fn new(rows: u16, cols: u16) -> Self {
-        Self { rows, cols }
+        Self {
+            rows,
+            cols,
+            x: 0,
+            y: 0,
+        }
+    }
+
+    pub fn viewport(rows: u16, cols: u16, x: u16, y: u16) -> Self {
+        Self { rows, cols, x, y }
     }
 }
 
@@ -214,6 +226,8 @@ pub struct Server {
     pub force_clear_display: bool,
     pub instance_id: String,
     pub socket_name: Option<String>,
+    /// Creation directory shared only by this workspace/server instance.
+    pub workspace_home: Option<String>,
 }
 
 impl Server {
@@ -231,6 +245,7 @@ impl Server {
             force_clear_display: false,
             instance_id: crate::domain::ids::new_instance_id(),
             socket_name: None,
+            workspace_home: None,
         }
     }
 

@@ -23,8 +23,9 @@ use ratatui::Terminal;
 
 mod backend;
 use backend::TerminalBackend;
-use serde::{Deserialize, Serialize};
 
+mod navigation;
+mod remote;
 mod render;
 pub(crate) mod socket;
 mod visual;
@@ -44,7 +45,6 @@ pub struct ClientApp {
     pub session_name: Option<String>,
     pub clean: bool,
     pub start_dir: Option<String>,
-    pub initial_tab_title: Option<String>,
     pub attach_all: bool,
 }
 
@@ -52,6 +52,14 @@ pub struct ClientApp {
 enum InputMode {
     Normal,
     Prefix,
+    Navigator,
+    NavigationHelp {
+        scroll: usize,
+    },
+    ShortcutsHelp {
+        scroll: usize,
+        return_mode: Box<InputMode>,
+    },
     Resize,
     CopyMode,
     CopySearch {
@@ -62,48 +70,33 @@ enum InputMode {
     RenameWindow {
         buf: String,
         cursor: usize,
+        return_to_navigator: bool,
     },
     RenameSession {
         buf: String,
         cursor: usize,
+        return_to_navigator: bool,
     },
-    RenameTab {
-        code: String,
-        code_cursor: usize,
-        title: String,
-        title_cursor: usize,
-        editing_code: bool,
-        error: Option<String>,
-        return_to_tab_chooser: bool,
+    RenamePane {
+        buf: String,
+        cursor: usize,
+        return_to_navigator: bool,
     },
-    ConfirmKillTab {
-        socket_name: String,
-        label: String,
-        return_to_tab_chooser: bool,
+    RenameIdentity {
+        id: navigation::NavigationNodeId,
+        buf: String,
+        cursor: usize,
+    },
+    ConfirmNavigationClose {
+        entry: navigation::NavigationEntry,
     },
     Command {
         buf: String,
         cursor: usize,
     },
-    SessionChooser {
-        entries: Vec<SessionTreeEntry>,
-        selected: usize,
-        collapsed: std::collections::HashSet<String>,
-        collapsed_windows: std::collections::HashSet<(String, usize)>,
-    },
     OptionPanel {
         selected: usize,
         scroll_on_erase_in_display: bool,
-    },
-    TabChooser {
-        query: String,
-        cursor: usize,
-        selected: usize,
-        search_active: bool,
-    },
-    TabQuickSwitch {
-        code: String,
-        error: Option<String>,
     },
 }
 
@@ -122,12 +115,14 @@ struct MouseDragOrigin {
     col: u16,
 }
 
-struct ClientTab {
-    code: String,
-    title: String,
+struct WorkspaceConnection {
     socket_name: String,
+    machine_id: String,
     client: Box<dyn DomainHandle>,
     visual_focus: VisualFocus,
+    navigation_tree: Vec<SessionTreeEntry>,
+    navigation_tree_at: Option<Instant>,
+    navigation_refresh_until: Option<Instant>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -135,24 +130,447 @@ enum VisualFocus {
     Local { pane_id: Option<usize> },
 }
 
-#[derive(Clone, Default, Deserialize, Serialize)]
-struct StoredTabMetadata {
-    code: Option<String>,
-    title: Option<String>,
-    visible: Option<bool>,
+impl WorkspaceConnection {
+    fn local(socket_name: String, client: SocketClient) -> Self {
+        Self {
+            socket_name,
+            machine_id: "local".to_string(),
+            client: Box::new(client),
+            visual_focus: VisualFocus::Local { pane_id: None },
+            navigation_tree: Vec::new(),
+            navigation_tree_at: None,
+            navigation_refresh_until: None,
+        }
+    }
 }
 
-struct TabManager {
-    tabs: Vec<ClientTab>,
+struct WorkspaceManager {
+    sidebar_visible: bool,
+    workspaces: Vec<WorkspaceConnection>,
     active: usize,
-    tab_bar_offset: usize,
     base_socket: String,
-    start_dir: Option<String>,
-    next_id: usize,
-    killed_sockets: std::collections::HashSet<String>,
 }
 
-impl TabManager {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteMachineState {
+    Disconnected,
+    Probing,
+    Connected,
+    Unavailable,
+}
+
+struct RemoteMachine {
+    host: String,
+    id: String,
+    route: Vec<String>,
+    state: RemoteMachineState,
+    error: Option<String>,
+    retry_attempt: u32,
+    retry_at: Option<Instant>,
+    activate_after_probe: bool,
+}
+
+struct RemoteRegistry {
+    machines: Vec<RemoteMachine>,
+    result_tx:
+        std::sync::mpsc::Sender<(String, Result<(), remote::RemoteFailure>)>,
+    result_rx:
+        std::sync::mpsc::Receiver<(String, Result<(), remote::RemoteFailure>)>,
+}
+
+fn remote_machine_id(route: &[String]) -> String {
+    let mut id = String::from("ssh:");
+    for component in route {
+        id.push_str(&format!("{}#{component}", component.len()));
+    }
+    id
+}
+
+impl RemoteRegistry {
+    fn new() -> Self {
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        Self {
+            machines: Vec::new(),
+            result_tx,
+            result_rx,
+        }
+    }
+
+    fn add_and_probe(
+        &mut self,
+        host: &str,
+        activate: bool,
+    ) -> Result<String, String> {
+        let host = host.trim();
+        if host.is_empty() || host.starts_with('-') {
+            return Err("usage: new -m <SSH_HOST>".to_string());
+        }
+        let route = vec![host.to_string()];
+        let id = remote_machine_id(&route);
+        if !self.machines.iter().any(|machine| machine.id == id) {
+            self.machines.push(RemoteMachine {
+                host: host.to_string(),
+                id: id.clone(),
+                route,
+                state: RemoteMachineState::Disconnected,
+                error: None,
+                retry_attempt: 0,
+                retry_at: None,
+                activate_after_probe: false,
+            });
+        }
+        self.start_probe(&id, activate);
+        Ok(id)
+    }
+
+    fn start_probe(&mut self, alias: &str, activate: bool) -> bool {
+        let Some(machine) =
+            self.machines.iter_mut().find(|machine| machine.id == alias)
+        else {
+            return false;
+        };
+        if machine.state == RemoteMachineState::Probing {
+            machine.activate_after_probe |= activate;
+            return false;
+        }
+        machine.state = RemoteMachineState::Probing;
+        machine.error = None;
+        machine.retry_at = None;
+        machine.activate_after_probe |= activate;
+        let id = alias.to_string();
+        let route = machine.route.clone();
+        let tx = self.result_tx.clone();
+        std::thread::spawn(move || {
+            let result = remote::probe(&route);
+            let _ = tx.send((id, result));
+        });
+        true
+    }
+
+    fn mark_disconnected(&mut self, alias: &str, error: String) {
+        self.mark_failure(alias, remote::RemoteFailure::transient(error));
+    }
+
+    fn mark_failure(&mut self, alias: &str, error: remote::RemoteFailure) {
+        if let Some(machine) =
+            self.machines.iter_mut().find(|machine| machine.id == alias)
+        {
+            machine.state = RemoteMachineState::Unavailable;
+            machine.error = Some(error.message);
+            machine.retry_attempt = machine.retry_attempt.saturating_add(1);
+            let backoff =
+                1u64 << machine.retry_attempt.saturating_sub(1).min(5);
+            machine.retry_at = error
+                .retryable
+                .then(|| Instant::now() + Duration::from_secs(backoff));
+            machine.activate_after_probe = false;
+        }
+    }
+
+    fn mark_detached(&mut self, id: &str) {
+        if let Some(machine) =
+            self.machines.iter_mut().find(|machine| machine.id == id)
+        {
+            machine.state = RemoteMachineState::Disconnected;
+            machine.error = None;
+            machine.retry_attempt = 0;
+            machine.retry_at = None;
+            machine.activate_after_probe = false;
+        }
+    }
+
+    fn due_retries(&self, now: Instant) -> Vec<String> {
+        self.machines
+            .iter()
+            .filter(|machine| {
+                machine.state == RemoteMachineState::Unavailable
+                    && machine.retry_at.is_some_and(|at| at <= now)
+            })
+            .map(|machine| machine.id.clone())
+            .collect()
+    }
+
+    fn display_name(&self, id: &str) -> String {
+        self.machines
+            .iter()
+            .find(|machine| machine.id == id)
+            .map(|machine| machine.host.clone())
+            .unwrap_or_else(|| id.to_string())
+    }
+}
+
+enum NavigationOpenResult {
+    Toggled,
+    Opened,
+    Probing(String),
+    Failed(String),
+}
+
+fn open_navigation_entry(
+    workspaces: &mut WorkspaceManager,
+    remotes: &mut RemoteRegistry,
+    navigation_state: &mut navigation::NavigationState,
+    navigation_entries: &[navigation::NavigationEntry],
+    entry: &navigation::NavigationEntry,
+    size: Size,
+) -> NavigationOpenResult {
+    use navigation::{NavigationNodeId, NavigationNodeKind};
+
+    if entry.kind != NavigationNodeKind::Machine {
+        return if workspaces.activate_navigation_entry(entry, size) {
+            NavigationOpenResult::Opened
+        } else {
+            NavigationOpenResult::Failed(
+                "navigation target is unavailable".to_string(),
+            )
+        };
+    }
+
+    let NavigationNodeId::Machine(machine_id) = &entry.id else {
+        return NavigationOpenResult::Failed(
+            "invalid machine node".to_string(),
+        );
+    };
+    if machine_id == "local" {
+        navigation_state.toggle_selected(navigation_entries);
+        return NavigationOpenResult::Toggled;
+    }
+
+    let connected = remotes
+        .machines
+        .iter()
+        .find(|machine| machine.id == *machine_id)
+        .is_some_and(|machine| machine.state == RemoteMachineState::Connected);
+    if connected {
+        let route = remotes
+            .machines
+            .iter()
+            .find(|machine| machine.id == *machine_id)
+            .map(|machine| machine.route.clone())
+            .unwrap_or_default();
+        return match workspaces
+            .connect_remote_machine(machine_id, &route, size, true)
+        {
+            Ok(()) => NavigationOpenResult::Opened,
+            Err(error) => NavigationOpenResult::Failed(format!(
+                "failed to open {}: {error}",
+                remotes.display_name(machine_id)
+            )),
+        };
+    }
+
+    let name = remotes.display_name(machine_id);
+    remotes.start_probe(machine_id, true);
+    NavigationOpenResult::Probing(name)
+}
+
+fn navigation_kind_label(kind: navigation::NavigationNodeKind) -> &'static str {
+    match kind {
+        navigation::NavigationNodeKind::Machine => "machine",
+        navigation::NavigationNodeKind::Workspace => "workspace",
+        navigation::NavigationNodeKind::Session => "session",
+        navigation::NavigationNodeKind::Window => "window",
+        navigation::NavigationNodeKind::Pane => "pane",
+    }
+}
+
+fn navigation_rename_value(entry: &navigation::NavigationEntry) -> String {
+    match &entry.id {
+        navigation::NavigationNodeId::Session { name, .. } => name.clone(),
+        navigation::NavigationNodeId::Pane { .. }
+            if entry.label.starts_with("pane ") =>
+        {
+            String::new()
+        }
+        _ => entry.label.clone(),
+    }
+}
+
+fn navigation_close_block_reason(
+    entries: &[navigation::NavigationEntry],
+    entry: &navigation::NavigationEntry,
+) -> Option<String> {
+    use navigation::NavigationNodeId;
+    match &entry.id {
+        NavigationNodeId::Machine(machine) if machine == "local" => {
+            Some("the local machine cannot be closed".to_string())
+        }
+        NavigationNodeId::Session {
+            machine, workspace, ..
+        } => {
+            let count = entries
+                .iter()
+                .filter(|candidate| {
+                    matches!(
+                        &candidate.id,
+                        NavigationNodeId::Session {
+                            machine: other_machine,
+                            workspace: other_workspace,
+                            ..
+                        } if other_machine == machine && other_workspace == workspace
+                    )
+                })
+                .count();
+            (count <= 1).then(|| {
+                "cannot close the last session; close its workspace instead"
+                    .to_string()
+            })
+        }
+        NavigationNodeId::Window {
+            machine,
+            workspace,
+            session,
+            ..
+        } => {
+            let count = entries
+                .iter()
+                .filter(|candidate| {
+                    matches!(
+                        &candidate.id,
+                        NavigationNodeId::Window {
+                            machine: other_machine,
+                            workspace: other_workspace,
+                            session: other_session,
+                            ..
+                        } if other_machine == machine
+                            && other_workspace == workspace
+                            && other_session == session
+                    )
+                })
+                .count();
+            (count <= 1).then(|| {
+                "cannot close the last window in a session".to_string()
+            })
+        }
+        NavigationNodeId::Pane {
+            machine,
+            workspace,
+            session,
+            window,
+            ..
+        } => {
+            let pane_count = entries
+                .iter()
+                .filter(|candidate| {
+                    matches!(
+                        &candidate.id,
+                        NavigationNodeId::Pane {
+                            machine: other_machine,
+                            workspace: other_workspace,
+                            session: other_session,
+                            window: other_window,
+                            ..
+                        } if other_machine == machine
+                            && other_workspace == workspace
+                            && other_session == session
+                            && other_window == window
+                    )
+                })
+                .count();
+            let window_count = entries
+                .iter()
+                .filter(|candidate| {
+                    matches!(
+                        &candidate.id,
+                        NavigationNodeId::Window {
+                            machine: other_machine,
+                            workspace: other_workspace,
+                            session: other_session,
+                            ..
+                        } if other_machine == machine
+                            && other_workspace == workspace
+                            && other_session == session
+                    )
+                })
+                .count();
+            (pane_count <= 1 && window_count <= 1).then(|| {
+                "cannot close the only pane in the last window".to_string()
+            })
+        }
+        NavigationNodeId::Machine(_) | NavigationNodeId::Workspace { .. } => {
+            None
+        }
+    }
+}
+
+fn close_navigation_entry(
+    workspaces: &mut WorkspaceManager,
+    remotes: &mut RemoteRegistry,
+    entry: &navigation::NavigationEntry,
+    size: Size,
+) -> Result<bool, String> {
+    use navigation::{NavigationNodeId, NavigationNodeKind};
+
+    if let NavigationNodeId::Workspace { machine, workspace } = &entry.id {
+        let Some(index) = workspaces.workspaces.iter().position(|connection| {
+            connection.machine_id == *machine
+                && connection.socket_name == *workspace
+        }) else {
+            return Err("workspace is unavailable".to_string());
+        };
+        workspaces.active = index;
+        let empty = workspaces.close_active();
+        if machine != "local"
+            && !workspaces
+                .workspaces
+                .iter()
+                .any(|connection| connection.machine_id == *machine)
+        {
+            remotes.mark_detached(machine);
+        }
+        return Ok(empty);
+    }
+
+    if let NavigationNodeId::Machine(machine_id) = &entry.id {
+        if machine_id == "local" {
+            return Err("the local machine cannot be closed".to_string());
+        }
+        while let Some(index) = workspaces
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.machine_id == *machine_id)
+        {
+            workspaces.active = index;
+            if workspaces.close_active() {
+                remotes.machines.retain(|machine| machine.id != *machine_id);
+                return Ok(true);
+            }
+        }
+        remotes.machines.retain(|machine| machine.id != *machine_id);
+        return Ok(false);
+    }
+
+    if !workspaces.activate_navigation_entry(entry, size) {
+        return Err("navigation target is unavailable".to_string());
+    }
+    let command = match entry.kind {
+        NavigationNodeKind::Session => match &entry.id {
+            NavigationNodeId::Session { name, .. } => {
+                format!("kill-session -t {}", shell_quote(name))
+            }
+            _ => unreachable!(),
+        },
+        NavigationNodeKind::Window => "kill-window".to_string(),
+        NavigationNodeKind::Pane => "kill-pane".to_string(),
+        NavigationNodeKind::Machine | NavigationNodeKind::Workspace => {
+            unreachable!()
+        }
+    };
+    workspaces.active_client().run_command(&command);
+    Ok(false)
+}
+
+impl WorkspaceManager {
+    fn set_sidebar_visible(&mut self, visible: bool, cols: u16, rows: u16) {
+        if self.sidebar_visible == visible {
+            return;
+        }
+        self.sidebar_visible = visible;
+        self.invalidate_visual_pane();
+        self.resize_all(server_content_size(cols, rows, visible));
+        self.active_client().refresh_display();
+    }
+
     fn new(
         base_socket: &str,
         session_name: &str,
@@ -160,46 +578,22 @@ impl TabManager {
         clean: bool,
         start_dir: Option<String>,
     ) -> io::Result<Self> {
-        let (client, existing_server) = ensure_server_and_connect(
+        let (client, _) = ensure_server_and_connect(
             base_socket,
             session_name,
             size,
             clean,
             start_dir.as_deref(),
         )?;
-        let stored = if existing_server {
-            load_tab_metadata().remove(base_socket)
-        } else if clean {
-            remove_tab_metadata_for_socket_family(base_socket);
-            None
-        } else {
-            // Keep titles for sibling tab servers that may still be running.
-            let _ = remove_tab_metadata(base_socket);
-            None
-        };
-        let code = stored
-            .as_ref()
-            .and_then(|meta| meta.code.as_deref())
-            .and_then(|code| normalize_tab_code(code).ok())
-            .unwrap_or_else(|| tab_code(0));
-        let title = title_from_stored(stored.as_ref());
-        let manager = Self {
-            tabs: vec![ClientTab {
-                code,
-                title,
-                socket_name: base_socket.to_string(),
-                client: Box::new(client),
-                visual_focus: VisualFocus::Local { pane_id: None },
-            }],
+        Ok(Self {
+            workspaces: vec![WorkspaceConnection::local(
+                base_socket.to_string(),
+                client,
+            )],
+            sidebar_visible: false,
             active: 0,
-            tab_bar_offset: 0,
             base_socket: base_socket.to_string(),
-            start_dir,
-            next_id: 1,
-            killed_sockets: std::collections::HashSet::new(),
-        };
-        manager.persist_active_metadata();
-        Ok(manager)
+        })
     }
 
     fn from_existing_sockets(
@@ -207,10 +601,9 @@ impl TabManager {
         socket_names: Vec<String>,
         target_session: Option<&str>,
         size: Size,
-        start_dir: Option<String>,
     ) -> io::Result<Self> {
-        let metadata = load_tab_metadata();
-        let mut tabs = Vec::new();
+        let mut workspaces = Vec::new();
+        let mut connection_error = None;
         for socket_name in socket_names {
             match SocketClient::connect(&socket_name, size) {
                 Ok(client) => {
@@ -220,60 +613,40 @@ impl TabManager {
                             shell_quote(target)
                         ));
                     }
-                    let stored = metadata.get(&socket_name);
-                    if stored.and_then(|meta| meta.visible) == Some(false) {
-                        continue;
-                    }
-                    let code = stored
-                        .and_then(|meta| meta.code.as_deref())
-                        .and_then(|code| normalize_tab_code(code).ok())
-                        .filter(|code| {
-                            !tabs
-                                .iter()
-                                .any(|tab: &ClientTab| tab.code == *code)
-                        })
-                        .unwrap_or_else(|| {
-                            next_available_tab_code(&tabs, tabs.len())
-                        });
-                    let title = title_from_stored(stored);
-                    tabs.push(ClientTab {
-                        code,
-                        title,
-                        socket_name,
-                        client: Box::new(client),
-                        visual_focus: VisualFocus::Local { pane_id: None },
-                    });
+                    workspaces
+                        .push(WorkspaceConnection::local(socket_name, client));
                 }
-                Err(e) => {
-                    log_client(&format!(
-                        "attach-all skipped socket '{}': {}",
-                        socket_name, e
-                    ));
-                    cleanup_stale_socket(&socket_name, &e);
+                Err(error) => {
+                    cleanup_stale_socket(&socket_name, &error);
+                    if !matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound
+                            | io::ErrorKind::ConnectionRefused
+                    ) {
+                        connection_error = Some(error);
+                    }
                 }
             }
         }
-        if tabs.is_empty() {
+        if workspaces.is_empty() {
+            if let Some(error) = connection_error {
+                return Err(error);
+            }
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                "no attachable zmux servers found",
+                "no running workspaces",
             ));
         }
-        let manager = Self {
+        Ok(Self {
+            workspaces,
+            sidebar_visible: false,
             active: 0,
-            tab_bar_offset: 0,
             base_socket: base_socket.to_string(),
-            start_dir,
-            next_id: tabs.len().max(1),
-            tabs,
-            killed_sockets: std::collections::HashSet::new(),
-        };
-        manager.persist_all_metadata();
-        Ok(manager)
+        })
     }
 
     fn active_client(&self) -> &dyn DomainHandle {
-        self.tabs[self.active].client.as_ref()
+        self.workspaces[self.active].client.as_ref()
     }
 
     fn focused_client(&self) -> &dyn DomainHandle {
@@ -281,26 +654,25 @@ impl TabManager {
     }
 
     fn display_snapshot(&mut self) -> (Option<FrameData>, u64) {
-        self.tabs[self.active].client.frame_snapshot()
+        self.workspaces[self.active].client.frame_snapshot()
     }
 
-    fn visual_move(&mut self, dir: crate::layout::NavDir, hide_borders: bool) {
+    fn visual_move(
+        &mut self,
+        dir: crate::layout::NavDir,
+        hide_borders: bool,
+    ) -> bool {
         let hits = self.composed_hits(hide_borders);
         let Some(current) = self.current_visual_target(&hits) else {
-            return;
+            return false;
         };
         if let Some(next) = visual::neighbor_in_dir(&hits, &current, dir) {
             self.apply_visual_target(next);
-            return;
+            return true;
         }
-        let cmd = match dir {
-            crate::layout::NavDir::Left => "select-pane -L",
-            crate::layout::NavDir::Right => "select-pane -R",
-            crate::layout::NavDir::Up => "select-pane -U",
-            crate::layout::NavDir::Down => "select-pane -D",
-        };
-        self.active_client().run_command(cmd);
-        self.invalidate_visual_pane();
+        // No neighbour means a focus boundary. Do not ask the server to wrap
+        // focus while the client is entering the navigation sidebar.
+        false
     }
 
     fn resize_visual(&self, dir: crate::layout::NavDir) {
@@ -315,9 +687,9 @@ impl TabManager {
 
     fn composed_hits(&self, hide_borders: bool) -> Vec<visual::VisualHit> {
         let (cols, rows) = terminal::size().unwrap_or((80, 24));
-        let area = server_layout_area(cols, rows);
-        let tab = &self.tabs[self.active];
-        let Some(fd) = tab.client.latest_frame() else {
+        let area = server_layout_area(cols, rows, self.sidebar_visible);
+        let workspace = &self.workspaces[self.active];
+        let Some(fd) = workspace.client.latest_frame() else {
             return Vec::new();
         };
         visual::collect_visual_hits(&fd.layout, area, hide_borders)
@@ -327,7 +699,7 @@ impl TabManager {
         &self,
         hits: &[visual::VisualHit],
     ) -> Option<visual::VisualTarget> {
-        let stored = match self.tabs[self.active].visual_focus {
+        let stored = match self.workspaces[self.active].visual_focus {
             VisualFocus::Local {
                 pane_id: Some(pane_id),
             } => Some(visual::VisualTarget::Local { pane_id }),
@@ -337,17 +709,60 @@ impl TabManager {
     }
 
     fn invalidate_visual_pane(&mut self) {
-        self.tabs[self.active].visual_focus =
+        self.workspaces[self.active].visual_focus =
             VisualFocus::Local { pane_id: None };
     }
 
+    fn sync_navigation_to_active(
+        &self,
+        state: &mut navigation::NavigationState,
+        entries: &[navigation::NavigationEntry],
+    ) {
+        use navigation::NavigationNodeId;
+
+        let Some(workspace) = self.workspaces.get(self.active) else {
+            state.sync_to_active(entries);
+            return;
+        };
+        let pane_id = match workspace.visual_focus {
+            VisualFocus::Local {
+                pane_id: Some(pane_id),
+            } => Some(pane_id),
+            VisualFocus::Local { pane_id: None } => workspace
+                .client
+                .latest_frame()
+                .and_then(|frame| active_pane_id(&frame.layout)),
+        };
+        let selected = pane_id.and_then(|pane_id| {
+            entries.iter().position(|entry| {
+                matches!(
+                    &entry.id,
+                    NavigationNodeId::Pane {
+                        machine,
+                        workspace: socket,
+                        pane_id: entry_pane_id,
+                        ..
+                    } if machine == &workspace.machine_id
+                        && socket == &workspace.socket_name
+                        && *entry_pane_id == pane_id
+                )
+            })
+        });
+        if let Some(index) = selected {
+            state.select_index(entries, index);
+        } else {
+            state.sync_to_active(entries);
+        }
+    }
+
     fn apply_visual_target(&mut self, target: visual::VisualTarget) {
-        let tab = &mut self.tabs[self.active];
+        let workspace = &mut self.workspaces[self.active];
         match target {
             visual::VisualTarget::Local { pane_id } => {
-                tab.client
+                workspace
+                    .client
                     .run_command(&format!("select-pane -t %{pane_id}"));
-                tab.visual_focus = VisualFocus::Local {
+                workspace.visual_focus = VisualFocus::Local {
                     pane_id: Some(pane_id),
                 };
             }
@@ -415,48 +830,22 @@ impl TabManager {
 
     fn kill_visual_pane(&mut self) {
         self.active_client().run_command("kill-pane");
-    }
-
-    fn active_index(&self) -> usize {
-        self.active
-    }
-
-    fn active_code(&self) -> String {
-        self.tabs[self.active].code.clone()
-    }
-
-    fn active_title(&self) -> String {
-        self.tabs[self.active].title.clone()
+        self.invalidate_active_navigation_tree();
     }
 
     fn active_socket_name(&self) -> String {
-        self.tabs[self.active].socket_name.clone()
+        self.workspaces[self.active].socket_name.clone()
     }
 
-    fn active_title_for_confirm(&self) -> String {
-        if self.tabs[self.active].title.is_empty() {
-            self.tabs[self.active].socket_name.clone()
-        } else {
-            self.tabs[self.active].title.clone()
-        }
-    }
-
-    fn select(&mut self, index: usize) -> bool {
-        if index >= self.tabs.len() {
-            return false;
-        }
-        self.active = index;
-        if index < self.tab_bar_offset {
-            self.tab_bar_offset = index;
-        }
-        true
+    fn active_machine_id(&self) -> String {
+        self.workspaces[self.active].machine_id.clone()
     }
 
     fn select_socket(&mut self, socket_name: &str) -> bool {
         if let Some(index) = self
-            .tabs
+            .workspaces
             .iter()
-            .position(|tab| tab.socket_name == socket_name)
+            .position(|workspace| workspace.socket_name == socket_name)
         {
             self.active = index;
             true
@@ -465,313 +854,44 @@ impl TabManager {
         }
     }
 
-    fn set_active_title(&mut self, title: String) {
-        self.tabs[self.active].title = title;
-        self.persist_active_metadata();
-    }
-
-    fn persist_active_metadata(&self) {
-        self.persist_tab_metadata(&self.tabs[self.active]);
-    }
-
-    fn persist_all_metadata(&self) {
-        for tab in &self.tabs {
-            self.persist_tab_metadata(tab);
-        }
-    }
-
-    fn persist_tab_metadata(&self, tab: &ClientTab) {
-        if let Err(e) =
-            store_tab_metadata(&tab.socket_name, &tab.code, &tab.title)
-        {
-            log_client(&format!(
-                "failed to store tab metadata for '{}': {}",
-                tab.socket_name, e
-            ));
-        }
-    }
-
-    fn capture_session_title_if_empty(&mut self, index: usize) {
-        let Some(tab) = self.tabs.get_mut(index) else {
-            return;
-        };
-        if !tab.title.trim().is_empty() {
-            return;
-        }
-        if let Some(title) =
-            meaningful_session_title(&tab.client.session_name())
-        {
-            tab.title = title;
-        }
-    }
-
-    fn set_active_metadata(
-        &mut self,
-        code: &str,
-        title: String,
-    ) -> Result<(), String> {
-        let code = normalize_tab_code(code)?;
-        if self
-            .tabs
-            .iter()
-            .enumerate()
-            .any(|(index, tab)| index != self.active && tab.code == code)
-        {
-            return Err(format!("tab code {} already exists", code));
-        }
-        self.tabs[self.active].code = code;
-        self.tabs[self.active].title = title;
-        self.persist_active_metadata();
-        Ok(())
-    }
-
-    fn create_tab(&mut self, size: Size) -> io::Result<()> {
-        let id = self.next_id;
-        self.next_id += 1;
-        let socket_name =
-            format!("{}.tab.{}.{}", self.base_socket, std::process::id(), id);
-        let (client, _) = ensure_server_and_connect(
-            &socket_name,
-            "0",
-            size,
-            true,
-            self.start_dir.as_deref(),
-        )?;
-        let code = next_available_tab_code(&self.tabs, id);
-        self.tabs.push(ClientTab {
-            code,
-            title: String::new(),
-            socket_name,
-            client: Box::new(client),
-            visual_focus: VisualFocus::Local { pane_id: None },
-        });
-        self.active = self.tabs.len() - 1;
-        self.persist_active_metadata();
-        Ok(())
-    }
-
-    fn next_tab(&mut self) -> bool {
-        if self.tabs.len() <= 1 {
-            return false;
-        }
-        self.active = (self.active + 1) % self.tabs.len();
-        true
-    }
-
-    fn prev_tab(&mut self) -> bool {
-        if self.tabs.len() <= 1 {
-            return false;
-        }
-        self.active = (self.active + self.tabs.len() - 1) % self.tabs.len();
-        true
-    }
-
-    fn ensure_active_visible(&mut self, width: u16) -> bool {
-        if self.tabs.is_empty() {
-            return false;
-        }
-        let views = self.tab_views();
-        let visible = tab_bar_visible_range(&views, width, self.tab_bar_offset);
-        if self.active >= visible.start && self.active < visible.end {
-            return false;
-        }
-        for offset in 0..=self.active.min(self.tabs.len().saturating_sub(1)) {
-            let range = tab_bar_visible_range(&views, width, offset);
-            if self.active >= range.start && self.active < range.end {
-                if offset != self.tab_bar_offset {
-                    self.tab_bar_offset = offset;
-                    return true;
-                }
-                return false;
-            }
-        }
-        false
-    }
-
-    fn scroll_tab_bar_back(&mut self) -> bool {
-        if self.tab_bar_offset == 0 {
-            return false;
-        }
-        self.tab_bar_offset -= 1;
-        true
-    }
-
     fn close_active(&mut self) -> bool {
-        self.capture_session_title_if_empty(self.active);
-        self.set_active_visibility(false);
-        self.tabs[self.active].client.detach();
+        self.workspaces[self.active].client.detach();
         self.remove_active()
     }
 
     fn close_dead_active(&mut self) -> bool {
-        self.capture_session_title_if_empty(self.active);
-        self.set_active_visibility(false);
         self.remove_active()
     }
 
-    fn set_active_visibility(&self, visible: bool) {
-        let tab = &self.tabs[self.active];
-        if let Err(e) =
-            set_tab_visibility(&tab.socket_name, &tab.code, &tab.title, visible)
-        {
-            log_client(&format!(
-                "failed to store tab visibility for '{}': {}",
-                tab.socket_name, e
-            ));
-        }
-    }
-
     fn remove_active(&mut self) -> bool {
-        self.tabs.remove(self.active);
-        if self.tabs.is_empty() {
+        self.workspaces.remove(self.active);
+        if self.workspaces.is_empty() {
             return true;
         }
-        if self.active >= self.tabs.len() {
-            self.active = self.tabs.len() - 1;
+        if self.active >= self.workspaces.len() {
+            self.active = self.workspaces.len() - 1;
         }
         false
     }
 
-    fn show_socket(&mut self, socket_name: &str, size: Size) -> io::Result<()> {
-        self.show_socket_with_code(socket_name, size, None)
-    }
-
-    fn show_socket_with_code(
-        &mut self,
-        socket_name: &str,
-        size: Size,
-        preferred_code: Option<&str>,
-    ) -> io::Result<()> {
-        if let Some(index) = self
-            .tabs
-            .iter()
-            .position(|tab| tab.socket_name == socket_name)
-        {
-            let tab = &self.tabs[index];
-            set_tab_visibility(socket_name, &tab.code, &tab.title, true)?;
-            self.active = index;
-            return Ok(());
-        }
-        let metadata = load_tab_metadata();
-        let stored = metadata.get(socket_name);
-        let preferred_code = preferred_code
-            .and_then(|code| normalize_tab_code(code).ok())
-            .filter(|code| !self.tabs.iter().any(|tab| tab.code == *code));
-        let code = stored
-            .and_then(|meta| meta.code.as_deref())
-            .and_then(|code| normalize_tab_code(code).ok())
-            .filter(|code| !self.tabs.iter().any(|tab| tab.code == *code))
-            .or(preferred_code)
-            .unwrap_or_else(|| {
-                next_available_tab_code(&self.tabs, self.tabs.len())
-            });
-        let mut title = title_from_stored(stored);
-        let client = SocketClient::connect(socket_name, size)?;
-        if title.is_empty() {
-            if let Some(session) =
-                meaningful_session_title(&client.session_name())
-            {
-                title = session;
-            }
-        }
-        set_tab_visibility(socket_name, &code, &title, true)?;
-        self.tabs.push(ClientTab {
-            code,
-            title,
-            socket_name: socket_name.to_string(),
-            client: Box::new(client),
-            visual_focus: VisualFocus::Local { pane_id: None },
-        });
-        self.active = self.tabs.len() - 1;
-        Ok(())
-    }
-
-    fn hide_socket(&mut self, socket_name: &str) -> Result<(), String> {
-        if self.tabs.len() <= 1 {
-            return Err("cannot hide the last visible tab".to_string());
-        }
-        let Some(index) = self
-            .tabs
-            .iter()
-            .position(|tab| tab.socket_name == socket_name)
-        else {
-            return Ok(());
-        };
-        self.capture_session_title_if_empty(index);
-        if let Err(e) = set_tab_visibility(
-            socket_name,
-            &self.tabs[index].code,
-            &self.tabs[index].title,
-            false,
-        ) {
-            log_client(&format!(
-                "failed to store tab visibility for '{}': {}",
-                socket_name, e
-            ));
-        }
-        self.tabs[index].client.detach();
-        self.tabs.remove(index);
-        if self.active >= self.tabs.len() {
-            self.active = self.tabs.len() - 1;
-        } else if index < self.active {
-            self.active -= 1;
-        }
-        if self.tab_bar_offset >= self.tabs.len() {
-            self.tab_bar_offset = self.tabs.len().saturating_sub(1);
-        }
-        Ok(())
-    }
-
-    fn kill_socket(&mut self, socket_name: &str) -> io::Result<bool> {
-        match SocketClient::kill_server_socket(socket_name) {
-            Ok(()) => {}
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
-                ) => {}
-            Err(e) => return Err(e),
-        }
-        self.killed_sockets.insert(socket_name.to_string());
-        if let Err(e) = remove_tab_metadata(socket_name) {
-            log_client(&format!(
-                "failed to remove tab metadata for '{}': {}",
-                socket_name, e
-            ));
-        }
-        cleanup_killed_socket(socket_name);
-        if let Some(index) = self
-            .tabs
-            .iter()
-            .position(|tab| tab.socket_name == socket_name)
-        {
-            self.tabs[index].client.shutdown();
-            self.tabs.remove(index);
-            if self.tabs.is_empty() {
-                return Ok(true);
-            }
-            if self.active >= self.tabs.len() {
-                self.active = self.tabs.len() - 1;
-            } else if index < self.active {
-                self.active -= 1;
-            }
-        }
-        Ok(self.tabs.is_empty())
-    }
-
-    fn remove_dead_inactive(&mut self) -> usize {
+    fn remove_dead_inactive(&mut self) -> (usize, Vec<String>) {
         let mut removed = 0;
+        let mut removed_machines = Vec::new();
         let mut index = 0;
-        while index < self.tabs.len() {
+        while index < self.workspaces.len() {
             let dead = index != self.active
-                && self.tabs[index]
+                && self.workspaces[index]
                     .client
                     .latest_frame()
                     .as_ref()
                     .is_some_and(|frame| frame.exit);
             if dead {
-                self.tabs[index].client.shutdown();
-                self.tabs.remove(index);
+                if self.workspaces[index].machine_id != "local" {
+                    removed_machines
+                        .push(self.workspaces[index].machine_id.clone());
+                }
+                self.workspaces[index].client.shutdown();
+                self.workspaces.remove(index);
                 removed += 1;
                 if index < self.active {
                     self.active -= 1;
@@ -780,500 +900,228 @@ impl TabManager {
                 index += 1;
             }
         }
-        removed
+        (removed, removed_machines)
     }
 
     fn detach_all(&self) {
-        self.persist_all_metadata();
-        for tab in &self.tabs {
-            tab.client.detach();
+        for workspace in &self.workspaces {
+            workspace.client.detach();
         }
     }
 
     fn resize_all(&self, size: Size) {
-        for tab in &self.tabs {
-            tab.client.resize(size);
+        for workspace in &self.workspaces {
+            workspace.client.resize(size);
         }
     }
 
-    fn tab_views(&self) -> Vec<ClientTabView> {
-        self.tabs
+    fn invalidate_active_navigation_tree(&mut self) {
+        if let Some(workspace) = self.workspaces.get_mut(self.active) {
+            workspace.navigation_tree_at = None;
+            workspace.navigation_refresh_until =
+                Some(Instant::now() + Duration::from_millis(500));
+            workspace.client.refresh_session_tree();
+        }
+    }
+
+    fn navigation_entries(
+        &mut self,
+        machine_name: &str,
+        remotes: &RemoteRegistry,
+        state: &navigation::NavigationState,
+    ) -> Vec<navigation::NavigationEntry> {
+        let now = Instant::now();
+        for workspace in &mut self.workspaces {
+            let fast_refresh = workspace
+                .navigation_refresh_until
+                .is_some_and(|until| now < until);
+            let refresh_interval = Duration::from_millis(75);
+            if workspace.navigation_tree_at.is_none_or(|at| {
+                now.saturating_duration_since(at) >= refresh_interval
+            }) {
+                workspace.navigation_tree = workspace.client.session_tree();
+                workspace.navigation_tree_at = Some(now);
+                if fast_refresh {
+                    workspace.client.refresh_session_tree();
+                }
+            }
+            if workspace
+                .navigation_refresh_until
+                .is_some_and(|until| now >= until)
+            {
+                workspace.navigation_refresh_until = None;
+            }
+        }
+        let local_views: Vec<navigation::WorkspaceNavigationView<'_>> = self
+            .workspaces
             .iter()
             .enumerate()
-            .map(|(index, tab)| self.tab_view_for(index, tab))
-            .collect()
-    }
-
-    fn tab_chooser_views(&self) -> Vec<ClientTabView> {
-        let mut views = self.tab_views();
-        let metadata = load_tab_metadata();
-        let socket_names = discover_all_socket_names(&self.base_socket)
-            .unwrap_or_else(|e| {
-                log_client(&format!("failed to discover sockets: {}", e));
-                Vec::new()
-            });
-        for socket_name in socket_names {
-            if self.killed_sockets.contains(&socket_name) {
-                continue;
-            }
-            if views.iter().any(|tab| tab.socket_name == socket_name) {
-                continue;
-            }
-            let stored = metadata.get(&socket_name);
-            let code =
-                stored.and_then(|meta| meta.code.clone()).unwrap_or_else(
-                    || next_available_view_code(&views, views.len()),
-                );
-            let title = title_from_stored(stored);
-            views.push(ClientTabView {
-                code,
-                title,
-                state: ClientTabState::Inactive,
-                socket_name,
-                visible: false,
-            });
-        }
-        views
-    }
-
-    fn tab_view_for(&self, index: usize, tab: &ClientTab) -> ClientTabView {
-        let dead = tab
-            .client
-            .latest_frame()
-            .as_ref()
-            .is_some_and(|frame| frame.exit);
-        let state = if dead {
-            ClientTabState::Dead
-        } else if index == self.active {
-            ClientTabState::Active
-        } else {
-            ClientTabState::Inactive
-        };
-        ClientTabView {
-            code: tab.code.clone(),
-            title: tab.title.clone(),
+            .filter(|(_, workspace)| workspace.machine_id == "local")
+            .map(|(index, workspace)| navigation::WorkspaceNavigationView {
+                socket_name: &workspace.socket_name,
+                title: "",
+                active: index == self.active,
+                tree: &workspace.navigation_tree,
+            })
+            .collect();
+        let remote_views: Vec<navigation::RemoteMachineNavigationView<'_>> =
+            remotes
+                .machines
+                .iter()
+                .map(|machine| {
+                    let workspaces = self
+                        .workspaces
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, workspace)| {
+                            workspace.machine_id == machine.id
+                        })
+                        .map(|(index, workspace)| {
+                            navigation::WorkspaceNavigationView {
+                                socket_name: &workspace.socket_name,
+                                title: &self.base_socket,
+                                active: index == self.active,
+                                tree: &workspace.navigation_tree,
+                            }
+                        })
+                        .collect();
+                    let state = match machine.state {
+                        RemoteMachineState::Disconnected => {
+                            navigation::MachineConnectionState::Disconnected
+                        }
+                        RemoteMachineState::Probing => {
+                            navigation::MachineConnectionState::Probing
+                        }
+                        RemoteMachineState::Connected => {
+                            navigation::MachineConnectionState::Connected
+                        }
+                        RemoteMachineState::Unavailable => {
+                            navigation::MachineConnectionState::Unavailable
+                        }
+                    };
+                    navigation::RemoteMachineNavigationView {
+                        id: &machine.id,
+                        name: &machine.host,
+                        state,
+                        active: self.workspaces.get(self.active).is_some_and(
+                            |workspace| workspace.machine_id == machine.id,
+                        ),
+                        workspaces,
+                    }
+                })
+                .collect();
+        navigation::build_navigation_tree(
+            "local",
+            machine_name,
+            &local_views,
+            &remote_views,
             state,
-            socket_name: tab.socket_name.clone(),
-            visible: true,
-        }
-    }
-}
-
-/// A tab switch changes which server owns the physical terminal framebuffer.
-/// Inactive tabs only retain their latest incremental ANSI frame, so that
-/// cached frame cannot be replayed as a full-screen snapshot after an automatic
-/// switch (for example when the active tab is closed).
-fn request_active_tab_full_refresh(tabs: &TabManager) {
-    // REFRESH_FRAME carries a unique frame type, so SocketClient publishes it
-    // even when no PTY output arrived after the tab switch.
-    tabs.active_client().refresh_display();
-}
-
-fn tab_code(index: usize) -> String {
-    let index = index % (26 * 26);
-    let first = (b'A' + (index / 26) as u8) as char;
-    let second = (b'A' + (index % 26) as u8) as char;
-    format!("{}{}", first, second)
-}
-
-#[cfg(test)]
-fn attach_tab_title(base_socket: &str, socket_name: &str) -> String {
-    let tab_prefix = format!("{}.tab.", base_socket);
-    if socket_name == base_socket {
-        return socket_name.to_string();
-    }
-    if let Some(rest) = socket_name.strip_prefix(&tab_prefix) {
-        if let Some((_, id)) = rest.rsplit_once('.') {
-            return format!("{}:{}", base_socket, id);
-        }
-    }
-    socket_name.to_string()
-}
-
-fn title_from_stored(stored: Option<&StoredTabMetadata>) -> String {
-    stored
-        .and_then(|meta| meta.title.clone())
-        .unwrap_or_default()
-}
-
-fn meaningful_session_title(name: &str) -> Option<String> {
-    let name = name.trim();
-    if name.is_empty() || name == "0" {
-        None
-    } else {
-        Some(name.to_string())
-    }
-}
-
-type TabMetadataMap = std::collections::BTreeMap<String, StoredTabMetadata>;
-
-struct TabMetadataLock {
-    file: std::fs::File,
-}
-
-impl TabMetadataLock {
-    fn acquire(data_path: &std::path::Path) -> io::Result<Self> {
-        let lock_path = data_path.with_file_name(format!(
-            "{}.lock",
-            data_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("tab-metadata.json")
-        ));
-        if let Some(parent) = lock_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&lock_path)?;
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            match file.try_lock() {
-                Ok(()) => return Ok(Self { file }),
-                Err(std::fs::TryLockError::WouldBlock)
-                    if Instant::now() < deadline =>
-                {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-    }
-}
-
-impl Drop for TabMetadataLock {
-    fn drop(&mut self) {
-        let _ = self.file.unlock();
-    }
-}
-
-fn read_tab_metadata_file(path: &std::path::Path) -> Option<TabMetadataMap> {
-    let data = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&data).ok()
-}
-
-fn load_tab_metadata() -> TabMetadataMap {
-    if let Ok(path) = tab_metadata_path() {
-        let file_exists = path.exists();
-        let metadata = {
-            let _lock = TabMetadataLock::acquire(&path).ok();
-            read_tab_metadata_file(&path)
-        };
-        if let Some(metadata) = metadata {
-            return metadata;
-        }
-        if file_exists {
-            return TabMetadataMap::new();
-        }
-    }
-    if let Ok(path) = legacy_tab_metadata_path() {
-        if let Some(metadata) = read_tab_metadata_file(&path) {
-            if !metadata.is_empty() {
-                if let Err(e) = write_tab_metadata(&metadata) {
-                    log_client(&format!(
-                        "failed to migrate tab metadata: {}",
-                        e
-                    ));
-                }
-            }
-            return metadata;
-        }
-    }
-    TabMetadataMap::new()
-}
-
-fn store_tab_metadata(
-    socket_name: &str,
-    code: &str,
-    title: &str,
-) -> io::Result<()> {
-    let path = tab_metadata_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let _lock = TabMetadataLock::acquire(&path)?;
-    let mut metadata = read_tab_metadata_file(&path)
-        .or_else(|| {
-            legacy_tab_metadata_path()
-                .ok()
-                .and_then(|path| read_tab_metadata_file(&path))
-        })
-        .unwrap_or_default();
-    metadata.insert(
-        socket_name.to_string(),
-        StoredTabMetadata {
-            code: Some(code.to_string()),
-            title: Some(title.to_string()),
-            visible: metadata
-                .get(socket_name)
-                .and_then(|meta| meta.visible)
-                .or(Some(true)),
-        },
-    );
-    write_tab_metadata_atomic(&path, &metadata)
-}
-
-fn set_tab_visibility(
-    socket_name: &str,
-    code: &str,
-    title: &str,
-    visible: bool,
-) -> io::Result<()> {
-    let path = tab_metadata_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let _lock = TabMetadataLock::acquire(&path)?;
-    let mut metadata = read_tab_metadata_file(&path)
-        .or_else(|| {
-            legacy_tab_metadata_path()
-                .ok()
-                .and_then(|path| read_tab_metadata_file(&path))
-        })
-        .unwrap_or_default();
-    metadata.insert(
-        socket_name.to_string(),
-        StoredTabMetadata {
-            code: Some(code.to_string()),
-            title: Some(title.to_string()),
-            visible: Some(visible),
-        },
-    );
-    write_tab_metadata_atomic(&path, &metadata)
-}
-
-fn remove_tab_metadata(socket_name: &str) -> io::Result<()> {
-    let path = tab_metadata_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let _lock = TabMetadataLock::acquire(&path)?;
-    let mut metadata = read_tab_metadata_file(&path).unwrap_or_default();
-    metadata.remove(socket_name);
-    write_tab_metadata_atomic(&path, &metadata)
-}
-
-fn remove_tab_metadata_for_socket_family(socket_name: &str) {
-    if let Err(e) = remove_tab_metadata_for_socket_family_inner(socket_name) {
-        log_client(&format!(
-            "failed to remove stale tab metadata for '{}': {}",
-            socket_name, e
-        ));
-    }
-}
-
-fn remove_tab_metadata_for_socket_family_inner(
-    socket_name: &str,
-) -> io::Result<()> {
-    let path = tab_metadata_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let _lock = TabMetadataLock::acquire(&path)?;
-    let mut metadata = read_tab_metadata_file(&path).unwrap_or_default();
-    let tab_prefix = format!("{}.tab.", socket_name);
-    metadata.retain(|name, _| {
-        name != socket_name && !name.starts_with(&tab_prefix)
-    });
-    write_tab_metadata_atomic(&path, &metadata)
-}
-
-fn write_tab_metadata(metadata: &TabMetadataMap) -> io::Result<()> {
-    let path = tab_metadata_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let _lock = TabMetadataLock::acquire(&path)?;
-    write_tab_metadata_atomic(&path, metadata)
-}
-
-fn write_tab_metadata_atomic(
-    path: &std::path::Path,
-    metadata: &TabMetadataMap,
-) -> io::Result<()> {
-    let data = serde_json::to_string_pretty(metadata)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    let tmp_path = path.with_file_name(format!(
-        ".{}.{}.tmp",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("tab-metadata.json"),
-        std::process::id()
-    ));
-    std::fs::write(&tmp_path, data)?;
-    replace_metadata_file(&tmp_path, path)
-}
-
-#[cfg(not(windows))]
-fn replace_metadata_file(
-    tmp_path: &std::path::Path,
-    path: &std::path::Path,
-) -> io::Result<()> {
-    std::fs::rename(tmp_path, path)
-}
-
-#[cfg(windows)]
-fn replace_metadata_file(
-    tmp_path: &std::path::Path,
-    path: &std::path::Path,
-) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-
-    let from: Vec<u16> = tmp_path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let to: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let ok = unsafe {
-        MoveFileExW(
-            from.as_ptr(),
-            to.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
         )
-    };
-    if ok == 0 {
-        Err(io::Error::last_os_error())
-    } else {
+    }
+
+    fn connect_remote_machine(
+        &mut self,
+        machine_id: &str,
+        route: &[String],
+        size: Size,
+        activate: bool,
+    ) -> io::Result<()> {
+        if let Some(index) = self
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.machine_id == machine_id)
+        {
+            if activate {
+                self.active = index;
+            }
+            self.workspaces[index].client.resize(size);
+            return Ok(());
+        }
+        let socket_name = self.base_socket.clone();
+        let client = remote::connect_remote(route, &socket_name, size)?;
+        let previous_active = self.active;
+        self.workspaces.push(WorkspaceConnection {
+            socket_name: format!("ssh://{machine_id}/{socket_name}"),
+            machine_id: machine_id.to_string(),
+            client: Box::new(client),
+            visual_focus: VisualFocus::Local { pane_id: None },
+            navigation_tree: Vec::new(),
+            navigation_tree_at: None,
+            navigation_refresh_until: None,
+        });
+        self.active = if activate {
+            self.workspaces.len() - 1
+        } else {
+            previous_active
+        };
         Ok(())
     }
-}
 
-#[cfg(target_os = "macos")]
-fn tab_metadata_path() -> io::Result<std::path::PathBuf> {
-    let home = std::env::var_os("HOME").ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "HOME not set")
-    })?;
-    Ok(std::path::PathBuf::from(home)
-        .join("Library")
-        .join("Application Support")
-        .join("zmux")
-        .join("tab-metadata.json"))
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn tab_metadata_path() -> io::Result<std::path::PathBuf> {
-    if let Some(dir) = std::env::var_os("XDG_STATE_HOME") {
-        return Ok(std::path::PathBuf::from(dir)
-            .join("zmux")
-            .join("tab-metadata.json"));
-    }
-    let home = std::env::var_os("HOME").ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "HOME not set")
-    })?;
-    Ok(std::path::PathBuf::from(home)
-        .join(".local")
-        .join("state")
-        .join("zmux")
-        .join("tab-metadata.json"))
-}
-
-#[cfg(windows)]
-fn tab_metadata_path() -> io::Result<std::path::PathBuf> {
-    if let Some(dir) = std::env::var_os("LOCALAPPDATA") {
-        return Ok(std::path::PathBuf::from(dir)
-            .join("zmux")
-            .join("tab-metadata.json"));
-    }
-    if let Some(dir) = std::env::var_os("APPDATA") {
-        return Ok(std::path::PathBuf::from(dir)
-            .join("zmux")
-            .join("tab-metadata.json"));
-    }
-    legacy_tab_metadata_path()
-}
-
-#[cfg(unix)]
-fn legacy_tab_metadata_path() -> io::Result<std::path::PathBuf> {
-    crate::ipc::socket_path("tab-metadata.json")
-}
-
-#[cfg(windows)]
-fn legacy_tab_metadata_path() -> io::Result<std::path::PathBuf> {
-    Ok(std::env::temp_dir().join("zmux-tab-metadata.json"))
-}
-
-fn next_available_tab_code(tabs: &[ClientTab], start: usize) -> String {
-    for offset in 0..(26 * 26) {
-        let code = tab_code(start + offset);
-        if !tabs.iter().any(|tab| tab.code == code) {
-            return code;
+    fn activate_navigation_entry(
+        &mut self,
+        entry: &navigation::NavigationEntry,
+        size: Size,
+    ) -> bool {
+        use navigation::NavigationNodeId;
+        let (workspace, command) = match &entry.id {
+            NavigationNodeId::Machine(_) => return false,
+            NavigationNodeId::Workspace { workspace, .. } => (workspace.as_str(), None),
+            NavigationNodeId::Session {
+                workspace, name, ..
+            } => (
+                workspace.as_str(),
+                Some(format!("switch-client -t {}", shell_quote(name))),
+            ),
+            NavigationNodeId::Window {
+                workspace,
+                session,
+                index,
+                ..
+            } => (
+                workspace.as_str(),
+                Some(format!(
+                    "switch-client -t {}; select-window -t {}",
+                    shell_quote(session),
+                    index
+                )),
+            ),
+            NavigationNodeId::Pane {
+                workspace,
+                session,
+                window,
+                pane_id,
+                ..
+            } => (
+                workspace.as_str(),
+                Some(format!(
+                    "switch-client -t {}; select-window -t {}; select-pane -t %{}",
+                    shell_quote(session),
+                    window,
+                    pane_id
+                )),
+            ),
+        };
+        if !self.select_socket(workspace) {
+            return false;
         }
-    }
-    "ZZ".to_string()
-}
-
-fn next_available_view_code(tabs: &[ClientTabView], start: usize) -> String {
-    for offset in 0..(26 * 26) {
-        let code = tab_code(start + offset);
-        if !tabs.iter().any(|tab| tab.code == code) {
-            return code;
+        self.active_client().resize(size);
+        if let Some(command) = command {
+            self.active_client().run_command(&command);
         }
-    }
-    "ZZ".to_string()
-}
-
-fn normalize_tab_code(code: &str) -> Result<String, String> {
-    let code = code.trim().to_ascii_uppercase();
-    if code.len() != 2 || !code.bytes().all(|b| b.is_ascii_uppercase()) {
-        return Err("tab code must be two uppercase letters".to_string());
-    }
-    Ok(code)
-}
-
-fn default_tab_chooser_mode(tabs: &TabManager) -> InputMode {
-    InputMode::TabChooser {
-        query: String::new(),
-        cursor: 0,
-        selected: tabs.active_index(),
-        search_active: false,
+        self.invalidate_visual_pane();
+        self.invalidate_active_navigation_tree();
+        true
     }
 }
 
-fn tab_quick_switch_mode() -> InputMode {
-    InputMode::TabQuickSwitch {
-        code: String::new(),
-        error: None,
-    }
-}
-
-fn select_tab_by_code(
-    tabs: &mut TabManager,
-    code: &str,
-    size: Size,
-) -> Result<(), String> {
-    let code = normalize_tab_code(code)?;
-    if let Some(index) = tabs.tabs.iter().position(|tab| tab.code == code) {
-        tabs.select(index);
-        tabs.active_client().resize(size);
-        return Ok(());
-    }
-
-    let Some(tab) = tabs.tab_chooser_views().into_iter().find(|tab| {
-        !tab.visible
-            && normalize_tab_code(&tab.code)
-                .is_ok_and(|tab_code| tab_code == code)
-    }) else {
-        return Err(format!("tab not found: {}", code));
-    };
-
-    tabs.show_socket_with_code(&tab.socket_name, size, Some(&code))
-        .map_err(|e| format!("show tab failed: {}", e))?;
-    if !tabs.select_socket(&tab.socket_name) {
-        return Err(format!("tab not found: {}", code));
-    }
-    tabs.active_client().resize(size);
-    Ok(())
+/// A workspace switch changes which server owns the physical terminal framebuffer.
+/// Inactive workspaces only retain their latest incremental ANSI frame, so that
+/// cached frame cannot be replayed as a full-screen snapshot after an automatic
+/// switch (for example when the active workspace is closed).
+fn request_active_workspace_full_refresh(workspaces: &WorkspaceManager) {
+    // REFRESH_FRAME carries a unique frame type, so SocketClient publishes it
+    // even when no PTY output arrived after the workspace switch.
+    workspaces.active_client().refresh_display();
 }
 
 fn floating_overlay_rect(
@@ -1284,97 +1132,40 @@ fn floating_overlay_rect(
         return None;
     }
     match mode {
-        InputMode::TabChooser { .. } | InputMode::SessionChooser { .. } => {
-            Some(chooser_overlay_panel(area))
-        }
-        InputMode::RenameTab { .. } => Some(rename_tab_panel_rect(area)),
         InputMode::OptionPanel { .. } => Some(options_panel_rect(area)),
-        InputMode::TabQuickSwitch { .. } => {
-            Some(tab_quick_switch_panel_rect(area))
-        }
+        InputMode::NavigationHelp { .. } => Some(navigation_help_rect(area)),
+        InputMode::ShortcutsHelp { .. } => Some(shortcuts_help_rect(area)),
         _ => None,
     }
 }
 
-fn rename_tab_mode_for_active(
-    tabs: &TabManager,
-    return_to_tab_chooser: bool,
-) -> InputMode {
-    let code = tabs.active_code();
-    let title = tabs.active_title();
-    InputMode::RenameTab {
-        code_cursor: code.chars().count(),
-        title_cursor: title.chars().count(),
-        code,
-        title,
-        editing_code: true,
-        error: None,
-        return_to_tab_chooser,
-    }
-}
-
-fn tab_label(tab: &ClientTabView) -> String {
-    if tab.title.is_empty() {
-        tab.socket_name.clone()
-    } else {
-        tab.title.clone()
-    }
-}
-
-fn matching_tab_indices(tabs: &[ClientTabView], query: &str) -> Vec<usize> {
-    let query = query.trim().to_lowercase();
-    tabs.iter()
-        .enumerate()
-        .filter_map(|(index, tab)| {
-            if query.is_empty()
-                || tab.code.to_lowercase().contains(&query)
-                || tab.title.to_lowercase().contains(&query)
-                || tab.socket_name.to_lowercase().contains(&query)
-            {
-                Some(index)
-            } else {
-                None
+// Keep the tree visible while a node operation or navigation help is open.
+fn retains_navigation_popup(mode: &InputMode) -> bool {
+    matches!(
+        mode,
+        InputMode::Navigator
+            | InputMode::Prefix
+            | InputMode::NavigationHelp { .. }
+            | InputMode::RenameIdentity { .. }
+            | InputMode::ConfirmNavigationClose { .. }
+            | InputMode::RenameWindow {
+                return_to_navigator: true,
+                ..
             }
-        })
-        .collect()
+            | InputMode::RenameSession {
+                return_to_navigator: true,
+                ..
+            }
+            | InputMode::RenamePane {
+                return_to_navigator: true,
+                ..
+            }
+    )
 }
 
-fn tab_target_index(tabs: &TabManager, target: &str) -> Option<usize> {
-    let target = target.trim();
-    if target.is_empty() {
-        return None;
-    }
-    if let Ok(index) = target.parse::<usize>() {
-        if index < tabs.tabs.len() {
-            return Some(index);
-        }
-    }
-    let target_lower = target.to_lowercase();
-    tabs.tabs.iter().position(|tab| {
-        tab.code.to_lowercase() == target_lower
-            || tab.title.to_lowercase() == target_lower
-    })
-}
-
-fn tab_summary(tabs: &TabManager) -> String {
-    tabs.tabs
-        .iter()
-        .enumerate()
-        .map(|(index, tab)| {
-            let active = if index == tabs.active { "*" } else { "-" };
-            let title = if tab.title.is_empty() {
-                "(untitled)".to_string()
-            } else {
-                tab.title.clone()
-            };
-            format!("{}{} {}", tab.code, active, title)
-        })
-        .collect::<Vec<_>>()
-        .join(" | ")
-}
-
-enum ClientTabCommandResult {
+enum ClientCommandResult {
     Handled(Option<String>),
+    ShowHelp,
     NotHandled,
 }
 
@@ -1385,28 +1176,11 @@ impl ClientApp {
         clean: bool,
         start_dir: Option<String>,
     ) -> Self {
-        Self::new_with_initial_tab_title(
-            socket_name,
-            session_name,
-            clean,
-            start_dir,
-            None,
-        )
-    }
-
-    pub fn new_with_initial_tab_title(
-        socket_name: &str,
-        session_name: Option<String>,
-        clean: bool,
-        start_dir: Option<String>,
-        initial_tab_title: Option<String>,
-    ) -> Self {
         Self {
             socket_name: socket_name.to_string(),
             session_name,
             clean,
             start_dir,
-            initial_tab_title,
             attach_all: false,
         }
     }
@@ -1422,33 +1196,32 @@ impl ClientApp {
             session_name,
             clean,
             start_dir,
-            initial_tab_title: None,
             attach_all: true,
         }
     }
 
     pub fn run(&self) -> io::Result<()> {
         install_client_panic_hook();
+        let sidebar_visible = false;
         let (cols, rows) = terminal::size().unwrap_or((80, 24));
-        let size = server_content_size(cols, rows);
+        let size = server_content_size(cols, rows, sidebar_visible);
         let session_name =
             self.session_name.clone().unwrap_or_else(|| "0".to_string());
 
         #[cfg(unix)]
         crate::pty::remember_host_termios();
 
-        let mut tabs = if self.attach_all {
+        let mut workspaces = if self.attach_all {
             let socket_names = discover_all_socket_names(&self.socket_name)?;
-            match TabManager::from_existing_sockets(
+            match WorkspaceManager::from_existing_sockets(
                 &self.socket_name,
                 socket_names,
                 self.session_name.as_deref(),
                 size,
-                self.start_dir.clone(),
             ) {
-                Ok(tabs) => tabs,
+                Ok(workspaces) => workspaces,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    TabManager::new(
+                    WorkspaceManager::new(
                         &self.socket_name,
                         &session_name,
                         size,
@@ -1459,7 +1232,7 @@ impl ClientApp {
                 Err(e) => return Err(e),
             }
         } else {
-            TabManager::new(
+            WorkspaceManager::new(
                 &self.socket_name,
                 &session_name,
                 size,
@@ -1467,9 +1240,10 @@ impl ClientApp {
                 self.start_dir.clone(),
             )?
         };
-        if let Some(title) = &self.initial_tab_title {
-            tabs.set_active_title(title.clone());
-        }
+        let mut remotes = RemoteRegistry::new();
+        let machine_config = crate::config::machines::config_path()?;
+        let mut machine_names =
+            crate::config::machines::MachineNames::load(&machine_config)?;
 
         terminal::enable_raw_mode()?;
         let mut stdout = io::stdout();
@@ -1500,8 +1274,13 @@ impl ClientApp {
 
         let prefix_key = (KeyCode::Char('a'), KeyModifiers::CONTROL);
         let mut mode = InputMode::Normal;
+        let mut navigation_popup = false;
+        let mut navigation_popup_return_mode = InputMode::Normal;
+        let machine_name = local_machine_name();
+        let mut navigation_state = navigation::NavigationState::default();
         let mut copy_mode_confirmed = false;
         let mut prefix_from_copy_mode = false;
+        let mut prefix_from_navigator = false;
         let mut copy_mode_sync_suppress_frame: Option<u64> = None;
         let mut copy_mode_exit_pending = false;
         let mut display_scrolled = false;
@@ -1515,10 +1294,106 @@ impl ClientApp {
         let mut last_drawn_counter: u64 = 0;
         let mut last_ansi_frame: Option<(String, u64)> = None;
         let mut last_overlay_rect: Option<ratatui::layout::Rect> = None;
+        let mut last_navigation_entries = Vec::new();
+        let mut last_drawn_mode: Option<InputMode> = None;
+        let mut last_drawn_sidebar = false;
+        let mut global_prefix_pending = false;
+        let mut global_prefix_origin = InputMode::Normal;
         let run_result: io::Result<()> = (|| {
             loop {
-                let (frame, current_counter) = tabs.display_snapshot();
-                let active_socket_name = tabs.active_socket_name();
+                navigation_popup &= retains_navigation_popup(&mode);
+                let sidebar_visible = workspaces.sidebar_visible;
+                for machine_id in remotes.due_retries(Instant::now()) {
+                    remotes.start_probe(&machine_id, false);
+                }
+                while let Ok((alias, probe_result)) =
+                    remotes.result_rx.try_recv()
+                {
+                    // A confirmed machine removal must not be undone by an
+                    // already-running SSH probe completing afterwards.
+                    if !remotes
+                        .machines
+                        .iter()
+                        .any(|machine| machine.id == alias)
+                    {
+                        continue;
+                    }
+                    let machine_label = remotes.display_name(&alias);
+                    match probe_result {
+                        Ok(_) => {
+                            let route = remotes
+                                .machines
+                                .iter()
+                                .find(|machine| machine.id == alias)
+                                .map(|machine| machine.route.clone())
+                                .unwrap_or_default();
+                            let activate = remotes
+                                .machines
+                                .iter()
+                                .find(|machine| machine.id == alias)
+                                .is_some_and(|machine| {
+                                    machine.activate_after_probe
+                                });
+                            let (cols, rows) =
+                                terminal::size().unwrap_or((80, 24));
+                            match workspaces.connect_remote_machine(
+                                &alias,
+                                &route,
+                                server_content_size(
+                                    cols,
+                                    rows,
+                                    sidebar_visible,
+                                ),
+                                activate,
+                            ) {
+                                Ok(()) => {
+                                    if let Some(machine) = remotes
+                                        .machines
+                                        .iter_mut()
+                                        .find(|machine| machine.id == alias)
+                                    {
+                                        machine.state =
+                                            RemoteMachineState::Connected;
+                                        machine.error = None;
+                                        machine.retry_attempt = 0;
+                                        machine.retry_at = None;
+                                        machine.activate_after_probe = false;
+                                    }
+                                    status_notice = Some((
+                                        format!("connected to {machine_label}"),
+                                        Instant::now() + Duration::from_secs(3),
+                                    ));
+                                    request_active_workspace_full_refresh(
+                                        &workspaces,
+                                    );
+                                }
+                                Err(error) => {
+                                    remotes.mark_failure(
+                                        &alias,
+                                        remote::RemoteFailure::from_io(&error),
+                                    );
+                                    status_notice = Some((
+                                        format!(
+                                            "{machine_label}: attach failed: {error}"
+                                        ),
+                                        Instant::now() + Duration::from_secs(5),
+                                    ));
+                                }
+                            }
+                            last_drawn_counter = 0;
+                        }
+                        Err(error) => {
+                            remotes.mark_failure(&alias, error.clone());
+                            status_notice = Some((
+                                format!("{machine_label}: {}", error.message),
+                                Instant::now() + Duration::from_secs(5),
+                            ));
+                            last_drawn_counter = 0;
+                        }
+                    }
+                }
+                let (frame, current_counter) = workspaces.display_snapshot();
+                let active_socket_name = workspaces.active_socket_name();
                 if matches!(
                     copy_mode_sync_suppress_frame,
                     Some(counter) if counter != current_counter
@@ -1527,39 +1402,50 @@ impl ClientApp {
                 }
                 if let Some(ref fd) = frame {
                     if fd.exit {
-                        log_client("received exit frame for active tab");
-                        if tabs.close_dead_active() {
+                        log_client("received exit frame for active workspace");
+                        let disconnected_machine =
+                            workspaces.active_machine_id();
+                        if workspaces.close_dead_active() {
                             break;
+                        }
+                        if disconnected_machine != "local" {
+                            remotes.mark_disconnected(
+                                &disconnected_machine,
+                                "SSH connection closed".to_string(),
+                            );
                         }
                         mode = InputMode::Normal;
                         copy_mode_confirmed = false;
                         mouse_select = None;
-                        request_active_tab_full_refresh(&tabs);
+                        request_active_workspace_full_refresh(&workspaces);
                         last_drawn_counter = 0;
                         status_notice = Some((
-                            "tab closed".to_string(),
+                            "workspace closed".to_string(),
                             Instant::now() + Duration::from_secs(3),
                         ));
                         continue;
                     }
-                    let removed_dead_tabs = tabs.remove_dead_inactive();
-                    if removed_dead_tabs > 0 {
+                    let (removed_dead_workspaces, disconnected_machines) =
+                        workspaces.remove_dead_inactive();
+                    for machine_id in disconnected_machines {
+                        remotes.mark_disconnected(
+                            &machine_id,
+                            "remote connection closed".to_string(),
+                        );
+                    }
+                    if removed_dead_workspaces > 0 {
                         last_drawn_counter = 0;
                         status_notice = Some((
-                            if removed_dead_tabs == 1 {
-                                "closed 1 dead tab".to_string()
+                            if removed_dead_workspaces == 1 {
+                                "closed 1 dead workspace".to_string()
                             } else {
                                 format!(
-                                    "closed {} dead tabs",
-                                    removed_dead_tabs
+                                    "closed {} dead workspaces",
+                                    removed_dead_workspaces
                                 )
                             },
                             Instant::now() + Duration::from_secs(3),
                         ));
-                    }
-                    let (cols, _) = terminal::size().unwrap_or((80, 24));
-                    if tabs.ensure_active_visible(cols) {
-                        last_drawn_counter = 0;
                     }
                     if !active_in_copy_mode(fd) {
                         copy_mode_exit_pending = false;
@@ -1621,25 +1507,58 @@ impl ClientApp {
                     InputMode::CopySearch { .. }
                         | InputMode::RenameWindow { .. }
                         | InputMode::RenameSession { .. }
+                        | InputMode::RenamePane { .. }
+                        | InputMode::RenameIdentity { .. }
                         | InputMode::Command { .. }
-                        | InputMode::ConfirmKillTab { .. }
+                        | InputMode::ConfirmNavigationClose { .. }
                 );
-                let has_overlay = matches!(
-                    mode,
-                    InputMode::SessionChooser { .. }
-                        | InputMode::OptionPanel { .. }
-                        | InputMode::TabChooser { .. }
-                        | InputMode::RenameTab { .. }
-                        | InputMode::TabQuickSwitch { .. }
-                );
+                let has_overlay = navigation_popup
+                    || matches!(
+                        mode,
+                        InputMode::OptionPanel { .. }
+                            | InputMode::NavigationHelp { .. }
+                            | InputMode::ShortcutsHelp { .. }
+                    );
                 let hide_status = has_prompt;
 
                 let (cols, rows) = terminal::size().unwrap_or((80, 24));
+                let mut navigation_entries = workspaces.navigation_entries(
+                    &machine_name,
+                    &remotes,
+                    &navigation_state,
+                );
+                for entry in &mut navigation_entries {
+                    let name = match &entry.id {
+                        navigation::NavigationNodeId::Machine(id) => {
+                            machine_names.names.get(id).map(String::as_str)
+                        }
+                        navigation::NavigationNodeId::Workspace {
+                            machine,
+                            workspace,
+                        } => machine_names.workspace_name(machine, workspace),
+                        _ => None,
+                    };
+                    if let Some(name) = name {
+                        entry.label = name.to_string();
+                    }
+                }
+                if navigation_entries != last_navigation_entries {
+                    last_drawn_counter = 0;
+                }
+                navigation_state.clamp_selection(&navigation_entries);
+                let areas = workspace_areas(cols, rows, sidebar_visible);
                 let mut drew_terminal_output = false;
                 let terminal_area =
                     ratatui::layout::Rect::new(0, 0, cols, rows);
-                let current_overlay_rect =
+                let mut current_overlay_rect =
                     floating_overlay_rect(&mode, terminal_area);
+                if navigation_popup {
+                    let popup = navigation_popup_rect(terminal_area);
+                    current_overlay_rect = Some(
+                        current_overlay_rect
+                            .map_or(popup, |rect| rect.union(popup)),
+                    );
+                }
                 let stale_overlay_rect =
                     if last_overlay_rect != current_overlay_rect {
                         last_overlay_rect
@@ -1651,12 +1570,22 @@ impl ClientApp {
                     // server for a complete pane repaint before drawing again;
                     // replaying the latest incremental frame would leave the
                     // covered portion of an inactive pane blank.
-                    tabs.active_client().refresh_display();
+                    workspaces.active_client().refresh_display();
                     last_drawn_counter = current_counter;
                     last_overlay_rect = current_overlay_rect;
                 }
 
-                let redraw_needed = current_counter != last_drawn_counter;
+                // A visibility change moves the server-owned ANSI viewport.
+                // Keep the old complete screen until a correctly sized frame
+                // arrives, then paint terminal and chrome in one sync update.
+                let viewport_ready = last_drawn_sidebar == sidebar_visible
+                    || frame.as_ref().is_some_and(|fd| {
+                        layout_fits_area(&fd.layout, areas.layout, hide_borders)
+                    });
+                let redraw_needed = viewport_ready
+                    && (current_counter != last_drawn_counter
+                        || last_drawn_mode.as_ref() != Some(&mode)
+                        || last_drawn_sidebar != sidebar_visible);
                 let server_frame_new = last_ansi_frame.as_ref().is_none_or(
                     |(socket_name, counter)| {
                         socket_name != &active_socket_name
@@ -1665,32 +1594,25 @@ impl ClientApp {
                 );
                 if redraw_needed {
                     drew_terminal_output = true;
-                    let mut server_ansi_update_open = false;
+                    // Enclose chrome-only draws too: prompt/sidebar updates
+                    // must not expose their intermediate blanking writes.
+                    begin_server_ansi_update(terminal.backend_mut())?;
+                    let server_ansi_update_open = true;
                     if server_frame_new {
                         if let Some(ref fd) = frame {
                             if should_write_server_ansi(has_overlay, has_prompt)
                             {
                                 if let Some(ref ansi) = fd.ansi {
                                     if !ansi.trim().is_empty() {
-                                        match begin_server_ansi_update(
-                                            terminal.backend_mut(),
-                                        ) {
-                                            Ok(()) => {
-                                                server_ansi_update_open = true;
-                                                if let Err(err) =
-                                                    write_server_ansi_payload(
-                                                        terminal.backend_mut(),
-                                                        ansi,
-                                                    )
-                                                {
-                                                    log_client(&format!(
+                                        if let Err(err) =
+                                            write_server_ansi_payload(
+                                                terminal.backend_mut(),
+                                                ansi,
+                                            )
+                                        {
+                                            log_client(&format!(
                                                         "failed to write pane ansi: {err}"
                                                     ));
-                                                }
-                                            }
-                                            Err(err) => log_client(&format!(
-                                                "failed to begin pane ANSI paint: {err}"
-                                            )),
                                         }
                                     }
                                     if let Err(err) = refresh_mouse_pointer(
@@ -1704,6 +1626,7 @@ impl ClientApp {
                                         hide_status,
                                         has_overlay || has_prompt,
                                         true,
+                                        sidebar_visible,
                                     ) {
                                         log_client(&format!(
                                             "failed to set mouse pointer after ansi: {err}"
@@ -1730,7 +1653,12 @@ impl ClientApp {
                     if let Err(err) = terminal.draw(|f| {
                         let in_prefix = mode == InputMode::Prefix;
                         if let Some(ref fd) = frame {
-                            skip_pane_area_for_ansi(f, fd, hide_borders);
+                            skip_pane_area_for_ansi_in(
+                                f,
+                                fd,
+                                areas.layout,
+                                hide_borders,
+                            );
                             let mut display_frame = fd.clone();
                             if let Some(ref message) = status_banner {
                                 if let Some(status) =
@@ -1739,23 +1667,26 @@ impl ClientApp {
                                     status.right = message.clone();
                                 }
                             }
-                            let tab_views = tabs.tab_views();
-                            render_tabbed_frame(
+                            render_frame_in_area(
                                 f,
                                 &display_frame,
-                                &tab_views,
-                                tabs.tab_bar_offset,
+                                areas.frame,
                                 in_prefix,
                                 hide_status,
                                 hide_borders,
                             );
                         } else {
-                            let tab_views = tabs.tab_views();
-                            render_tabbed_loading(
-                                f,
-                                &tab_views,
-                                tabs.tab_bar_offset,
-                            );
+                            render_loading_in_area(f, areas.frame);
+                        }
+                        render_navigation_sidebar(
+                            f,
+                            &navigation_entries,
+                            navigation_state.selected,
+                            mode == InputMode::Navigator,
+                            areas.sidebar,
+                        );
+                        if navigation_popup {
+                            render_navigation_popup(f, &navigation_entries, navigation_state.selected);
                         }
                         match &mode {
                             InputMode::CopySearch { buf, forward, .. } => {
@@ -1771,51 +1702,36 @@ impl ClientApp {
                             InputMode::RenameSession { buf, .. } => {
                                 render_prompt(f, "Rename session: ", buf)
                             }
-                            InputMode::RenameTab {
-                                code,
-                                title,
-                                editing_code,
-                                error,
-                                ..
-                            } => render_rename_tab_panel(
+                            InputMode::RenamePane { buf, .. } => {
+                                render_prompt(f, "Rename pane: ", buf)
+                            }
+                            InputMode::RenameIdentity {
+                                id, buf, cursor,
+                            } => render_prompt_input(
                                 f,
-                                code,
-                                title,
-                                *editing_code,
-                                error.as_deref(),
+                                if matches!(id, navigation::NavigationNodeId::Workspace { .. }) { "Rename workspace: " } else { "Rename machine: " },
+                                buf,
+                                *cursor,
                             ),
-                            InputMode::Command { buf, .. } => {
-                                render_prompt(f, ":", buf)
+                            InputMode::Command { buf, cursor } => {
+                                render_prompt_input(f, ":", buf, *cursor)
                             }
-                            InputMode::TabQuickSwitch { code, error } => {
-                                render_tab_quick_switch_panel(
-                                    f,
-                                    code,
-                                    error.as_deref(),
-                                )
-                            }
-                            InputMode::ConfirmKillTab { label, .. } => {
+                            InputMode::ConfirmNavigationClose { entry } => {
                                 render_prompt(
                                     f,
                                     &format!(
-                                        "Kill tab '{}' and its server? [y/N] ",
-                                        label
+                                        "Close {} '{}' ({})? [y/N] ",
+                                        navigation_kind_label(entry.kind),
+                                        entry.label,
+                                        match entry.kind {
+                                            navigation::NavigationNodeKind::Machine => "detach connections",
+                                            navigation::NavigationNodeKind::Workspace => "detach only",
+                                            _ => "end processes",
+                                        }
                                     ),
                                     "",
                                 )
                             }
-                            InputMode::SessionChooser {
-                                entries,
-                                selected,
-                                collapsed,
-                                collapsed_windows,
-                            } => render_session_chooser(
-                                f,
-                                entries,
-                                *selected,
-                                collapsed,
-                                collapsed_windows,
-                            ),
                             InputMode::OptionPanel {
                                 selected,
                                 scroll_on_erase_in_display,
@@ -1824,22 +1740,8 @@ impl ClientApp {
                                 *selected,
                                 *scroll_on_erase_in_display,
                             ),
-                            InputMode::TabChooser {
-                                query,
-                                selected,
-                                search_active,
-                                ..
-                            } => {
-                                let tab_views = tabs.tab_chooser_views();
-                                render_tab_chooser(
-                                    f,
-                                    &tab_views,
-                                    query,
-                                    *selected,
-                                    *search_active,
-                                );
-                            }
-
+                            InputMode::NavigationHelp { scroll } => render_navigation_help(f, *scroll),
+                            InputMode::ShortcutsHelp { scroll, .. } => render_shortcuts_help(f, *scroll),
                             _ => {}
                         }
                         if let Some(ref sel) = mouse_select {
@@ -1850,7 +1752,9 @@ impl ClientApp {
                                         sel,
                                         fd,
                                         hide_borders,
-                                    );
+
+sidebar_visible,
+);
                                 }
                             }
                         }
@@ -1866,8 +1770,11 @@ impl ClientApp {
                             if mouse_select.is_none() {
                                 let (sr, sc, er, ec) = prev.normalized_bounds();
                                 if let Some(ref fd) = frame {
-                                    let layout_area =
-                                        server_layout_area(cols, rows);
+                                    let layout_area = server_layout_area(
+                                        cols,
+                                        rows,
+                                        sidebar_visible,
+                                    );
                                     if let Err(err) =
                                         restore_mouse_selection_ansi(
                                             terminal.backend_mut(),
@@ -1894,7 +1801,8 @@ impl ClientApp {
                         if let (Some(ref fd), Some(sel)) =
                             (frame.as_ref(), mouse_select.as_ref())
                         {
-                            let layout_area = server_layout_area(cols, rows);
+                            let layout_area =
+                                server_layout_area(cols, rows, sidebar_visible);
                             let selection_changed = last_drawn_mouse_select
                                 .is_none_or(|prev| {
                                     !mouse_selection_bounds_eq(&prev, sel)
@@ -1933,12 +1841,21 @@ impl ClientApp {
                     }
                     if let Some(ref fd) = frame {
                         if fd.ansi.is_some() {
-                            if has_overlay || has_prompt {
+                            if has_prompt {
+                                // The prompt renderer owns cursor placement.
+                                terminal.show_cursor()?;
+                            } else if has_overlay
+                                || mode == InputMode::Navigator
+                            {
                                 terminal.hide_cursor()?;
                             } else {
                                 let (cols, rows) =
                                     terminal::size().unwrap_or((80, 24));
-                                let frame_area = server_frame_area(cols, rows);
+                                let frame_area = server_frame_area(
+                                    cols,
+                                    rows,
+                                    sidebar_visible,
+                                );
                                 if let Some(pos) = active_cursor_screen_position(
                                     fd,
                                     frame_area,
@@ -1961,6 +1878,9 @@ impl ClientApp {
                             Some((active_socket_name, current_counter));
                     }
                     last_overlay_rect = current_overlay_rect;
+                    last_navigation_entries = navigation_entries.clone();
+                    last_drawn_mode = Some(mode.clone());
+                    last_drawn_sidebar = sidebar_visible;
                 }
 
                 if let Err(err) = refresh_mouse_pointer(
@@ -1974,6 +1894,7 @@ impl ClientApp {
                     hide_status,
                     has_overlay || has_prompt,
                     drew_terminal_output,
+                    sidebar_visible,
                 ) {
                     log_client(&format!("failed to set mouse pointer: {err}"));
                 }
@@ -1984,6 +1905,73 @@ impl ClientApp {
                             if key.kind == KeyEventKind::Press
                                 || key.kind == KeyEventKind::Repeat =>
                         {
+                            let sidebar_shortcut = global_prefix_pending;
+                            global_prefix_pending = (key.code, key.modifiers)
+                                == prefix_key
+                                && !sidebar_shortcut;
+                            if global_prefix_pending
+                                && mode != InputMode::Prefix
+                            {
+                                global_prefix_origin =
+                                    if mode == InputMode::Resize {
+                                        InputMode::Normal
+                                    } else {
+                                        mode.clone()
+                                    };
+                            }
+                            let open_popup = sidebar_shortcut
+                                && key.code == KeyCode::Char('m')
+                                && !key.modifiers.intersects(
+                                    KeyModifiers::SHIFT
+                                        | KeyModifiers::ALT
+                                        | KeyModifiers::CONTROL,
+                                );
+                            if open_popup {
+                                navigation_popup = !navigation_popup;
+                                mode = if navigation_popup {
+                                    navigation_popup_return_mode =
+                                        global_prefix_origin.clone();
+                                    workspaces.sync_navigation_to_active(
+                                        &mut navigation_state,
+                                        &navigation_entries,
+                                    );
+                                    InputMode::Navigator
+                                } else {
+                                    navigation_popup_return_mode.clone()
+                                };
+                                prefix_from_navigator = false;
+                                prefix_from_copy_mode = false;
+                                mouse_select = None;
+                                mouse_drag_origin = None;
+                                last_drawn_mouse_select = None;
+                                last_drawn_counter = 0;
+                                continue;
+                            }
+                            let toggle_sidebar =
+                                sidebar_shortcut && is_shifted_letter(key, 'M');
+                            if toggle_sidebar {
+                                let visible = !workspaces.sidebar_visible;
+                                navigation_popup = false;
+                                workspaces
+                                    .set_sidebar_visible(visible, cols, rows);
+                                prefix_from_navigator = false;
+                                prefix_from_copy_mode = false;
+                                mouse_select = None;
+                                mouse_drag_origin = None;
+                                last_drawn_mouse_select = None;
+                                mode = if !matches!(
+                                    global_prefix_origin,
+                                    InputMode::Navigator
+                                        | InputMode::NavigationHelp { .. }
+                                        | InputMode::Prefix
+                                ) {
+                                    global_prefix_origin.clone()
+                                } else {
+                                    InputMode::Normal
+                                };
+                                last_drawn_counter = 0;
+                                continue;
+                            }
                             match mode.clone() {
                                 InputMode::Normal => {
                                     if (key.code, key.modifiers) == prefix_key {
@@ -1991,7 +1979,7 @@ impl ClientApp {
                                     } else if key.kind == KeyEventKind::Press
                                         && is_cloud_paste_key(key)
                                     {
-                                        let message = tabs
+                                        let message = workspaces
                                             .focused_client()
                                             .paste_cloud()
                                             .unwrap_or_else(|e| e);
@@ -2009,7 +1997,8 @@ impl ClientApp {
                                             )
                                     ) && display_scrolled
                                     {
-                                        tabs.focused_client()
+                                        workspaces
+                                            .focused_client()
                                             .scroll_display_bottom();
                                         display_scrolled = false;
                                         last_drawn_counter = 0;
@@ -2020,7 +2009,7 @@ impl ClientApp {
                                             && copy_mode_exit_pending
                                         {
                                             leave_copy_mode_client(
-                                                tabs.focused_client(),
+                                                workspaces.focused_client(),
                                                 &mut mode,
                                                 &mut copy_mode_confirmed,
                                                 &mut copy_mode_exit_pending,
@@ -2029,7 +2018,8 @@ impl ClientApp {
                                         }
                                         let bytes = key_to_bytes(key);
                                         if !bytes.is_empty() {
-                                            tabs.focused_client()
+                                            workspaces
+                                                .focused_client()
                                                 .send_input(&bytes);
                                         }
                                     }
@@ -2037,13 +2027,28 @@ impl ClientApp {
 
                                 InputMode::Prefix => {
                                     mode = InputMode::Normal;
+                                    if prefix_from_navigator {
+                                        prefix_from_navigator = false;
+                                        if matches!(
+                                            key.code,
+                                            KeyCode::Char('t' | 'T' | 'S')
+                                        ) {
+                                            mode = InputMode::Navigator;
+                                            continue;
+                                        }
+                                        if let Some(dir) = prefix_nav_dir(key) {
+                                            mode = navigator_prefix_move(dir);
+                                            continue;
+                                        }
+                                    }
                                     let prefix_started_from_copy_mode =
                                         prefix_from_copy_mode;
                                     prefix_from_copy_mode = false;
                                     if (key.code, key.modifiers) == prefix_key {
                                         let bytes = key_to_bytes(key);
                                         if !bytes.is_empty() {
-                                            tabs.focused_client()
+                                            workspaces
+                                                .focused_client()
                                                 .send_input(&bytes);
                                         }
                                         continue;
@@ -2078,7 +2083,7 @@ impl ClientApp {
                                             }
                                             _ => crate::layout::NavDir::Down,
                                         };
-                                        tabs.resize_visual(dir);
+                                        workspaces.resize_visual(dir);
                                         last_drawn_counter = 0;
                                         mode = InputMode::Resize;
                                         resize_deadline = Some(
@@ -2088,112 +2093,47 @@ impl ClientApp {
                                         continue;
                                     }
                                     match (key.code, key.modifiers) {
+                                        _ if is_shifted_letter(key, 'H') => {
+                                            if let Some(message) =
+                                                set_workspace_home(&workspaces)
+                                            {
+                                                status_notice = Some((
+                                                    message,
+                                                    Instant::now()
+                                                        + Duration::from_secs(
+                                                            3,
+                                                        ),
+                                                ));
+                                            }
+                                            last_drawn_counter = 0;
+                                        }
                                         (
                                             KeyCode::Char('d'),
                                             KeyModifiers::NONE,
                                         ) => {
-                                            tabs.detach_all();
+                                            workspaces.detach_all();
                                             break;
                                         }
-                                        (
-                                            KeyCode::Char('t'),
-                                            KeyModifiers::NONE,
-                                        ) => {
-                                            if prefix_started_from_copy_mode
-                                                || frame.as_ref().is_some_and(
-                                                    active_in_copy_mode,
-                                                )
-                                            {
-                                                tabs.focused_client()
-                                                    .exit_copy_mode();
-                                                copy_mode_confirmed = false;
-                                            }
-                                            mode =
-                                                default_tab_chooser_mode(&tabs);
-                                            last_drawn_counter = 0;
-                                        }
-                                        (KeyCode::Char('/'), _) => {
-                                            mode = tab_quick_switch_mode();
-                                        }
-                                        (KeyCode::Char('T'), _) => {
-                                            mode = rename_tab_mode_for_active(
-                                                &tabs, false,
-                                            );
-                                        }
-                                        (KeyCode::Tab, _) => {
-                                            if tabs.next_tab() {
-                                                let (cols, rows) =
-                                                    terminal::size()
-                                                        .unwrap_or((80, 24));
-                                                tabs.active_client().resize(
-                                                    server_content_size(
-                                                        cols, rows,
-                                                    ),
-                                                );
-                                                mode = InputMode::Normal;
-                                                copy_mode_confirmed = false;
-                                                mouse_select = None;
-                                                last_drawn_counter = 0;
-                                            }
-                                        }
-                                        (KeyCode::BackTab, _) => {
-                                            if tabs.prev_tab() {
-                                                let (cols, rows) =
-                                                    terminal::size()
-                                                        .unwrap_or((80, 24));
-                                                tabs.active_client().resize(
-                                                    server_content_size(
-                                                        cols, rows,
-                                                    ),
-                                                );
-                                                mode = InputMode::Normal;
-                                                copy_mode_confirmed = false;
-                                                mouse_select = None;
-                                                last_drawn_counter = 0;
-                                            }
-                                        }
-                                        (
-                                            KeyCode::Char('w'),
-                                            KeyModifiers::NONE,
-                                        ) => {
-                                            if tabs.close_active() {
-                                                break;
-                                            }
-                                            mode = InputMode::Normal;
-                                            copy_mode_confirmed = false;
-                                            mouse_select = None;
-                                            request_active_tab_full_refresh(
-                                                &tabs,
-                                            );
-                                            last_drawn_counter = 0;
-                                        }
-                                        (KeyCode::Char('W'), _) => {
-                                            mode = InputMode::ConfirmKillTab {
-                                                socket_name: tabs
-                                                    .active_socket_name(),
-                                                label: tabs
-                                                    .active_title_for_confirm(),
-                                                return_to_tab_chooser: false,
-                                            };
-                                        }
                                         (KeyCode::Char(','), _) => {
-                                            let cur = tabs
+                                            let cur = workspaces
                                                 .active_client()
                                                 .active_window_name();
                                             let len = cur.len();
                                             mode = InputMode::RenameWindow {
                                                 buf: cur,
                                                 cursor: len,
+                                                return_to_navigator: false,
                                             };
                                         }
                                         (KeyCode::Char('$'), _) => {
-                                            let cur = tabs
+                                            let cur = workspaces
                                                 .active_client()
                                                 .session_name();
                                             let len = cur.len();
                                             mode = InputMode::RenameSession {
                                                 buf: cur,
                                                 cursor: len,
+                                                return_to_navigator: false,
                                             };
                                         }
                                         (KeyCode::Char(':'), _) => {
@@ -2205,12 +2145,12 @@ impl ClientApp {
                                         (KeyCode::Char('O'), _) => {
                                             mode = InputMode::OptionPanel {
                                                 selected: 0,
-                                                scroll_on_erase_in_display: tabs.active_client()
+                                                scroll_on_erase_in_display: workspaces.active_client()
                                                     .scroll_on_erase_in_display(),
                                             };
                                         }
                                         (KeyCode::Char('['), _) => {
-                                            if tabs
+                                            if workspaces
                                                 .focused_client()
                                                 .enter_copy_mode()
                                             {
@@ -2229,64 +2169,34 @@ impl ClientApp {
                                                 ));
                                             }
                                         }
-                                        (
-                                            KeyCode::Char('s'),
-                                            KeyModifiers::NONE,
-                                        ) => {
-                                            let entries = tabs
-                                                .active_client()
-                                                .session_tree();
-                                            let focus = frame
-                                                .as_ref()
-                                                .and_then(
-                                                active_session_focus_from_frame,
-                                            );
-                                            let (collapsed, collapsed_windows, sel) =
-                                                build_initial_session_chooser_state(
-                                                    &entries, focus,
-                                                );
-                                            mode = InputMode::SessionChooser {
-                                                entries,
-                                                selected: sel,
-                                                collapsed,
-                                                collapsed_windows,
-                                            };
-                                            last_drawn_counter = 0;
-                                        }
                                         (KeyCode::Char('('), _) => {
-                                            tabs.active_client()
+                                            workspaces
+                                                .active_client()
                                                 .run_command("prev-session");
+                                            workspaces.invalidate_visual_pane();
+                                            workspaces.invalidate_active_navigation_tree();
                                         }
                                         (KeyCode::Char(')'), _) => {
-                                            tabs.active_client()
+                                            workspaces
+                                                .active_client()
                                                 .run_command("next-session");
+                                            workspaces.invalidate_visual_pane();
+                                            workspaces.invalidate_active_navigation_tree();
                                         }
                                         (
                                             KeyCode::Char('b'),
                                             KeyModifiers::NONE,
                                         ) => {
                                             hide_borders = !hide_borders;
-                                            tabs.active_client()
+                                            workspaces
+                                                .active_client()
                                                 .set_hide_borders(hide_borders);
-                                        }
-                                        _ if is_shifted_letter(key, 'H') => {
-                                            if let Some(message) =
-                                                set_tab_start_dir(&mut tabs)
-                                            {
-                                                status_notice = Some((
-                                                    message,
-                                                    Instant::now()
-                                                        + Duration::from_secs(
-                                                            3,
-                                                        ),
-                                                ));
-                                            }
                                         }
                                         (
                                             KeyCode::Char(']'),
                                             KeyModifiers::NONE,
                                         ) => {
-                                            match tabs
+                                            match workspaces
                                                 .focused_client()
                                                 .paste_cloud()
                                             {
@@ -2314,10 +2224,22 @@ impl ClientApp {
                                             if let Some(dir) =
                                                 prefix_nav_dir(key)
                                             {
-                                                tabs.visual_move(
-                                                    dir,
-                                                    hide_borders,
-                                                );
+                                                let moved = workspaces
+                                                    .visual_move(
+                                                        dir,
+                                                        hide_borders,
+                                                    );
+                                                if dir
+                                                    == crate::layout::NavDir::Left
+                                                    && !moved
+                                                {
+                                                    workspaces.sync_navigation_to_active(
+                                                        &mut navigation_state,
+                                                        &navigation_entries,
+                                                    );
+                                                    mode = InputMode::Navigator;
+                                                    workspaces.set_sidebar_visible(true, cols, rows);
+                                                }
                                             } else if matches!(
                                                 (key.code, key.modifiers),
                                                 (
@@ -2325,8 +2247,9 @@ impl ClientApp {
                                                     KeyModifiers::NONE
                                                 )
                                             ) {
-                                                tabs.kill_visual_pane();
-                                                tabs.invalidate_visual_pane();
+                                                workspaces.kill_visual_pane();
+                                                workspaces
+                                                    .invalidate_visual_pane();
                                             } else {
                                                 let invalidate_focus =
                                                     matches!(
@@ -2351,9 +2274,30 @@ impl ClientApp {
                                                         _
                                                     )
                                                 );
+                                                let invalidate_navigation = matches!(
+                                                    (key.code, key.modifiers),
+                                                    (KeyCode::Char('%'), _)
+                                                        | (
+                                                            KeyCode::Char('"'),
+                                                            _
+                                                        )
+                                                        | (
+                                                            KeyCode::Char('c'),
+                                                            KeyModifiers::NONE
+                                                        )
+                                                        | (
+                                                            KeyCode::Char('n'),
+                                                            KeyModifiers::NONE
+                                                        )
+                                                        | (
+                                                            KeyCode::Char('p'),
+                                                            KeyModifiers::NONE
+                                                        )
+                                                );
                                                 if let Some(message) =
                                                     handle_prefix_key(
-                                                        tabs.focused_client(),
+                                                        workspaces
+                                                            .focused_client(),
                                                         key,
                                                     )
                                                 {
@@ -2366,11 +2310,302 @@ impl ClientApp {
                                                     ));
                                                 }
                                                 if invalidate_focus {
-                                                    tabs.invalidate_visual_pane();
+                                                    workspaces
+                                                        .invalidate_visual_pane(
+                                                        );
+                                                }
+                                                if invalidate_navigation {
+                                                    workspaces.invalidate_active_navigation_tree();
                                                 }
                                             }
                                         }
                                     }
+                                }
+
+                                InputMode::Navigator => {
+                                    if (key.code, key.modifiers) == prefix_key {
+                                        prefix_from_navigator = true;
+                                        mode = InputMode::Prefix;
+                                        continue;
+                                    }
+                                    match key.code {
+                                        KeyCode::Esc | KeyCode::Char('q') => {
+                                            mode = if navigation_popup {
+                                                navigation_popup = false;
+                                                navigation_popup_return_mode
+                                                    .clone()
+                                            } else {
+                                                workspaces.set_sidebar_visible(
+                                                    false, cols, rows,
+                                                );
+                                                InputMode::Normal
+                                            };
+                                        }
+                                        KeyCode::Up | KeyCode::Char('k') => {
+                                            navigation_state.select_prev(
+                                                &navigation_entries,
+                                            );
+                                        }
+                                        KeyCode::Down | KeyCode::Char('j') => {
+                                            navigation_state.select_next(
+                                                &navigation_entries,
+                                            );
+                                        }
+                                        KeyCode::Home | KeyCode::Char('g') => {
+                                            navigation_state.select_first(
+                                                &navigation_entries,
+                                            );
+                                        }
+                                        KeyCode::End | KeyCode::Char('G') => {
+                                            navigation_state.select_last(
+                                                &navigation_entries,
+                                            );
+                                        }
+                                        _ if is_shifted_letter(key, 'H') => {
+                                            mode = InputMode::NavigationHelp {
+                                                scroll: 0,
+                                            }
+                                        }
+                                        KeyCode::Left | KeyCode::Char('h') => {
+                                            navigation_state
+                                                .collapse_or_parent(
+                                                    &navigation_entries,
+                                                );
+                                        }
+                                        KeyCode::Right | KeyCode::Char('l') => {
+                                            let entry = navigation_entries
+                                                .get(navigation_state.selected)
+                                                .cloned();
+                                            if let Some(entry) = entry {
+                                                if entry.expandable {
+                                                    navigation_state
+                                                        .expand_or_child(
+                                                            &navigation_entries,
+                                                        );
+                                                } else {
+                                                    let (cols, rows) =
+                                                        terminal::size()
+                                                            .unwrap_or((
+                                                                80, 24,
+                                                            ));
+                                                    match open_navigation_entry(
+                                                        &mut workspaces,
+                                                        &mut remotes,
+                                                        &mut navigation_state,
+                                                        &navigation_entries,
+                                                        &entry,
+                                                        server_content_size(
+                                                            cols, rows,
+
+sidebar_visible,
+),
+                                                    ) {
+                                                        NavigationOpenResult::Opened => {
+                                                            mode = InputMode::Normal;
+                                                            copy_mode_confirmed = false;
+                                                            mouse_select = None;
+                                                            request_active_workspace_full_refresh(
+                                                                &workspaces,
+                                                            );
+                                                        }
+                                                        NavigationOpenResult::Probing(name) => {
+                                                            status_notice = Some((
+                                                                format!("probing {name}…"),
+                                                                Instant::now()
+                                                                    + Duration::from_secs(6),
+                                                            ));
+                                                        }
+                                                        NavigationOpenResult::Failed(error) => {
+                                                            status_notice = Some((
+                                                                error,
+                                                                Instant::now()
+                                                                    + Duration::from_secs(4),
+                                                            ));
+                                                        }
+                                                        NavigationOpenResult::Toggled => {}
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        KeyCode::Char('R') => {
+                                            let selected_remote =
+                                                navigation_entries
+                                                    .get(
+                                                        navigation_state
+                                                            .selected,
+                                                    )
+                                                    .and_then(|entry| {
+                                                        match &entry.id {
+                                                            navigation::NavigationNodeId::Machine(id)
+                                                                if id
+                                                                    != "local" =>
+                                                            {
+                                                                Some(id.clone())
+                                                            }
+                                                            _ => None,
+                                                        }
+                                                    });
+                                            if let Some(machine_id) =
+                                                selected_remote
+                                            {
+                                                remotes.start_probe(
+                                                    &machine_id,
+                                                    false,
+                                                );
+                                            } else {
+                                                workspaces
+                                                    .active_client()
+                                                    .refresh_display();
+                                            }
+                                        }
+                                        KeyCode::Char('r') => {
+                                            let entry = navigation_entries
+                                                .get(navigation_state.selected)
+                                                .cloned();
+                                            if let Some(entry) = entry {
+                                                let (cols, rows) =
+                                                    terminal::size()
+                                                        .unwrap_or((80, 24));
+                                                let size = server_content_size(
+                                                    cols,
+                                                    rows,
+                                                    sidebar_visible,
+                                                );
+                                                if matches!(entry.kind, navigation::NavigationNodeKind::Machine | navigation::NavigationNodeKind::Workspace) {
+                                                        mode = InputMode::RenameIdentity {
+                                                            id: entry.id.clone(),
+                                                            cursor: entry.label.chars().count(),
+                                                            buf: entry.label.clone(),
+                                                        };
+                                                } else if !workspaces
+                                                    .activate_navigation_entry(&entry, size)
+                                                {
+                                                    status_notice = Some((
+                                                        "navigation target is unavailable"
+                                                            .to_string(),
+                                                        Instant::now()
+                                                            + Duration::from_secs(3),
+                                                    ));
+                                                } else {
+                                                    let buf = navigation_rename_value(&entry);
+                                                    let cursor = buf.chars().count();
+                                                    mode = match entry.kind {
+                                                        navigation::NavigationNodeKind::Session => {
+                                                            InputMode::RenameSession {
+                                                                buf,
+                                                                cursor,
+                                                                return_to_navigator: true,
+                                                            }
+                                                        }
+                                                        navigation::NavigationNodeKind::Window => {
+                                                            InputMode::RenameWindow {
+                                                                buf,
+                                                                cursor,
+                                                                return_to_navigator: true,
+                                                            }
+                                                        }
+                                                        navigation::NavigationNodeKind::Pane => {
+                                                            InputMode::RenamePane {
+                                                                buf,
+                                                                cursor,
+                                                                return_to_navigator: true,
+                                                            }
+                                                        }
+                                                        navigation::NavigationNodeKind::Machine | navigation::NavigationNodeKind::Workspace => {
+                                                            unreachable!()
+                                                        }
+                                                    };
+                                                    request_active_workspace_full_refresh(&workspaces);
+                                                }
+                                            }
+                                        }
+                                        KeyCode::Char('K')
+                                        | KeyCode::Char('d')
+                                        | KeyCode::Delete => {
+                                            if let Some(entry) =
+                                                navigation_entries
+                                                    .get(
+                                                        navigation_state
+                                                            .selected,
+                                                    )
+                                                    .cloned()
+                                            {
+                                                if let Some(reason) =
+                                                    navigation_close_block_reason(
+                                                        &navigation_entries,
+                                                        &entry,
+                                                    )
+                                                {
+                                                    status_notice = Some((
+                                                        reason,
+                                                        Instant::now()
+                                                            + Duration::from_secs(4),
+                                                    ));
+                                                } else {
+                                                    mode =
+                                                        InputMode::ConfirmNavigationClose {
+                                                            entry,
+                                                        };
+                                                }
+                                            }
+                                        }
+                                        KeyCode::Enter => {
+                                            if let Some(entry) =
+                                                navigation_entries
+                                                    .get(
+                                                        navigation_state
+                                                            .selected,
+                                                    )
+                                                    .cloned()
+                                            {
+                                                let (cols, rows) =
+                                                    terminal::size()
+                                                        .unwrap_or((80, 24));
+                                                match open_navigation_entry(
+                                                    &mut workspaces,
+                                                    &mut remotes,
+                                                    &mut navigation_state,
+                                                    &navigation_entries,
+                                                    &entry,
+                                                    server_content_size(
+                                                        cols, rows,
+
+sidebar_visible,
+),
+                                                ) {
+                                                    NavigationOpenResult::Opened => {
+                                                        mode =
+                                                            InputMode::Normal;
+                                                        copy_mode_confirmed =
+                                                            false;
+                                                        mouse_select = None;
+                                                        request_active_workspace_full_refresh(
+                                                            &workspaces,
+                                                        );
+                                                    }
+                                                    NavigationOpenResult::Probing(name) => {
+                                                        status_notice = Some((
+                                                            format!(
+                                                                "probing {name}…"
+                                                            ),
+                                                            Instant::now()
+                                                                + Duration::from_secs(6),
+                                                        ));
+                                                    }
+                                                    NavigationOpenResult::Failed(error) => {
+                                                        status_notice = Some((
+                                                            error,
+                                                            Instant::now()
+                                                                + Duration::from_secs(4),
+                                                        ));
+                                                    }
+                                                    NavigationOpenResult::Toggled => {}
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                    last_drawn_counter = 0;
                                 }
 
                                 InputMode::Resize => {
@@ -2396,7 +2631,7 @@ impl ClientApp {
                                             }
                                             _ => crate::layout::NavDir::Down,
                                         };
-                                        tabs.resize_visual(dir);
+                                        workspaces.resize_visual(dir);
                                         last_drawn_counter = 0;
                                         resize_deadline = Some(
                                             Instant::now()
@@ -2418,6 +2653,113 @@ impl ClientApp {
                                     resize_deadline = None;
                                 }
 
+                                InputMode::NavigationHelp { mut scroll }
+                                | InputMode::ShortcutsHelp {
+                                    mut scroll, ..
+                                } => {
+                                    let return_mode = match &mode {
+                                        InputMode::ShortcutsHelp {
+                                            return_mode,
+                                            ..
+                                        } => Some(return_mode.clone()),
+                                        _ => None,
+                                    };
+                                    let area = ratatui::layout::Rect::new(
+                                        0, 0, cols, rows,
+                                    );
+                                    let max_scroll = if return_mode.is_some() {
+                                        shortcuts_help_max_scroll(area)
+                                    } else {
+                                        navigation_help_max_scroll(area)
+                                    };
+                                    match key.code {
+                                        KeyCode::Esc
+                                        | KeyCode::Char('q')
+                                        | KeyCode::Char('H') => {
+                                            mode = return_mode
+                                                .map(|previous| *previous)
+                                                .unwrap_or(InputMode::Navigator)
+                                        }
+                                        _ => {
+                                            scroll = match key.code {
+                                                KeyCode::Down
+                                                | KeyCode::Char('j') => {
+                                                    scroll.saturating_add(1)
+                                                }
+                                                KeyCode::Up
+                                                | KeyCode::Char('k') => {
+                                                    scroll.saturating_sub(1)
+                                                }
+                                                KeyCode::PageDown => {
+                                                    scroll.saturating_add(8)
+                                                }
+                                                KeyCode::PageUp => {
+                                                    scroll.saturating_sub(8)
+                                                }
+                                                KeyCode::Home
+                                                | KeyCode::Char('g') => 0,
+                                                KeyCode::End
+                                                | KeyCode::Char('G') => {
+                                                    max_scroll
+                                                }
+                                                _ => scroll,
+                                            }
+                                            .min(max_scroll);
+                                            mode = match return_mode {
+                                                Some(return_mode) => {
+                                                    InputMode::ShortcutsHelp {
+                                                        scroll,
+                                                        return_mode,
+                                                    }
+                                                }
+                                                None => {
+                                                    InputMode::NavigationHelp {
+                                                        scroll,
+                                                    }
+                                                }
+                                            };
+                                        }
+                                    }
+                                }
+                                InputMode::RenameIdentity {
+                                    id,
+                                    mut buf,
+                                    mut cursor,
+                                } => match key.code {
+                                    KeyCode::Enter => {
+                                        let saved = match &id {
+                                            navigation::NavigationNodeId::Machine(machine) => machine_names.rename(&machine_config, machine, &buf),
+                                            navigation::NavigationNodeId::Workspace { machine, workspace } => machine_names.rename_workspace(&machine_config, machine, workspace, &buf),
+                                            _ => unreachable!(),
+                                        };
+                                        match saved {
+                                            Ok(()) => {
+                                                mode = InputMode::Navigator;
+                                                status_notice = Some((
+                                                    "display name saved"
+                                                        .to_string(),
+                                                    Instant::now()
+                                                        + Duration::from_secs(
+                                                            3,
+                                                        ),
+                                                ));
+                                            }
+                                            Err(error) => {
+                                                status_notice = Some((format!("rename failed: {error}"), Instant::now() + Duration::from_secs(5)));
+                                                mode = InputMode::Navigator;
+                                            }
+                                        }
+                                    }
+                                    KeyCode::Esc => mode = InputMode::Navigator,
+                                    _ => {
+                                        edit_prompt(&mut buf, &mut cursor, key);
+                                        mode = InputMode::RenameIdentity {
+                                            id,
+                                            buf,
+                                            cursor,
+                                        };
+                                    }
+                                },
                                 InputMode::Command {
                                     mut buf,
                                     mut cursor,
@@ -2428,12 +2770,20 @@ impl ClientApp {
                                         if !trimmed.is_empty() {
                                             let (cols, rows) = terminal::size()
                                                 .unwrap_or((80, 24));
-                                            match run_client_tab_command(
-                                                &mut tabs,
+                                            match run_client_command(
+                                                &mut workspaces,
+                                                &mut remotes,
                                                 &trimmed,
-                                                server_content_size(cols, rows),
+                                                server_content_size(cols, rows, sidebar_visible),
                                             ) {
-                                                ClientTabCommandResult::Handled(message) => {
+                                                ClientCommandResult::ShowHelp => {
+                                                    mode = InputMode::ShortcutsHelp {
+                                                        scroll: 0,
+                                                        return_mode: Box::new(InputMode::Normal),
+                                                    };
+                                                    last_drawn_counter = 0;
+                                                }
+                                                ClientCommandResult::Handled(message) => {
                                                     copy_mode_confirmed = false;
                                                     mouse_select = None;
                                                     last_drawn_counter = 0;
@@ -2444,15 +2794,23 @@ impl ClientApp {
                                                         ));
                                                     }
                                                 }
-                                                ClientTabCommandResult::NotHandled => {
+                                                ClientCommandResult::NotHandled => {
+                                                    let changes_navigation =
+                                                        command_changes_navigation(
+                                                            &trimmed,
+                                                        );
                                                     if let Some(message) = run_command_notice(
-                                                        tabs.focused_client(),
+                                                        workspaces.focused_client(),
                                                         &trimmed,
                                                     ) {
                                                         status_notice = Some((
                                                             message,
                                                             Instant::now() + Duration::from_secs(3),
                                                         ));
+                                                    }
+                                                    if changes_navigation {
+                                                        workspaces.invalidate_visual_pane();
+                                                        workspaces.invalidate_active_navigation_tree();
                                                     }
                                                 }
                                             }
@@ -2501,6 +2859,7 @@ impl ClientApp {
                                             InputMode::Command { buf, cursor };
                                     }
                                     _ => {
+                                        edit_prompt(&mut buf, &mut cursor, key);
                                         mode =
                                             InputMode::Command { buf, cursor };
                                     }
@@ -2519,7 +2878,7 @@ impl ClientApp {
                                             KeyModifiers::NONE,
                                         ) => {
                                             leave_copy_mode_client(
-                                                tabs.focused_client(),
+                                                workspaces.focused_client(),
                                                 &mut mode,
                                                 &mut copy_mode_confirmed,
                                                 &mut copy_mode_exit_pending,
@@ -2551,7 +2910,8 @@ impl ClientApp {
                                         )
                                         | (KeyCode::Left, KeyModifiers::NONE) =>
                                         {
-                                            tabs.focused_client()
+                                            workspaces
+                                                .focused_client()
                                                 .copy_move_left();
                                             mode = InputMode::CopyMode;
                                         }
@@ -2563,7 +2923,8 @@ impl ClientApp {
                                             KeyCode::Right,
                                             KeyModifiers::NONE,
                                         ) => {
-                                            tabs.focused_client()
+                                            workspaces
+                                                .focused_client()
                                                 .copy_move_right();
                                             mode = InputMode::CopyMode;
                                         }
@@ -2572,7 +2933,8 @@ impl ClientApp {
                                             KeyModifiers::NONE,
                                         )
                                         | (KeyCode::Up, KeyModifiers::NONE) => {
-                                            tabs.focused_client()
+                                            workspaces
+                                                .focused_client()
                                                 .copy_move_up();
                                             mode = InputMode::CopyMode;
                                         }
@@ -2582,7 +2944,8 @@ impl ClientApp {
                                         )
                                         | (KeyCode::Down, KeyModifiers::NONE) =>
                                         {
-                                            tabs.focused_client()
+                                            workspaces
+                                                .focused_client()
                                                 .copy_move_down();
                                             mode = InputMode::CopyMode;
                                         }
@@ -2590,7 +2953,8 @@ impl ClientApp {
                                             KeyCode::Char('b'),
                                             KeyModifiers::NONE,
                                         ) => {
-                                            tabs.focused_client()
+                                            workspaces
+                                                .focused_client()
                                                 .copy_move_word_backward();
                                             mode = InputMode::CopyMode;
                                         }
@@ -2598,7 +2962,8 @@ impl ClientApp {
                                             KeyCode::Char('w'),
                                             KeyModifiers::NONE,
                                         ) => {
-                                            tabs.focused_client()
+                                            workspaces
+                                                .focused_client()
                                                 .copy_move_word_forward();
                                             mode = InputMode::CopyMode;
                                         }
@@ -2606,7 +2971,8 @@ impl ClientApp {
                                             KeyCode::Char('e'),
                                             KeyModifiers::NONE,
                                         ) => {
-                                            tabs.focused_client()
+                                            workspaces
+                                                .focused_client()
                                                 .copy_move_word_end();
                                             mode = InputMode::CopyMode;
                                         }
@@ -2618,7 +2984,8 @@ impl ClientApp {
                                             KeyCode::Char('b'),
                                             KeyModifiers::CONTROL,
                                         ) => {
-                                            tabs.focused_client()
+                                            workspaces
+                                                .focused_client()
                                                 .copy_page_up();
                                             mode = InputMode::CopyMode;
                                         }
@@ -2630,7 +2997,8 @@ impl ClientApp {
                                             KeyCode::Char('f'),
                                             KeyModifiers::CONTROL,
                                         ) => {
-                                            tabs.focused_client()
+                                            workspaces
+                                                .focused_client()
                                                 .copy_page_down();
                                             mode = InputMode::CopyMode;
                                         }
@@ -2638,24 +3006,28 @@ impl ClientApp {
                                             KeyCode::Char('g'),
                                             KeyModifiers::NONE,
                                         ) => {
-                                            tabs.focused_client()
+                                            workspaces
+                                                .focused_client()
                                                 .copy_move_to_top();
                                             mode = InputMode::CopyMode;
                                         }
                                         (KeyCode::Char('G'), mods)
                                             if is_copy_plain_key(mods) =>
                                         {
-                                            tabs.focused_client()
+                                            workspaces
+                                                .focused_client()
                                                 .copy_move_to_bottom();
                                             mode = InputMode::CopyMode;
                                         }
                                         _ if is_copy_line_start_key(key) => {
-                                            tabs.focused_client()
+                                            workspaces
+                                                .focused_client()
                                                 .copy_move_to_line_start();
                                             mode = InputMode::CopyMode;
                                         }
                                         _ if is_copy_line_end_key(key) => {
-                                            tabs.focused_client()
+                                            workspaces
+                                                .focused_client()
                                                 .copy_move_to_line_end();
                                             mode = InputMode::CopyMode;
                                         }
@@ -2667,7 +3039,8 @@ impl ClientApp {
                                             KeyCode::Char(' '),
                                             KeyModifiers::NONE,
                                         ) => {
-                                            tabs.focused_client()
+                                            workspaces
+                                                .focused_client()
                                                 .copy_start_selection(
                                                     SelectionMode::Char,
                                                 );
@@ -2676,7 +3049,8 @@ impl ClientApp {
                                         (KeyCode::Char('V'), mods)
                                             if is_copy_plain_key(mods) =>
                                         {
-                                            tabs.focused_client()
+                                            workspaces
+                                                .focused_client()
                                                 .copy_start_selection(
                                                     SelectionMode::Line,
                                                 );
@@ -2686,7 +3060,8 @@ impl ClientApp {
                                             KeyCode::Char('v'),
                                             KeyModifiers::CONTROL,
                                         ) => {
-                                            tabs.focused_client()
+                                            workspaces
+                                                .focused_client()
                                                 .copy_start_selection(
                                                     SelectionMode::Rect,
                                                 );
@@ -2696,14 +3071,16 @@ impl ClientApp {
                                             KeyCode::Char('n'),
                                             KeyModifiers::NONE,
                                         ) => {
-                                            tabs.focused_client()
+                                            workspaces
+                                                .focused_client()
                                                 .copy_search_next();
                                             mode = InputMode::CopyMode;
                                         }
                                         (KeyCode::Char('N'), mods)
                                             if is_copy_plain_key(mods) =>
                                         {
-                                            tabs.focused_client()
+                                            workspaces
+                                                .focused_client()
                                                 .copy_search_prev();
                                             mode = InputMode::CopyMode;
                                         }
@@ -2712,7 +3089,7 @@ impl ClientApp {
                                             KeyModifiers::NONE,
                                         )
                                         | (KeyCode::Enter, _) => {
-                                            let text = tabs
+                                            let text = workspaces
                                                 .active_client()
                                                 .copy_yank_selection();
                                             if text.is_empty() {
@@ -2726,7 +3103,7 @@ impl ClientApp {
                                                 mode = InputMode::CopyMode;
                                             } else {
                                                 leave_copy_mode_client(
-                                                    tabs.focused_client(),
+                                                    workspaces.focused_client(),
                                                     &mut mode,
                                                     &mut copy_mode_confirmed,
                                                     &mut copy_mode_exit_pending,
@@ -2765,7 +3142,7 @@ impl ClientApp {
                                     match key.code {
                                         KeyCode::Enter => {
                                             if !buf.is_empty() {
-                                                let found = tabs
+                                                let found = workspaces
                                                     .active_client()
                                                     .copy_search(
                                                         buf.clone(),
@@ -2789,7 +3166,7 @@ impl ClientApp {
                                                 == KeyModifiers::NONE =>
                                         {
                                             leave_copy_mode_client(
-                                                tabs.focused_client(),
+                                                workspaces.focused_client(),
                                                 &mut mode,
                                                 &mut copy_mode_confirmed,
                                                 &mut copy_mode_exit_pending,
@@ -2872,7 +3249,8 @@ impl ClientApp {
                                     KeyCode::Enter | KeyCode::Char(' ') => {
                                         let enabled =
                                             !scroll_on_erase_in_display;
-                                        tabs.active_client()
+                                        workspaces
+                                            .active_client()
                                             .set_scroll_on_erase_in_display(
                                                 enabled,
                                             );
@@ -2889,739 +3267,61 @@ impl ClientApp {
                                     }
                                 },
 
-                                InputMode::SessionChooser {
-                                    entries,
-                                    mut selected,
-                                    mut collapsed,
-                                    mut collapsed_windows,
-                                } => {
-                                    let visible = visible_entries_full(
-                                        &entries,
-                                        &collapsed,
-                                        &collapsed_windows,
-                                    );
-                                    match key.code {
-                                        KeyCode::Esc | KeyCode::Char('q') => {
-                                            mode = InputMode::Normal;
-                                            last_drawn_counter = 0;
-                                        }
-                                        KeyCode::Up | KeyCode::Char('k') => {
-                                            if selected > 0 {
-                                                selected -= 1;
-                                            }
-                                            mode = InputMode::SessionChooser {
-                                                entries,
-                                                selected,
-                                                collapsed,
-                                                collapsed_windows,
-                                            };
-                                        }
-                                        KeyCode::Down | KeyCode::Char('j') => {
-                                            if selected + 1 < visible.len() {
-                                                selected += 1;
-                                            }
-                                            mode = InputMode::SessionChooser {
-                                                entries,
-                                                selected,
-                                                collapsed,
-                                                collapsed_windows,
-                                            };
-                                        }
-                                        KeyCode::Char('l') => {
-                                            let new_sel = if let Some(entry) =
-                                                visible.get(selected)
-                                            {
-                                                match entry {
-                                                    SessionTreeEntry::Session { name, .. } => {
-                                                        if collapsed.contains(name) {
-                                                            collapsed.remove(name);
-                                                            selected
-                                                        } else {
-                                                            // 已展开 → 跳到第一个 window
-                                                            let n = name.clone();
-                                                            let v2 = visible_entries_full(&entries, &collapsed, &collapsed_windows);
-                                                            v2.iter().position(|e| matches!(e,
-                                                                SessionTreeEntry::Window { session_name, index, .. }
-                                                                if *session_name == n && *index == 0
-                                                            )).unwrap_or(selected)
-                                                        }
-                                                    }
-                                                    SessionTreeEntry::Window { session_name, index, .. } => {
-                                                        let key_w = (session_name.clone(), *index);
-                                                        if collapsed_windows.contains(&key_w) {
-                                                            collapsed_windows.remove(&key_w);
-                                                            selected
-                                                        } else {
-                                                            // 已展开 → 跳到第一个 pane
-                                                            let sn = session_name.clone();
-                                                            let wi = *index;
-                                                            let v2 = visible_entries_full(&entries, &collapsed, &collapsed_windows);
-                                                            v2.iter().position(|e| matches!(e,
-                                                                SessionTreeEntry::Pane { session_name, window_index, index, .. }
-                                                                if *session_name == sn && *window_index == wi && *index == 0
-                                                            )).unwrap_or(selected)
-                                                        }
-                                                    }
-                                                    SessionTreeEntry::Pane { .. } => selected,
-                                                }
-                                            } else {
-                                                selected
-                                            };
-                                            let visible_len =
-                                                visible_entries_full(
-                                                    &entries,
-                                                    &collapsed,
-                                                    &collapsed_windows,
-                                                )
-                                                .len();
-                                            mode = InputMode::SessionChooser {
-                                                entries,
-                                                selected: clamp_session_chooser_selected(
-                                                    new_sel,
-                                                    visible_len,
-                                                ),
-                                                collapsed,
-                                                collapsed_windows,
-                                            };
-                                        }
-                                        KeyCode::Char('h') => {
-                                            if let Some(entry) =
-                                                visible.get(selected)
-                                            {
-                                                match entry {
-                                                    SessionTreeEntry::Session { name, .. } => {
-                                                        collapsed.insert(name.clone());
-                                                    }
-                                                    SessionTreeEntry::Window { session_name, index, .. } => {
-                                                        let key_w = (session_name.clone(), *index);
-                                                        if collapsed_windows.contains(&key_w) {
-                                                            // 已折叠 → 跳回父 session 并折叠 session
-                                                            collapsed.insert(session_name.clone());
-                                                            let sn = session_name.clone();
-                                                            let v2 = visible_entries_full(&entries, &collapsed, &collapsed_windows);
-                                                            selected = v2.iter().position(|e| matches!(e,
-                                                                SessionTreeEntry::Session { name, .. } if *name == sn
-                                                            )).unwrap_or(0);
-                                                        } else {
-                                                            // 展开 → 折叠 window
-                                                            collapsed_windows.insert(key_w);
-                                                        }
-                                                    }
-                                                    SessionTreeEntry::Pane { session_name, window_index, .. } => {
-                                                        // 跳回父 window 行
-                                                        let sn = session_name.clone();
-                                                        let wi = *window_index;
-                                                        let v2 = visible_entries_full(&entries, &collapsed, &collapsed_windows);
-                                                        selected = v2.iter().position(|e| matches!(e,
-                                                            SessionTreeEntry::Window { session_name, index, .. }
-                                                            if *session_name == sn && *index == wi
-                                                        )).unwrap_or(selected);
-                                                    }
-                                                }
-                                            }
-                                            let visible_len =
-                                                visible_entries_full(
-                                                    &entries,
-                                                    &collapsed,
-                                                    &collapsed_windows,
-                                                )
-                                                .len();
-                                            mode = InputMode::SessionChooser {
-                                                entries,
-                                                selected: clamp_session_chooser_selected(
-                                                    selected,
-                                                    visible_len,
-                                                ),
-                                                collapsed,
-                                                collapsed_windows,
-                                            };
-                                        }
-                                        KeyCode::Enter
-                                        | KeyCode::Char('\r')
-                                        | KeyCode::Char('\n') => {
-                                            if let Some(entry) =
-                                                visible.get(selected)
-                                            {
-                                                let cmd = match entry {
-                                                    SessionTreeEntry::Session { name, .. } =>
-                                                        format!("switch-client -t {}", name),
-                                                    SessionTreeEntry::Window { session_name, index, .. } =>
-                                                        format!("switch-client -t {}; select-window -t {}", session_name, index),
-                                                    SessionTreeEntry::Pane { session_name, window_index, pane_id, .. } =>
-                                                        format!("switch-client -t {}; select-window -t {}; select-pane -t %{}", session_name, window_index, pane_id),
-                                                };
-                                                tabs.active_client()
-                                                    .run_command(&cmd);
-                                            }
-                                            mode = InputMode::Normal;
-                                            last_drawn_counter = 0;
-                                        }
-                                        _ => {
-                                            mode = InputMode::SessionChooser {
-                                                entries,
-                                                selected,
-                                                collapsed,
-                                                collapsed_windows,
-                                            };
-                                        }
-                                    }
-                                }
-
-                                InputMode::TabQuickSwitch {
-                                    mut code,
-                                    error,
-                                } => match (key.code, key.modifiers) {
-                                    (KeyCode::Esc, _) => {
-                                        mode = InputMode::Normal;
-                                        last_drawn_counter = 0;
-                                    }
-                                    (KeyCode::Backspace, _) => {
-                                        code.pop();
-                                        mode = InputMode::TabQuickSwitch {
-                                            code,
-                                            error: None,
-                                        };
-                                    }
-                                    (KeyCode::Enter, _) => {
-                                        let (cols, rows) = terminal::size()
-                                            .unwrap_or((80, 24));
-                                        match select_tab_by_code(
-                                            &mut tabs,
-                                            &code,
-                                            server_content_size(cols, rows),
-                                        ) {
-                                            Ok(()) => {
-                                                mode = InputMode::Normal;
-                                                copy_mode_confirmed = false;
-                                                mouse_select = None;
-                                                last_drawn_counter = 0;
-                                            }
-                                            Err(e) => {
-                                                mode =
-                                                    InputMode::TabQuickSwitch {
-                                                        code: String::new(),
-                                                        error: Some(e),
-                                                    };
-                                            }
-                                        }
-                                    }
-                                    (KeyCode::Char(c), modifiers)
-                                        if !modifiers.intersects(
-                                            KeyModifiers::CONTROL
-                                                | KeyModifiers::ALT,
-                                        ) =>
-                                    {
-                                        if code.len() < 2
-                                            && c.is_ascii_alphabetic()
-                                        {
-                                            code.push(c.to_ascii_uppercase());
-                                        }
-                                        mode = InputMode::TabQuickSwitch {
-                                            code,
-                                            error: None,
-                                        };
-                                    }
-                                    _ => {
-                                        mode = InputMode::TabQuickSwitch {
-                                            code,
-                                            error,
-                                        };
-                                    }
-                                },
-
-                                InputMode::TabChooser {
-                                    mut query,
-                                    mut cursor,
-                                    mut selected,
-                                    mut search_active,
-                                } => match (key.code, key.modifiers) {
-                                    (KeyCode::Esc, _) if search_active => {
-                                        mode = default_tab_chooser_mode(&tabs);
-                                    }
-                                    (KeyCode::Esc, _)
-                                    | (
-                                        KeyCode::Char('q'),
-                                        KeyModifiers::NONE,
-                                    ) => {
-                                        mode = InputMode::Normal;
-                                        last_drawn_counter = 0;
-                                    }
-                                    (KeyCode::Char('/'), _)
-                                    | (KeyCode::Char('?'), _) => {
-                                        query.clear();
-                                        cursor = 0;
-                                        selected = 0;
-                                        search_active = true;
-                                        mode = InputMode::TabChooser {
-                                            query,
-                                            cursor,
-                                            selected,
-                                            search_active,
-                                        };
-                                    }
-                                    (KeyCode::Enter, _) => {
-                                        let tab_views =
-                                            tabs.tab_chooser_views();
-                                        let matches = matching_tab_indices(
-                                            &tab_views, &query,
-                                        );
-                                        if let Some(&tab_index) =
-                                            matches.get(selected)
-                                        {
-                                            let tab =
-                                                tab_views[tab_index].clone();
-                                            let (cols, rows) = terminal::size()
-                                                .unwrap_or((80, 24));
-                                            let size =
-                                                server_content_size(cols, rows);
-                                            let switch_result: Result<
-                                                (),
-                                                String,
-                                            > = if tab.visible {
-                                                if tabs.select_socket(
-                                                    &tab.socket_name,
-                                                ) {
-                                                    Ok(())
-                                                } else {
-                                                    Err("failed to switch tab"
-                                                        .to_string())
-                                                }
-                                            } else {
-                                                tabs.show_socket_with_code(
-                                                        &tab.socket_name,
-                                                        size,
-                                                        Some(&tab.code),
-                                                    )
-                                                    .map_err(|e| {
-                                                        format!(
-                                                            "show tab failed: {}",
-                                                            e
-                                                        )
-                                                    })
-                                                    .and_then(|()| {
-                                                        if tabs.select_socket(
-                                                            &tab.socket_name,
-                                                        ) {
-                                                            Ok(())
-                                                        } else {
-                                                            Err(
-                                                                "tab not found after show"
-                                                                    .to_string(),
-                                                            )
-                                                        }
-                                                    })
-                                            };
-                                            match switch_result {
-                                                Ok(()) => {
-                                                    tabs.active_client()
-                                                        .resize(size);
-                                                    mode = InputMode::Normal;
-                                                    copy_mode_confirmed = false;
-                                                    mouse_select = None;
-                                                    last_drawn_counter = 0;
-                                                }
-                                                Err(message) => {
-                                                    status_notice = Some((
-                                                        message,
-                                                        Instant::now()
-                                                            + Duration::from_secs(
-                                                                3,
-                                                            ),
-                                                    ));
-                                                    mode =
-                                                        InputMode::TabChooser {
-                                                            query,
-                                                            cursor,
-                                                            selected,
-                                                            search_active,
-                                                        };
-                                                }
-                                            }
-                                        } else {
-                                            mode = InputMode::TabChooser {
-                                                query,
-                                                cursor,
-                                                selected,
-                                                search_active,
-                                            };
-                                        }
-                                    }
-                                    (KeyCode::Char('R'), _) => {
-                                        let tab_views =
-                                            tabs.tab_chooser_views();
-                                        let matches = matching_tab_indices(
-                                            &tab_views, &query,
-                                        );
-                                        if let Some(&tab_index) =
-                                            matches.get(selected)
-                                        {
-                                            let tab = &tab_views[tab_index];
-                                            if tab.visible
-                                                && tabs.select_socket(
-                                                    &tab.socket_name,
-                                                )
-                                            {
-                                                mode =
-                                                    rename_tab_mode_for_active(
-                                                        &tabs, true,
-                                                    );
-                                            } else {
-                                                status_notice = Some((
-                                                    "show the tab before renaming".to_string(),
-                                                    Instant::now() + Duration::from_secs(3),
-                                                ));
-                                                mode = InputMode::TabChooser {
-                                                    query,
-                                                    cursor,
-                                                    selected,
-                                                    search_active,
-                                                };
-                                            }
-                                        } else {
-                                            mode = InputMode::TabChooser {
-                                                query,
-                                                cursor,
-                                                selected,
-                                                search_active,
-                                            };
-                                        }
-                                    }
-                                    (KeyCode::Char('K'), _) => {
-                                        let tab_views =
-                                            tabs.tab_chooser_views();
-                                        let matches = matching_tab_indices(
-                                            &tab_views, &query,
-                                        );
-                                        if let Some(&tab_index) =
-                                            matches.get(selected)
-                                        {
-                                            let tab = &tab_views[tab_index];
-                                            mode = InputMode::ConfirmKillTab {
-                                                socket_name: tab
-                                                    .socket_name
-                                                    .clone(),
-                                                label: tab_label(tab),
-                                                return_to_tab_chooser: true,
-                                            };
-                                        } else {
-                                            mode = InputMode::TabChooser {
-                                                query,
-                                                cursor,
-                                                selected,
-                                                search_active,
-                                            };
-                                        }
-                                    }
-                                    (KeyCode::Char(' '), _) => {
-                                        let tab_views =
-                                            tabs.tab_chooser_views();
-                                        let matches = matching_tab_indices(
-                                            &tab_views, &query,
-                                        );
-                                        if let Some(&tab_index) =
-                                            matches.get(selected)
-                                        {
-                                            let tab =
-                                                tab_views[tab_index].clone();
-                                            let (cols, rows) = terminal::size()
-                                                .unwrap_or((80, 24));
-                                            if tab.visible {
-                                                let active_socket_before =
-                                                    tabs.active_socket_name();
-                                                match tabs.hide_socket(
-                                                    &tab.socket_name,
-                                                ) {
-                                                    Ok(()) => {
-                                                        if tabs
-                                                            .active_socket_name()
-                                                            != active_socket_before
-                                                        {
-                                                            request_active_tab_full_refresh(
-                                                                &tabs,
-                                                            );
-                                                        }
-                                                        status_notice = Some((
-                                                            format!("hidden {}", tab_label(&tab)),
-                                                            Instant::now() + Duration::from_secs(3),
-                                                        ));
-                                                    }
-                                                    Err(e) => {
-                                                        status_notice = Some((
-                                                            e,
-                                                            Instant::now() + Duration::from_secs(3),
-                                                        ));
-                                                    }
-                                                }
-                                            } else {
-                                                match tabs.show_socket(
-                                                    &tab.socket_name,
-                                                    server_content_size(
-                                                        cols, rows,
-                                                    ),
-                                                ) {
-                                                    Ok(()) => {
-                                                        status_notice = Some((
-                                                            format!("shown {}", tab_label(&tab)),
-                                                            Instant::now() + Duration::from_secs(3),
-                                                        ));
-                                                    }
-                                                    Err(e) => {
-                                                        status_notice = Some((
-                                                            format!("show tab failed: {}", e),
-                                                            Instant::now() + Duration::from_secs(3),
-                                                        ));
-                                                    }
-                                                }
-                                            }
-                                            last_drawn_counter = 0;
-                                        }
-                                        let len = matching_tab_indices(
-                                            &tabs.tab_chooser_views(),
-                                            &query,
-                                        )
-                                        .len();
-                                        if selected >= len {
-                                            selected = len.saturating_sub(1);
-                                        }
-                                        mode = InputMode::TabChooser {
-                                            query,
-                                            cursor,
-                                            selected,
-                                            search_active,
-                                        };
-                                    }
-                                    (KeyCode::Up, _) => {
-                                        selected = selected.saturating_sub(1);
-                                        mode = InputMode::TabChooser {
-                                            query,
-                                            cursor,
-                                            selected,
-                                            search_active,
-                                        };
-                                    }
-                                    (
-                                        KeyCode::Char('k'),
-                                        KeyModifiers::NONE,
-                                    ) if !search_active => {
-                                        selected = selected.saturating_sub(1);
-                                        mode = InputMode::TabChooser {
-                                            query,
-                                            cursor,
-                                            selected,
-                                            search_active,
-                                        };
-                                    }
-                                    (KeyCode::Char('k'), m)
-                                        if search_active
-                                            && m.contains(
-                                                KeyModifiers::CONTROL,
-                                            ) =>
-                                    {
-                                        selected = selected.saturating_sub(1);
-                                        mode = InputMode::TabChooser {
-                                            query,
-                                            cursor,
-                                            selected,
-                                            search_active,
-                                        };
-                                    }
-                                    (KeyCode::Down, _) => {
-                                        let tab_views =
-                                            tabs.tab_chooser_views();
-                                        let len = matching_tab_indices(
-                                            &tab_views, &query,
-                                        )
-                                        .len();
-                                        if selected + 1 < len {
-                                            selected += 1;
-                                        }
-                                        mode = InputMode::TabChooser {
-                                            query,
-                                            cursor,
-                                            selected,
-                                            search_active,
-                                        };
-                                    }
-                                    (
-                                        KeyCode::Char('j'),
-                                        KeyModifiers::NONE,
-                                    ) if !search_active => {
-                                        let tab_views =
-                                            tabs.tab_chooser_views();
-                                        let len = matching_tab_indices(
-                                            &tab_views, &query,
-                                        )
-                                        .len();
-                                        if selected + 1 < len {
-                                            selected += 1;
-                                        }
-                                        mode = InputMode::TabChooser {
-                                            query,
-                                            cursor,
-                                            selected,
-                                            search_active,
-                                        };
-                                    }
-                                    (KeyCode::Char('j'), m)
-                                        if search_active
-                                            && m.contains(
-                                                KeyModifiers::CONTROL,
-                                            ) =>
-                                    {
-                                        let tab_views =
-                                            tabs.tab_chooser_views();
-                                        let len = matching_tab_indices(
-                                            &tab_views, &query,
-                                        )
-                                        .len();
-                                        if selected + 1 < len {
-                                            selected += 1;
-                                        }
-                                        mode = InputMode::TabChooser {
-                                            query,
-                                            cursor,
-                                            selected,
-                                            search_active,
-                                        };
-                                    }
-                                    (KeyCode::Backspace, _)
-                                        if search_active =>
-                                    {
-                                        if cursor > 0 {
-                                            let bp = char_byte_pos(
-                                                &query,
-                                                cursor - 1,
-                                            );
-                                            let ep =
-                                                char_byte_pos(&query, cursor);
-                                            query.drain(bp..ep);
-                                            cursor -= 1;
-                                            selected = 0;
-                                        }
-                                        mode = InputMode::TabChooser {
-                                            query,
-                                            cursor,
-                                            selected,
-                                            search_active,
-                                        };
-                                    }
-                                    (KeyCode::Left, _) if search_active => {
-                                        if cursor > 0 {
-                                            cursor -= 1;
-                                        }
-                                        mode = InputMode::TabChooser {
-                                            query,
-                                            cursor,
-                                            selected,
-                                            search_active,
-                                        };
-                                    }
-                                    (KeyCode::Right, _) if search_active => {
-                                        let m = query.chars().count();
-                                        if cursor < m {
-                                            cursor += 1;
-                                        }
-                                        mode = InputMode::TabChooser {
-                                            query,
-                                            cursor,
-                                            selected,
-                                            search_active,
-                                        };
-                                    }
-                                    (
-                                        KeyCode::Char(c),
-                                        KeyModifiers::NONE
-                                        | KeyModifiers::SHIFT,
-                                    ) if search_active => {
-                                        let bp = char_byte_pos(&query, cursor);
-                                        query.insert(bp, c);
-                                        cursor += 1;
-                                        mode = InputMode::TabChooser {
-                                            query,
-                                            cursor,
-                                            selected: 0,
-                                            search_active,
-                                        };
-                                    }
-                                    _ => {
-                                        mode = InputMode::TabChooser {
-                                            query,
-                                            cursor,
-                                            selected,
-                                            search_active,
-                                        };
-                                    }
-                                },
-
-                                InputMode::ConfirmKillTab {
-                                    socket_name,
-                                    label,
-                                    return_to_tab_chooser,
-                                } => {
+                                InputMode::ConfirmNavigationClose { entry } => {
                                     match key.code {
                                         KeyCode::Char('y')
                                         | KeyCode::Char('Y') => {
-                                            let active_socket_before =
-                                                tabs.active_socket_name();
-                                            match tabs.kill_socket(&socket_name)
-                                            {
+                                            let (cols, rows) = terminal::size()
+                                                .unwrap_or((80, 24));
+                                            match close_navigation_entry(
+                                                &mut workspaces,
+                                                &mut remotes,
+                                                &entry,
+                                                server_content_size(
+                                                    cols,
+                                                    rows,
+                                                    sidebar_visible,
+                                                ),
+                                            ) {
                                                 Ok(empty) => {
                                                     if empty {
                                                         break;
                                                     }
-                                                    if tabs.active_socket_name()
-                                                        != active_socket_before
-                                                    {
-                                                        request_active_tab_full_refresh(
-                                                            &tabs,
-                                                        );
-                                                    }
-                                                    mode =
-                                                        if return_to_tab_chooser
-                                                        {
-                                                            default_tab_chooser_mode(&tabs)
-                                                        } else {
-                                                            InputMode::Normal
-                                                        };
-                                                    copy_mode_confirmed = false;
-                                                    mouse_select = None;
-                                                    last_drawn_counter = 0;
+                                                    workspaces.invalidate_active_navigation_tree();
+                                                    request_active_workspace_full_refresh(&workspaces);
                                                     status_notice = Some((
-                                                    format!("killed {}", label),
-                                                    Instant::now() + Duration::from_secs(3),
-                                                ));
+                                                        format!(
+                                                            "closed {} '{}'",
+                                                            navigation_kind_label(entry.kind),
+                                                            entry.label
+                                                        ),
+                                                        Instant::now()
+                                                            + Duration::from_secs(3),
+                                                    ));
                                                 }
-                                                Err(e) => {
-                                                    mode =
-                                                        if return_to_tab_chooser
-                                                        {
-                                                            default_tab_chooser_mode(&tabs)
-                                                        } else {
-                                                            InputMode::Normal
-                                                        };
+                                                Err(error) => {
                                                     status_notice = Some((
-                                                    format!("kill tab failed: {}", e),
-                                                    Instant::now() + Duration::from_secs(3),
-                                                ));
+                                                        error,
+                                                        Instant::now()
+                                                            + Duration::from_secs(4),
+                                                    ));
                                                 }
                                             }
+                                            mode = InputMode::Navigator;
+                                            copy_mode_confirmed = false;
+                                            mouse_select = None;
+                                            last_drawn_counter = 0;
                                         }
                                         KeyCode::Esc
                                         | KeyCode::Char('n')
                                         | KeyCode::Char('N')
                                         | KeyCode::Enter => {
-                                            mode = if return_to_tab_chooser {
-                                                default_tab_chooser_mode(&tabs)
-                                            } else {
-                                                InputMode::Normal
-                                            };
+                                            mode = InputMode::Navigator;
                                             last_drawn_counter = 0;
                                         }
                                         _ => {
-                                            mode = InputMode::ConfirmKillTab {
-                                                socket_name,
-                                                label,
-                                                return_to_tab_chooser,
+                                            mode = InputMode::ConfirmNavigationClose {
+                                                entry,
                                             };
                                         }
                                     }
@@ -3630,20 +3330,32 @@ impl ClientApp {
                                 InputMode::RenameWindow {
                                     mut buf,
                                     mut cursor,
+                                    return_to_navigator,
                                 } => match key.code {
                                     KeyCode::Enter => {
                                         if !buf.is_empty() {
-                                            tabs.active_client().run_command(
-                                                &format!(
-                                                    "rename-window {}",
+                                            workspaces
+                                                .active_client()
+                                                .run_command(&format!(
+                                                    "rename-window -- {}",
                                                     shell_quote(&buf)
-                                                ),
-                                            );
+                                                ));
                                         }
-                                        mode = InputMode::Normal;
+                                        workspaces
+                                            .invalidate_active_navigation_tree(
+                                            );
+                                        mode = if return_to_navigator {
+                                            InputMode::Navigator
+                                        } else {
+                                            InputMode::Normal
+                                        };
                                     }
                                     KeyCode::Esc => {
-                                        mode = InputMode::Normal;
+                                        mode = if return_to_navigator {
+                                            InputMode::Navigator
+                                        } else {
+                                            InputMode::Normal
+                                        };
                                     }
                                     KeyCode::Backspace => {
                                         if cursor > 0 {
@@ -3657,6 +3369,7 @@ impl ClientApp {
                                         mode = InputMode::RenameWindow {
                                             buf,
                                             cursor,
+                                            return_to_navigator,
                                         };
                                     }
                                     KeyCode::Left => {
@@ -3666,6 +3379,7 @@ impl ClientApp {
                                         mode = InputMode::RenameWindow {
                                             buf,
                                             cursor,
+                                            return_to_navigator,
                                         };
                                     }
                                     KeyCode::Right => {
@@ -3676,6 +3390,7 @@ impl ClientApp {
                                         mode = InputMode::RenameWindow {
                                             buf,
                                             cursor,
+                                            return_to_navigator,
                                         };
                                     }
                                     KeyCode::Char(c)
@@ -3690,12 +3405,14 @@ impl ClientApp {
                                         mode = InputMode::RenameWindow {
                                             buf,
                                             cursor,
+                                            return_to_navigator,
                                         };
                                     }
                                     _ => {
                                         mode = InputMode::RenameWindow {
                                             buf,
                                             cursor,
+                                            return_to_navigator,
                                         };
                                     }
                                 },
@@ -3703,20 +3420,32 @@ impl ClientApp {
                                 InputMode::RenameSession {
                                     mut buf,
                                     mut cursor,
+                                    return_to_navigator,
                                 } => match key.code {
                                     KeyCode::Enter => {
                                         if !buf.is_empty() {
-                                            tabs.active_client().run_command(
-                                                &format!(
-                                                    "rename-session {}",
+                                            workspaces
+                                                .active_client()
+                                                .run_command(&format!(
+                                                    "rename-session -- {}",
                                                     shell_quote(&buf)
-                                                ),
-                                            );
+                                                ));
                                         }
-                                        mode = InputMode::Normal;
+                                        workspaces
+                                            .invalidate_active_navigation_tree(
+                                            );
+                                        mode = if return_to_navigator {
+                                            InputMode::Navigator
+                                        } else {
+                                            InputMode::Normal
+                                        };
                                     }
                                     KeyCode::Esc => {
-                                        mode = InputMode::Normal;
+                                        mode = if return_to_navigator {
+                                            InputMode::Navigator
+                                        } else {
+                                            InputMode::Normal
+                                        };
                                     }
                                     KeyCode::Backspace => {
                                         if cursor > 0 {
@@ -3730,6 +3459,7 @@ impl ClientApp {
                                         mode = InputMode::RenameSession {
                                             buf,
                                             cursor,
+                                            return_to_navigator,
                                         };
                                     }
                                     KeyCode::Left => {
@@ -3739,6 +3469,7 @@ impl ClientApp {
                                         mode = InputMode::RenameSession {
                                             buf,
                                             cursor,
+                                            return_to_navigator,
                                         };
                                     }
                                     KeyCode::Right => {
@@ -3749,6 +3480,7 @@ impl ClientApp {
                                         mode = InputMode::RenameSession {
                                             buf,
                                             cursor,
+                                            return_to_navigator,
                                         };
                                     }
                                     KeyCode::Char(c)
@@ -3763,212 +3495,131 @@ impl ClientApp {
                                         mode = InputMode::RenameSession {
                                             buf,
                                             cursor,
+                                            return_to_navigator,
                                         };
                                     }
                                     _ => {
                                         mode = InputMode::RenameSession {
                                             buf,
                                             cursor,
+                                            return_to_navigator,
                                         };
                                     }
                                 },
 
-                                InputMode::RenameTab {
-                                    mut code,
-                                    mut code_cursor,
-                                    mut title,
-                                    mut title_cursor,
-                                    mut editing_code,
-                                    return_to_tab_chooser,
-                                    ..
-                                } => {
-                                    match key.code {
-                                        KeyCode::Enter => {
-                                            if editing_code {
-                                                editing_code = false;
-                                                mode = InputMode::RenameTab {
-                                                    code,
-                                                    code_cursor,
-                                                    title,
-                                                    title_cursor,
-                                                    editing_code,
-                                                    error: None,
-                                                    return_to_tab_chooser,
-                                                };
-                                            } else {
-                                                match tabs.set_active_metadata(
-                                                    &code,
-                                                    title.trim().to_string(),
-                                                ) {
-                                                    Ok(()) => {
-                                                        mode = if return_to_tab_chooser {
-                                                        default_tab_chooser_mode(
-                                                            &tabs,
-                                                        )
-                                                    } else {
-                                                        InputMode::Normal
-                                                    };
-                                                        last_drawn_counter = 0;
-                                                    }
-                                                    Err(error) => {
-                                                        mode =
-                                                        InputMode::RenameTab {
-                                                            code,
-                                                            code_cursor,
-                                                            title,
-                                                            title_cursor,
-                                                            editing_code: true,
-                                                            error: Some(error),
-                                                            return_to_tab_chooser,
-                                                        };
-                                                    }
-                                                }
-                                            }
+                                InputMode::RenamePane {
+                                    mut buf,
+                                    mut cursor,
+                                    return_to_navigator,
+                                } => match key.code {
+                                    KeyCode::Enter => {
+                                        if !buf.is_empty() {
+                                            workspaces
+                                                .active_client()
+                                                .run_command(&format!(
+                                                    "rename-pane -- {}",
+                                                    shell_quote(&buf)
+                                                ));
                                         }
-                                        KeyCode::Esc => {
-                                            mode = if return_to_tab_chooser {
-                                                default_tab_chooser_mode(&tabs)
-                                            } else {
-                                                InputMode::Normal
-                                            };
-                                            last_drawn_counter = 0;
-                                        }
-                                        KeyCode::Tab | KeyCode::BackTab => {
-                                            editing_code = !editing_code;
-                                            mode = InputMode::RenameTab {
-                                                code,
-                                                code_cursor,
-                                                title,
-                                                title_cursor,
-                                                editing_code,
-                                                error: None,
-                                                return_to_tab_chooser,
-                                            };
-                                        }
-                                        KeyCode::Backspace => {
-                                            if editing_code {
-                                                if code_cursor > 0 {
-                                                    let bp = char_byte_pos(
-                                                        &code,
-                                                        code_cursor - 1,
-                                                    );
-                                                    let ep = char_byte_pos(
-                                                        &code,
-                                                        code_cursor,
-                                                    );
-                                                    code.drain(bp..ep);
-                                                    code_cursor -= 1;
-                                                }
-                                            } else if title_cursor > 0 {
-                                                let bp = char_byte_pos(
-                                                    &title,
-                                                    title_cursor - 1,
-                                                );
-                                                let ep = char_byte_pos(
-                                                    &title,
-                                                    title_cursor,
-                                                );
-                                                title.drain(bp..ep);
-                                                title_cursor -= 1;
-                                            }
-                                            mode = InputMode::RenameTab {
-                                                code,
-                                                code_cursor,
-                                                title,
-                                                title_cursor,
-                                                editing_code,
-                                                error: None,
-                                                return_to_tab_chooser,
-                                            };
-                                        }
-                                        KeyCode::Left => {
-                                            if editing_code {
-                                                code_cursor = code_cursor
-                                                    .saturating_sub(1);
-                                            } else {
-                                                title_cursor = title_cursor
-                                                    .saturating_sub(1);
-                                            }
-                                            mode = InputMode::RenameTab {
-                                                code,
-                                                code_cursor,
-                                                title,
-                                                title_cursor,
-                                                editing_code,
-                                                error: None,
-                                                return_to_tab_chooser,
-                                            };
-                                        }
-                                        KeyCode::Right => {
-                                            if editing_code {
-                                                let m = code.chars().count();
-                                                if code_cursor < m {
-                                                    code_cursor += 1;
-                                                }
-                                            } else {
-                                                let m = title.chars().count();
-                                                if title_cursor < m {
-                                                    title_cursor += 1;
-                                                }
-                                            }
-                                            mode = InputMode::RenameTab {
-                                                code,
-                                                code_cursor,
-                                                title,
-                                                title_cursor,
-                                                editing_code,
-                                                error: None,
-                                                return_to_tab_chooser,
-                                            };
-                                        }
-                                        KeyCode::Char(c)
-                                            if key.modifiers
-                                                == KeyModifiers::NONE
-                                                || key.modifiers
-                                                    == KeyModifiers::SHIFT =>
-                                        {
-                                            if editing_code {
-                                                let c = c.to_ascii_uppercase();
-                                                let bp = char_byte_pos(
-                                                    &code,
-                                                    code_cursor,
-                                                );
-                                                code.insert(bp, c);
-                                                code_cursor += 1;
-                                            } else {
-                                                let bp = char_byte_pos(
-                                                    &title,
-                                                    title_cursor,
-                                                );
-                                                title.insert(bp, c);
-                                                title_cursor += 1;
-                                            }
-                                            mode = InputMode::RenameTab {
-                                                code,
-                                                code_cursor,
-                                                title,
-                                                title_cursor,
-                                                editing_code,
-                                                error: None,
-                                                return_to_tab_chooser,
-                                            };
-                                        }
-                                        _ => {
-                                            mode = InputMode::RenameTab {
-                                                code,
-                                                code_cursor,
-                                                title,
-                                                title_cursor,
-                                                editing_code,
-                                                error: None,
-                                                return_to_tab_chooser,
-                                            };
-                                        }
+                                        workspaces
+                                            .invalidate_active_navigation_tree(
+                                            );
+                                        mode = if return_to_navigator {
+                                            InputMode::Navigator
+                                        } else {
+                                            InputMode::Normal
+                                        };
                                     }
-                                }
+                                    KeyCode::Esc => {
+                                        mode = if return_to_navigator {
+                                            InputMode::Navigator
+                                        } else {
+                                            InputMode::Normal
+                                        };
+                                    }
+                                    KeyCode::Backspace => {
+                                        if cursor > 0 {
+                                            let bp =
+                                                char_byte_pos(&buf, cursor - 1);
+                                            let ep =
+                                                char_byte_pos(&buf, cursor);
+                                            buf.drain(bp..ep);
+                                            cursor -= 1;
+                                        }
+                                        mode = InputMode::RenamePane {
+                                            buf,
+                                            cursor,
+                                            return_to_navigator,
+                                        };
+                                    }
+                                    KeyCode::Left => {
+                                        cursor = cursor.saturating_sub(1);
+                                        mode = InputMode::RenamePane {
+                                            buf,
+                                            cursor,
+                                            return_to_navigator,
+                                        };
+                                    }
+                                    KeyCode::Right => {
+                                        cursor = (cursor + 1)
+                                            .min(buf.chars().count());
+                                        mode = InputMode::RenamePane {
+                                            buf,
+                                            cursor,
+                                            return_to_navigator,
+                                        };
+                                    }
+                                    KeyCode::Char(c)
+                                        if key.modifiers
+                                            == KeyModifiers::NONE
+                                            || key.modifiers
+                                                == KeyModifiers::SHIFT =>
+                                    {
+                                        let bp = char_byte_pos(&buf, cursor);
+                                        buf.insert(bp, c);
+                                        cursor += 1;
+                                        mode = InputMode::RenamePane {
+                                            buf,
+                                            cursor,
+                                            return_to_navigator,
+                                        };
+                                    }
+                                    _ => {
+                                        mode = InputMode::RenamePane {
+                                            buf,
+                                            cursor,
+                                            return_to_navigator,
+                                        };
+                                    }
+                                },
                             }
                         }
                         Event::Mouse(mouse) => {
+                            let all_help =
+                                matches!(mode, InputMode::ShortcutsHelp { .. });
+                            if let InputMode::NavigationHelp { scroll }
+                            | InputMode::ShortcutsHelp { scroll, .. } =
+                                &mut mode
+                            {
+                                let area = ratatui::layout::Rect::new(
+                                    0, 0, cols, rows,
+                                );
+                                let max_scroll = if all_help {
+                                    shortcuts_help_max_scroll(area)
+                                } else {
+                                    navigation_help_max_scroll(area)
+                                };
+                                *scroll = match mouse.kind {
+                                    event::MouseEventKind::ScrollDown => {
+                                        scroll.saturating_add(3).min(max_scroll)
+                                    }
+                                    event::MouseEventKind::ScrollUp => {
+                                        scroll.saturating_sub(3)
+                                    }
+                                    _ => *scroll,
+                                };
+                                continue;
+                            }
                             last_mouse_pos = Some((mouse.column, mouse.row));
                             if let Err(err) = refresh_mouse_pointer(
                                 terminal.backend_mut(),
@@ -3981,6 +3632,7 @@ impl ClientApp {
                                 hide_status,
                                 has_overlay || has_prompt,
                                 true,
+                                sidebar_visible,
                             ) {
                                 log_client(&format!(
                                     "failed to set mouse pointer on move: {err}"
@@ -3988,56 +3640,144 @@ impl ClientApp {
                             }
                             if mode == InputMode::Prefix {
                                 prefix_from_copy_mode = false;
+                                prefix_from_navigator = false;
                             }
                             let (cols, rows) =
                                 terminal::size().unwrap_or((80, 24));
-                            if mouse.row == 0
-                                && !matches!(mode, InputMode::TabChooser { .. })
+                            let areas =
+                                workspace_areas(cols, rows, sidebar_visible);
+                            let navigation_area = if navigation_popup {
+                                navigation_popup_content_rect(
+                                    ratatui::layout::Rect::new(
+                                        0, 0, cols, rows,
+                                    ),
+                                )
+                            } else {
+                                areas.sidebar
+                            };
+                            if navigation_popup && mode != InputMode::Navigator
                             {
+                                continue;
+                            }
+                            if navigation_area.contains(
+                                ratatui::layout::Position::new(
+                                    mouse.column,
+                                    mouse.row,
+                                ),
+                            ) {
                                 mouse_select = None;
                                 mouse_drag_origin = None;
                                 last_mouse_click = None;
                                 if matches!(
                                     mouse.kind,
+                                    MouseEventKind::ScrollDown
+                                        | MouseEventKind::ScrollUp
+                                ) {
+                                    for _ in 0..3 {
+                                        if mouse.kind
+                                            == MouseEventKind::ScrollDown
+                                        {
+                                            navigation_state.select_next(
+                                                &navigation_entries,
+                                            );
+                                        } else {
+                                            navigation_state.select_prev(
+                                                &navigation_entries,
+                                            );
+                                        }
+                                    }
+                                    last_drawn_counter = 0;
+                                }
+                                if matches!(
+                                    mouse.kind,
                                     MouseEventKind::Down(MouseButton::Left)
                                 ) {
-                                    let tab_views = tabs.tab_views();
-                                    match tab_bar_hit(
-                                        &tab_views,
-                                        cols,
-                                        mouse.column,
-                                        tabs.tab_bar_offset,
-                                    ) {
-                                        Some(ClientTabBarHit::Tab(index)) => {
-                                            if tabs.select(index) {
-                                                tabs.active_client().resize(
-                                                    server_content_size(
-                                                        cols, rows,
-                                                    ),
-                                                );
-                                                mode = InputMode::Normal;
-                                                copy_mode_confirmed = false;
-                                                last_drawn_counter = 0;
+                                    if let Some(index) =
+                                        navigation::sidebar_entry_at(
+                                            navigation_state.selected,
+                                            navigation_entries.len(),
+                                            navigation_area.y,
+                                            navigation_area.height,
+                                            mouse.row,
+                                        )
+                                    {
+                                        let entry =
+                                            navigation_entries[index].clone();
+                                        navigation_state.select_index(
+                                            &navigation_entries,
+                                            index,
+                                        );
+                                        mode = InputMode::Navigator;
+                                        if navigation::disclosure_hit(
+                                            &entry,
+                                            navigation_area.x,
+                                            mouse.column,
+                                        ) {
+                                            navigation_state.toggle_selected(
+                                                &navigation_entries,
+                                            );
+                                        } else {
+                                            match open_navigation_entry(
+                                                &mut workspaces,
+                                                &mut remotes,
+                                                &mut navigation_state,
+                                                &navigation_entries,
+                                                &entry,
+                                                server_content_size(
+                                                    cols, rows,
+
+sidebar_visible,
+),
+                                            ) {
+                                                NavigationOpenResult::Opened => {
+                                                    mode = InputMode::Normal;
+                                                    copy_mode_confirmed = false;
+                                                    request_active_workspace_full_refresh(
+                                                        &workspaces,
+                                                    );
+                                                }
+                                                NavigationOpenResult::Probing(
+                                                    name,
+                                                ) => {
+                                                    status_notice = Some((
+                                                        format!(
+                                                            "probing {name}…"
+                                                        ),
+                                                        Instant::now()
+                                                            + Duration::from_secs(
+                                                                6,
+                                                            ),
+                                                    ));
+                                                }
+                                                NavigationOpenResult::Failed(
+                                                    error,
+                                                ) => {
+                                                    status_notice = Some((
+                                                        error,
+                                                        Instant::now()
+                                                            + Duration::from_secs(
+                                                                4,
+                                                            ),
+                                                    ));
+                                                }
+                                                NavigationOpenResult::Toggled => {}
                                             }
                                         }
-                                        Some(
-                                            ClientTabBarHit::OverflowStart,
-                                        ) => {
-                                            if tabs.scroll_tab_bar_back() {
-                                                last_drawn_counter = 0;
-                                            }
-                                        }
-                                        Some(ClientTabBarHit::OverflowEnd) => {
-                                            mode = InputMode::TabChooser {
-                                                query: String::new(),
-                                                cursor: 0,
-                                                selected: tabs.active_index(),
-                                                search_active: false,
-                                            };
-                                            last_drawn_counter = 0;
-                                        }
-                                        None => {}
+                                        last_drawn_counter = 0;
                                     }
+                                }
+                                continue;
+                            }
+                            // The floating tree owns mouse input; never send
+                            // clicks or wheel events to a covered terminal pane.
+                            if navigation_popup {
+                                if matches!(
+                                    mouse.kind,
+                                    MouseEventKind::Down(MouseButton::Left)
+                                ) {
+                                    navigation_popup = false;
+                                    mode = navigation_popup_return_mode.clone();
+                                    last_drawn_counter = 0;
                                 }
                                 continue;
                             }
@@ -4059,11 +3799,16 @@ impl ClientApp {
                                                 if let Some(win_index) =
                                                     status_window_tab_hit(
                                                         status,
-                                                        cols,
-                                                        mouse.column,
+                                                        areas.frame.width,
+                                                        mouse
+                                                            .column
+                                                            .saturating_sub(
+                                                                areas.frame.x,
+                                                            ),
                                                     )
                                                 {
-                                                    tabs.focused_client()
+                                                    workspaces
+                                                        .focused_client()
                                                         .run_command(&format!(
                                                         "select-window -t {}",
                                                         win_index
@@ -4110,14 +3855,14 @@ impl ClientApp {
                                             MouseEventKind::Down(
                                                 MouseButton::Left
                                             )
-                                        ) && tabs
-                                            .focus_at(
+                                        )
+                                            && workspaces.focus_at(
                                                 mouse.column,
                                                 mouse.row,
                                                 hide_borders,
                                             );
                                         if !focused_other_pane {
-                                            tabs.send_mouse_at(
+                                            workspaces.send_mouse_at(
                                                 mouse,
                                                 hide_borders,
                                             );
@@ -4125,7 +3870,7 @@ impl ClientApp {
                                     } else {
                                         match mouse.kind {
                                             MouseEventKind::ScrollUp => {
-                                                tabs.scroll_at(
+                                                workspaces.scroll_at(
                                                     mouse,
                                                     hide_borders,
                                                     "up",
@@ -4137,7 +3882,7 @@ impl ClientApp {
                                                 last_drawn_counter = 0;
                                             }
                                             MouseEventKind::ScrollDown => {
-                                                tabs.scroll_at(
+                                                workspaces.scroll_at(
                                                     mouse,
                                                     hide_borders,
                                                     "down",
@@ -4154,7 +3899,9 @@ impl ClientApp {
                                                                 80, 24,
                                                             ));
                                                     let fa = server_frame_area(
-                                                        cols, rows,
+                                                        cols,
+                                                        rows,
+                                                        sidebar_visible,
                                                     );
                                                     let pa = active_pane_content_rect(fd, fa, hide_borders);
                                                     if mouse.column >= pa.x
@@ -4171,6 +3918,7 @@ impl ClientApp {
                                                                 mouse.row,
                                                                 mouse.column,
                                                                 hide_borders,
+                                                                sidebar_visible,
                                                             )
                                                         {
                                                             mouse_select =
@@ -4187,11 +3935,12 @@ impl ClientApp {
                                                                 });
                                                         }
                                                     } else {
-                                                        let _ = tabs.focus_at(
-                                                            mouse.column,
-                                                            mouse.row,
-                                                            hide_borders,
-                                                        );
+                                                        let _ = workspaces
+                                                            .focus_at(
+                                                                mouse.column,
+                                                                mouse.row,
+                                                                hide_borders,
+                                                            );
                                                     }
                                                 }
                                             }
@@ -4210,7 +3959,9 @@ impl ClientApp {
                                                                 ));
                                                         let fa =
                                                             server_frame_area(
-                                                                cols, rows,
+                                                                cols,
+                                                                rows,
+                                                                sidebar_visible,
                                                             );
                                                         let pa = active_pane_content_rect(fd, fa, hide_borders);
                                                         sel.end_col = mouse
@@ -4239,7 +3990,9 @@ impl ClientApp {
                                                                 mouse,
                                                                 fd,
                                                                 hide_borders,
-                                                            ),
+
+sidebar_visible,
+),
                                                         );
                                                     }
                                                 }
@@ -4257,7 +4010,9 @@ impl ClientApp {
                                                             fd,
                                                             server_frame_area(
                                                                 cols, rows,
-                                                            ),
+
+sidebar_visible,
+),
                                                             hide_borders,
                                                         )
                                                     });
@@ -4284,7 +4039,9 @@ impl ClientApp {
                                                                     sel.start_row,
                                                                     sel.start_col,
                                                                     hide_borders,
-                                                                ) {
+
+sidebar_visible,
+) {
                                                                     open_url(&url);
                                                                     status_notice = Some((
                                                                         format!(
@@ -4311,7 +4068,9 @@ impl ClientApp {
                                                                 hide_borders,
                                                                 &mut status_notice,
                                                                 &mut last_drawn_counter,
-                                                            );
+
+sidebar_visible,
+);
                                                         }
                                                     }
                                                 } else if mouse_drag_origin
@@ -4328,7 +4087,9 @@ impl ClientApp {
                                                                 mouse.row,
                                                                 mouse.column,
                                                                 hide_borders,
-                                                            ) {
+
+sidebar_visible,
+) {
                                                                 open_url(&url);
                                                                 status_notice = Some((
                                                                     format!(
@@ -4363,7 +4124,7 @@ impl ClientApp {
                                 }
                                 InputMode::CopyMode => match mouse.kind {
                                     MouseEventKind::ScrollUp => {
-                                        tabs.scroll_at(
+                                        workspaces.scroll_at(
                                             mouse,
                                             hide_borders,
                                             "up",
@@ -4371,7 +4132,7 @@ impl ClientApp {
                                         last_drawn_counter = 0;
                                     }
                                     MouseEventKind::ScrollDown => {
-                                        tabs.scroll_at(
+                                        workspaces.scroll_at(
                                             mouse,
                                             hide_borders,
                                             "down",
@@ -4382,8 +4143,11 @@ impl ClientApp {
                                         if let Some(ref fd) = frame {
                                             let (cols, rows) = terminal::size()
                                                 .unwrap_or((80, 24));
-                                            let fa =
-                                                server_frame_area(cols, rows);
+                                            let fa = server_frame_area(
+                                                cols,
+                                                rows,
+                                                sidebar_visible,
+                                            );
                                             let pa = active_pane_content_rect(
                                                 fd,
                                                 fa,
@@ -4402,6 +4166,7 @@ impl ClientApp {
                                                         mouse.row,
                                                         mouse.column,
                                                         hide_borders,
+                                                        sidebar_visible,
                                                     )
                                                 {
                                                     mouse_select = Some(sel);
@@ -4420,7 +4185,7 @@ impl ClientApp {
                                                         },
                                                     );
                                                 }
-                                            } else if tabs.focus_at(
+                                            } else if workspaces.focus_at(
                                                 mouse.column,
                                                 mouse.row,
                                                 hide_borders,
@@ -4441,7 +4206,9 @@ impl ClientApp {
                                                     terminal::size()
                                                         .unwrap_or((80, 24));
                                                 let fa = server_frame_area(
-                                                    cols, rows,
+                                                    cols,
+                                                    rows,
+                                                    sidebar_visible,
                                                 );
                                                 let pa =
                                                     active_pane_content_rect(
@@ -4474,6 +4241,7 @@ impl ClientApp {
                                                         mouse,
                                                         fd,
                                                         hide_borders,
+                                                        sidebar_visible,
                                                     ),
                                                 );
                                             }
@@ -4489,7 +4257,9 @@ impl ClientApp {
                                                 active_pane_content_rect(
                                                     fd,
                                                     server_frame_area(
-                                                        cols, rows,
+                                                        cols,
+                                                        rows,
+                                                        sidebar_visible,
                                                     ),
                                                     hide_borders,
                                                 )
@@ -4513,6 +4283,7 @@ impl ClientApp {
                                                                 sel.start_row,
                                                                 sel.start_col,
                                                                 hide_borders,
+                                                                sidebar_visible,
                                                             )
                                                         {
                                                             open_url(&url);
@@ -4540,6 +4311,7 @@ impl ClientApp {
                                                         hide_borders,
                                                         &mut status_notice,
                                                         &mut last_drawn_counter,
+                                                        sidebar_visible,
                                                     );
                                                 }
                                             }
@@ -4556,14 +4328,16 @@ impl ClientApp {
                         }
                         Event::Paste(text) => {
                             handle_paste_event(
-                                tabs.focused_client(),
+                                workspaces.focused_client(),
                                 &mut mode,
                                 text,
                             );
                         }
                         Event::Resize(new_cols, new_rows) => {
-                            tabs.resize_all(server_content_size(
-                                new_cols, new_rows,
+                            workspaces.resize_all(server_content_size(
+                                new_cols,
+                                new_rows,
+                                sidebar_visible,
                             ));
                             last_drawn_counter = 0;
                         }
@@ -4578,7 +4352,6 @@ impl ClientApp {
             Ok(())
         })();
 
-        tabs.persist_all_metadata();
         let _ = terminal::disable_raw_mode();
         if keyboard_enhancement_enabled {
             let _ =
@@ -4600,38 +4373,119 @@ impl ClientApp {
     }
 }
 
-fn server_content_size(cols: u16, rows: u16) -> Size {
-    Size::new(rows.saturating_sub(1).max(1), cols.max(1))
+const SIDEBAR_MIN_WIDTH: u16 = 22;
+const SIDEBAR_MAX_WIDTH: u16 = 32;
+const MIN_TERMINAL_CONTENT_WIDTH: u16 = 20;
+
+fn local_machine_name() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| {
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty())
+        })
+        .unwrap_or_else(|| "local".to_string())
 }
 
-fn server_frame_area(cols: u16, rows: u16) -> ratatui::layout::Rect {
-    ratatui::layout::Rect {
-        x: 0,
-        y: 1,
-        width: cols,
-        height: rows.saturating_sub(1),
+#[derive(Clone, Copy)]
+struct WorkspaceAreas {
+    sidebar: ratatui::layout::Rect,
+    frame: ratatui::layout::Rect,
+    layout: ratatui::layout::Rect,
+}
+
+fn workspace_areas(
+    cols: u16,
+    rows: u16,
+    sidebar_visible: bool,
+) -> WorkspaceAreas {
+    let preferred_sidebar_width =
+        (cols / 4).clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+    let sidebar_width = if sidebar_visible {
+        preferred_sidebar_width
+            .min(cols.saturating_sub(MIN_TERMINAL_CONTENT_WIDTH))
+    } else {
+        0
+    };
+    let sidebar = ratatui::layout::Rect::new(0, 0, sidebar_width, rows);
+    let frame = ratatui::layout::Rect::new(
+        sidebar_width,
+        0,
+        cols.saturating_sub(sidebar_width).max(1),
+        rows.max(1),
+    );
+    let layout = ratatui::layout::Rect {
+        height: frame.height.saturating_sub(1),
+        ..frame
+    };
+    WorkspaceAreas {
+        sidebar,
+        frame,
+        layout,
     }
+}
+
+fn server_content_size(cols: u16, rows: u16, sidebar_visible: bool) -> Size {
+    let areas = workspace_areas(cols, rows, sidebar_visible);
+    Size::viewport(
+        areas.frame.height,
+        areas.frame.width,
+        areas.frame.x,
+        areas.frame.y,
+    )
+}
+
+fn server_frame_area(
+    cols: u16,
+    rows: u16,
+    sidebar_visible: bool,
+) -> ratatui::layout::Rect {
+    workspace_areas(cols, rows, sidebar_visible).frame
 }
 
 fn server_frame_area_from(
     area: ratatui::layout::Rect,
+
+    sidebar_visible: bool,
 ) -> ratatui::layout::Rect {
-    ratatui::layout::Rect {
-        x: area.x,
-        y: area.y + 1,
-        width: area.width,
-        height: area.height.saturating_sub(1),
-    }
+    let mut frame =
+        workspace_areas(area.width, area.height, sidebar_visible).frame;
+    frame.x = frame.x.saturating_add(area.x);
+    frame.y = frame.y.saturating_add(area.y);
+    frame
 }
 
-fn server_layout_area(cols: u16, rows: u16) -> ratatui::layout::Rect {
-    let frame = server_frame_area(cols, rows);
-    ratatui::layout::Rect {
-        x: frame.x,
-        y: frame.y,
-        width: frame.width,
-        height: frame.height.saturating_sub(1),
-    }
+fn server_layout_area(
+    cols: u16,
+    rows: u16,
+    sidebar_visible: bool,
+) -> ratatui::layout::Rect {
+    workspace_areas(cols, rows, sidebar_visible).layout
+}
+
+fn layout_fits_area(
+    layout: &LayoutJson,
+    area: ratatui::layout::Rect,
+    hide_borders: bool,
+) -> bool {
+    let geometry = layout_geometry_fingerprint(layout);
+    visual::collect_visual_hits(layout, area, hide_borders)
+        .iter()
+        .all(|hit| {
+            let visual::VisualTarget::Local { pane_id } = hit.target;
+            let content = visual::content_rect(hit.rect, hide_borders);
+            geometry.iter().any(|(id, rows, cols)| {
+                *id == pane_id
+                    && *rows == content.height
+                    && *cols == content.width
+            })
+        })
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -4641,9 +4495,6 @@ fn mouse_for_pane(
     layout_area: ratatui::layout::Rect,
     hide_borders: bool,
 ) -> Option<MouseEvent> {
-    if mouse.row == 0 {
-        return None;
-    }
     let (_, pa) =
         find_active_pane_content(&fd.layout, layout_area, hide_borders);
     if mouse.column < pa.x
@@ -4705,6 +4556,7 @@ fn try_word_select_on_double_click(
     row: u16,
     col: u16,
     hide_borders: bool,
+    sidebar_visible: bool,
 ) -> Option<MouseSelection> {
     let is_double = last.as_ref().is_some_and(|prev| {
         prev.row == row
@@ -4713,7 +4565,7 @@ fn try_word_select_on_double_click(
     });
     if is_double {
         last.take();
-        word_selection_at_click(fd, row, col, hide_borders)
+        word_selection_at_click(fd, row, col, hide_borders, sidebar_visible)
     } else {
         None
     }
@@ -4765,9 +4617,11 @@ fn pane_coords_at_screen(
     screen_row: u16,
     screen_col: u16,
     hide_borders: bool,
+
+    sidebar_visible: bool,
 ) -> Option<(Vec<PaneContentRow>, ratatui::layout::Rect, usize, usize)> {
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
-    let layout_area = server_layout_area(cols, rows);
+    let layout_area = server_layout_area(cols, rows, sidebar_visible);
     let (row_texts, content_area) =
         find_active_pane_content(&fd.layout, layout_area, hide_borders);
     if screen_row < content_area.y
@@ -4802,12 +4656,14 @@ fn copy_drag_selection(
     hide_borders: bool,
     status_notice: &mut Option<(String, Instant)>,
     last_drawn_counter: &mut u64,
+
+    sidebar_visible: bool,
 ) {
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
     let text = extract_text_from_frame_in_area(
         fd,
         sel,
-        server_layout_area(cols, rows),
+        server_layout_area(cols, rows, sidebar_visible),
         hide_borders,
     );
     copy_text_and_notify(&text, status_notice, last_drawn_counter);
@@ -4818,9 +4674,16 @@ fn word_selection_at_click(
     screen_row: u16,
     screen_col: u16,
     hide_borders: bool,
+
+    sidebar_visible: bool,
 ) -> Option<MouseSelection> {
-    let (row_texts, content_area, pane_row, pane_col) =
-        pane_coords_at_screen(fd, screen_row, screen_col, hide_borders)?;
+    let (row_texts, content_area, pane_row, pane_col) = pane_coords_at_screen(
+        fd,
+        screen_row,
+        screen_col,
+        hide_borders,
+        sidebar_visible,
+    )?;
     let line = row_texts.get(pane_row)?.text.as_str();
     let (start, end) = word_display_range_in_line(line, pane_col)?;
     Some(selection_for_pane_range(
@@ -4852,9 +4715,11 @@ fn mouse_selection_from_drag(
     mouse: MouseEvent,
     fd: &FrameData,
     hide_borders: bool,
+
+    sidebar_visible: bool,
 ) -> MouseSelection {
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
-    let fa = server_frame_area(cols, rows);
+    let fa = server_frame_area(cols, rows, sidebar_visible);
     let pa = active_pane_content_rect(fd, fa, hide_borders);
     MouseSelection {
         start_col: origin.col,
@@ -4935,6 +4800,8 @@ fn render_mouse_selection(
     sel: &MouseSelection,
     fd: &FrameData,
     hide_borders: bool,
+
+    sidebar_visible: bool,
 ) {
     use ratatui::style::{Color, Modifier, Style};
 
@@ -4948,7 +4815,7 @@ fn render_mouse_selection(
     let frame_area = f.area();
     let pa = active_pane_content_rect(
         fd,
-        server_frame_area_from(frame_area),
+        server_frame_area_from(frame_area, sidebar_visible),
         hide_borders,
     );
 
@@ -5372,6 +5239,7 @@ fn refresh_mouse_pointer<W: Write>(
     hide_status: bool,
     ui_overlay_active: bool,
     force: bool,
+    sidebar_visible: bool,
 ) -> io::Result<()> {
     let desired = desired_mouse_pointer_shape(
         last_mouse_pos,
@@ -5381,6 +5249,7 @@ fn refresh_mouse_pointer<W: Write>(
         hide_borders,
         hide_status,
         ui_overlay_active,
+        sidebar_visible,
     );
     apply_mouse_pointer_shape(writer, applied, desired, force)
 }
@@ -5393,6 +5262,8 @@ fn desired_mouse_pointer_shape(
     hide_borders: bool,
     hide_status: bool,
     ui_overlay_active: bool,
+
+    sidebar_visible: bool,
 ) -> Option<MousePointerShape> {
     if ui_overlay_active {
         return Some(MousePointerShape::Default);
@@ -5407,6 +5278,7 @@ fn desired_mouse_pointer_shape(
         fd,
         hide_borders,
         hide_status,
+        sidebar_visible,
     ))
 }
 
@@ -5418,16 +5290,15 @@ fn mouse_pointer_shape_at(
     fd: &FrameData,
     hide_borders: bool,
     hide_status: bool,
+
+    sidebar_visible: bool,
 ) -> MousePointerShape {
-    if row == 0 {
-        return MousePointerShape::Default;
-    }
     if let Some(status_row) = status_bar_screen_row(rows, hide_status) {
         if row == status_row {
             return MousePointerShape::Default;
         }
     }
-    let layout_area = server_layout_area(cols, rows);
+    let layout_area = server_layout_area(cols, rows, sidebar_visible);
     if col < layout_area.x
         || col >= layout_area.x + layout_area.width
         || row < layout_area.y
@@ -5524,7 +5395,15 @@ fn is_shifted_letter(key: KeyEvent, letter: char) -> bool {
 }
 
 fn prefix_nav_dir(key: KeyEvent) -> Option<crate::layout::NavDir> {
-    match (key.code, key.modifiers) {
+    // Holding Ctrl after Ctrl-A is common; accept both Ctrl-H and plain H.
+    if key
+        .modifiers
+        .intersects(KeyModifiers::ALT | KeyModifiers::SUPER)
+    {
+        return None;
+    }
+    match (key.code, key.modifiers & !KeyModifiers::CONTROL) {
+        (KeyCode::Backspace, _) => Some(crate::layout::NavDir::Left),
         (KeyCode::Char('h'), KeyModifiers::NONE) | (KeyCode::Left, _) => {
             Some(crate::layout::NavDir::Left)
         }
@@ -5541,6 +5420,52 @@ fn prefix_nav_dir(key: KeyEvent) -> Option<crate::layout::NavDir> {
     }
 }
 
+fn navigator_prefix_move(dir: crate::layout::NavDir) -> InputMode {
+    match dir {
+        crate::layout::NavDir::Right => return InputMode::Normal,
+        crate::layout::NavDir::Up
+        | crate::layout::NavDir::Down
+        | crate::layout::NavDir::Left => {}
+    }
+    InputMode::Navigator
+}
+
+fn edit_prompt(buf: &mut String, cursor: &mut usize, key: KeyEvent) {
+    *cursor = (*cursor).min(buf.chars().count());
+    match key.code {
+        KeyCode::Home => *cursor = 0,
+        KeyCode::End => *cursor = buf.chars().count(),
+        KeyCode::Left => *cursor = cursor.saturating_sub(1),
+        KeyCode::Right => *cursor = (*cursor + 1).min(buf.chars().count()),
+        KeyCode::Backspace if *cursor > 0 => {
+            let start = char_byte_pos(buf, *cursor - 1);
+            let end = char_byte_pos(buf, *cursor);
+            buf.drain(start..end);
+            *cursor -= 1;
+        }
+        KeyCode::Delete if *cursor < buf.chars().count() => {
+            let start = char_byte_pos(buf, *cursor);
+            let end = char_byte_pos(buf, *cursor + 1);
+            buf.drain(start..end);
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let end = char_byte_pos(buf, *cursor);
+            buf.drain(..end);
+            *cursor = 0;
+        }
+        KeyCode::Char(ch)
+            if !key.modifiers.intersects(
+                KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+            ) && !ch.is_control() =>
+        {
+            let at = char_byte_pos(buf, *cursor);
+            buf.insert(at, ch);
+            *cursor += 1;
+        }
+        _ => {}
+    }
+}
+
 fn handle_prefix_key(
     server: &dyn DomainHandle,
     key: KeyEvent,
@@ -5554,7 +5479,6 @@ fn handle_prefix_key(
         (KeyCode::Char('x'), KeyModifiers::NONE) => "kill-pane",
         (KeyCode::Char('z'), KeyModifiers::NONE) => "zoom-pane",
         _ if is_shifted_letter(key, 'K') => "clear-pane",
-        _ if is_shifted_letter(key, 'H') => "set-pane-start-dir",
         (KeyCode::Char('h'), KeyModifiers::NONE) => "select-pane -L",
         (KeyCode::Char('j'), KeyModifiers::NONE) => "select-pane -D",
         (KeyCode::Char('k'), KeyModifiers::NONE) => "select-pane -U",
@@ -5568,101 +5492,56 @@ fn handle_prefix_key(
     run_command_notice(server, cmd)
 }
 
-fn run_client_tab_command(
-    tabs: &mut TabManager,
+fn run_client_command(
+    workspaces: &mut WorkspaceManager,
+    remotes: &mut RemoteRegistry,
     raw: &str,
-    size: Size,
-) -> ClientTabCommandResult {
+    _size: Size,
+) -> ClientCommandResult {
     let mut parsed = ParsedCommand::parse(raw);
     if parsed.len() != 1 {
-        return ClientTabCommandResult::NotHandled;
+        return ClientCommandResult::NotHandled;
     }
     let cmd = parsed.remove(0);
     match cmd.name.as_str() {
-        "new-tab" | "newt" => {
-            let title = cmd.flag_value("t").unwrap_or_default().to_string();
-            match tabs.create_tab(size) {
-                Ok(()) => {
-                    tabs.set_active_title(title);
-                    ClientTabCommandResult::Handled(Some("new tab".to_string()))
-                }
-                Err(e) => ClientTabCommandResult::Handled(Some(format!(
-                    "new tab failed: {}",
-                    e
-                ))),
+        "h" | "help" => {
+            if cmd.args.is_empty() && cmd.flags.is_empty() {
+                ClientCommandResult::ShowHelp
+            } else {
+                ClientCommandResult::Handled(Some(
+                    "usage: h or help".to_string(),
+                ))
             }
         }
-        "new" if cmd.flags.contains_key("t") => {
-            let title = cmd.flag_value("t").unwrap_or_default().to_string();
-            match tabs.create_tab(size) {
-                Ok(()) => {
-                    tabs.set_active_title(title);
-                    ClientTabCommandResult::Handled(Some("new tab".to_string()))
-                }
-                Err(e) => ClientTabCommandResult::Handled(Some(format!(
-                    "new tab failed: {}",
-                    e
-                ))),
-            }
+        "set-workspace-home" => {
+            ClientCommandResult::Handled(set_workspace_home(workspaces))
         }
-        "select-tab" | "selectt" => {
-            let target = cmd
-                .flag_value("t")
-                .or_else(|| cmd.args.first().map(String::as_str));
-            let Some(target) = target else {
-                return ClientTabCommandResult::Handled(Some(
-                    "usage: select-tab -t <code|index|title>".to_string(),
+        "new"
+            if cmd.flags.contains_key("t") && !cmd.flags.contains_key("m") =>
+        {
+            ClientCommandResult::Handled(Some(
+                "tab creation was removed; use new -s <session> or new-window"
+                    .to_string(),
+            ))
+        }
+        "new" if cmd.flags.contains_key("m") => {
+            let Some(host) = cmd.flag_value("m") else {
+                return ClientCommandResult::Handled(Some(
+                    "usage: new -m <SSH_HOST>".to_string(),
                 ));
             };
-            if let Some(index) = tab_target_index(tabs, target) {
-                tabs.select(index);
-                tabs.active_client().resize(size);
-                ClientTabCommandResult::Handled(None)
-            } else {
-                ClientTabCommandResult::Handled(Some(format!(
-                    "tab not found: {}",
-                    target
-                )))
+            match remotes.add_and_probe(host, true) {
+                Ok(_) => ClientCommandResult::Handled(Some(format!(
+                    "connecting to {host}"
+                ))),
+                Err(error) => ClientCommandResult::Handled(Some(error)),
             }
         }
-        "rename-tab" | "renamet" => {
-            let code = cmd
-                .flag_value("c")
-                .unwrap_or(&tabs.active_code())
-                .to_string();
-            let title = if cmd.flags.contains_key("t") {
-                cmd.flag_value("t").unwrap_or_default().to_string()
-            } else {
-                cmd.args
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| tabs.active_title())
-            };
-            match tabs.set_active_metadata(&code, title) {
-                Ok(()) => ClientTabCommandResult::Handled(Some(
-                    "renamed tab".to_string(),
-                )),
-                Err(e) => ClientTabCommandResult::Handled(Some(e)),
-            }
-        }
-        "next-tab" | "nextt" => {
-            tabs.next_tab();
-            tabs.active_client().resize(size);
-            ClientTabCommandResult::Handled(None)
-        }
-        "prev-tab" | "prevt" => {
-            tabs.prev_tab();
-            tabs.active_client().resize(size);
-            ClientTabCommandResult::Handled(None)
-        }
-        "list-tabs" | "lst" => {
-            ClientTabCommandResult::Handled(Some(tab_summary(tabs)))
-        }
-        "paste-cloud" => match tabs.focused_client().paste_cloud() {
-            Ok(message) => ClientTabCommandResult::Handled(Some(message)),
-            Err(e) => ClientTabCommandResult::Handled(Some(e)),
+        "paste-cloud" => match workspaces.focused_client().paste_cloud() {
+            Ok(message) => ClientCommandResult::Handled(Some(message)),
+            Err(e) => ClientCommandResult::Handled(Some(e)),
         },
-        _ => ClientTabCommandResult::NotHandled,
+        _ => ClientCommandResult::NotHandled,
     }
 }
 
@@ -5688,15 +5567,50 @@ fn run_command_notice(server: &dyn DomainHandle, cmd: &str) -> Option<String> {
     None
 }
 
-fn set_tab_start_dir(tabs: &mut TabManager) -> Option<String> {
-    let output = tabs
+fn command_changes_navigation(command: &str) -> bool {
+    ParsedCommand::parse(command).iter().any(|part| {
+        matches!(
+            part.name.as_str(),
+            "split-window"
+                | "splitw"
+                | "new"
+                | "new-session"
+                | "new-window"
+                | "neww"
+                | "zoom-pane"
+                | "zoomp"
+                | "kill-pane"
+                | "killp"
+                | "kill-window"
+                | "killw"
+                | "kill-session"
+                | "kill-s"
+                | "rename-pane"
+                | "renamep"
+                | "rename-window"
+                | "renamew"
+                | "rename-session"
+                | "rename-s"
+                | "select-pane"
+                | "selectp"
+                | "select-window"
+                | "selectw"
+                | "switch-client"
+                | "switchc"
+                | "prev-session"
+                | "next-session"
+        )
+    })
+}
+
+fn set_workspace_home(workspaces: &WorkspaceManager) -> Option<String> {
+    let output = workspaces
         .active_client()
-        .run_command_with_output("set-pane-start-dir");
+        .run_command_with_output("set-workspace-home");
     let Some(path) = start_dir_from_command_output(&output) else {
-        return Some("set start dir failed".to_string());
+        return Some("set workspace home failed".to_string());
     };
-    tabs.start_dir = Some(path.clone());
-    Some(format!("start dir: {}", path))
+    Some(format!("workspace home: {}", path))
 }
 
 fn start_dir_from_command_output(output: &str) -> Option<String> {
@@ -5736,6 +5650,7 @@ fn status_banner_for_mode(
     notice: Option<&str>,
 ) -> Option<String> {
     let mode_label = match mode {
+        InputMode::Navigator => Some("NAV"),
         InputMode::Resize => Some("RESIZE"),
         InputMode::CopyMode => Some("COPY"),
         InputMode::CopySearch { forward, .. } => {
@@ -5872,41 +5787,46 @@ fn handle_paste_event(
         InputMode::RenameWindow {
             mut buf,
             mut cursor,
+            return_to_navigator,
         } => {
             insert_text_at_cursor(&mut buf, &mut cursor, &text);
-            *mode = InputMode::RenameWindow { buf, cursor };
+            *mode = InputMode::RenameWindow {
+                buf,
+                cursor,
+                return_to_navigator,
+            };
         }
         InputMode::RenameSession {
             mut buf,
             mut cursor,
+            return_to_navigator,
         } => {
             insert_text_at_cursor(&mut buf, &mut cursor, &text);
-            *mode = InputMode::RenameSession { buf, cursor };
-        }
-        InputMode::RenameTab {
-            mut code,
-            mut code_cursor,
-            mut title,
-            mut title_cursor,
-            editing_code,
-            return_to_tab_chooser,
-            ..
-        } => {
-            if editing_code {
-                let text = text.to_ascii_uppercase();
-                insert_text_at_cursor(&mut code, &mut code_cursor, &text);
-            } else {
-                insert_text_at_cursor(&mut title, &mut title_cursor, &text);
-            }
-            *mode = InputMode::RenameTab {
-                code,
-                code_cursor,
-                title,
-                title_cursor,
-                editing_code,
-                error: None,
-                return_to_tab_chooser,
+            *mode = InputMode::RenameSession {
+                buf,
+                cursor,
+                return_to_navigator,
             };
+        }
+        InputMode::RenamePane {
+            mut buf,
+            mut cursor,
+            return_to_navigator,
+        } => {
+            insert_text_at_cursor(&mut buf, &mut cursor, &text);
+            *mode = InputMode::RenamePane {
+                buf,
+                cursor,
+                return_to_navigator,
+            };
+        }
+        InputMode::RenameIdentity {
+            id,
+            mut buf,
+            mut cursor,
+        } => {
+            insert_text_at_cursor(&mut buf, &mut cursor, &text);
+            *mode = InputMode::RenameIdentity { id, buf, cursor };
         }
         InputMode::Command {
             mut buf,
@@ -5915,34 +5835,12 @@ fn handle_paste_event(
             insert_text_at_cursor(&mut buf, &mut cursor, &text);
             *mode = InputMode::Command { buf, cursor };
         }
-        InputMode::TabChooser {
-            mut query,
-            mut cursor,
-            ..
-        } => {
-            insert_text_at_cursor(&mut query, &mut cursor, &text);
-            *mode = InputMode::TabChooser {
-                query,
-                cursor,
-                selected: 0,
-                search_active: true,
-            };
-        }
-        InputMode::TabQuickSwitch { mut code, .. } => {
-            for c in text.chars() {
-                if code.len() >= 2 {
-                    break;
-                }
-                if c.is_ascii_alphabetic() {
-                    code.push(c.to_ascii_uppercase());
-                }
-            }
-            *mode = InputMode::TabQuickSwitch { code, error: None };
-        }
-        InputMode::CopyMode
-        | InputMode::SessionChooser { .. }
+        InputMode::Navigator
+        | InputMode::NavigationHelp { .. }
+        | InputMode::ShortcutsHelp { .. }
+        | InputMode::CopyMode
         | InputMode::OptionPanel { .. }
-        | InputMode::ConfirmKillTab { .. } => {}
+        | InputMode::ConfirmNavigationClose { .. } => {}
     }
 }
 
@@ -6182,187 +6080,7 @@ fn insert_text_at_cursor(buf: &mut String, cursor: &mut usize, text: &str) {
 }
 
 fn shell_quote(s: &str) -> String {
-    if s.contains(|c: char| c.is_whitespace() || c == '"' || c == '\'') {
-        format!("\"{}\"", s.replace('"', "\\\""))
-    } else {
-        s.to_string()
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct SessionChooserFocus {
-    session_name: String,
-    window_index: usize,
-    pane_id: usize,
-}
-
-fn active_session_focus_from_frame(
-    frame: &FrameData,
-) -> Option<SessionChooserFocus> {
-    let status = frame.status.as_ref()?;
-    let session_name = status
-        .left
-        .trim()
-        .strip_prefix('[')?
-        .strip_suffix(']')?
-        .trim()
-        .to_string();
-    let window = status.windows.iter().find(|w| w.active)?;
-    let pane_id = active_pane_id(&frame.layout)?;
-    Some(SessionChooserFocus {
-        session_name,
-        window_index: window.index,
-        pane_id,
-    })
-}
-
-fn build_initial_session_chooser_state(
-    entries: &[SessionTreeEntry],
-    focus: Option<SessionChooserFocus>,
-) -> (
-    std::collections::HashSet<String>,
-    std::collections::HashSet<(String, usize)>,
-    usize,
-) {
-    let mut collapsed: std::collections::HashSet<String> = entries
-        .iter()
-        .filter_map(|e| match e {
-            SessionTreeEntry::Session { name, .. } => Some(name.clone()),
-            _ => None,
-        })
-        .collect();
-    for e in entries {
-        if let SessionTreeEntry::Session {
-            name,
-            is_active: true,
-            ..
-        } = e
-        {
-            collapsed.remove(name);
-        }
-    }
-    let mut collapsed_windows = std::collections::HashSet::new();
-    for e in entries {
-        if let SessionTreeEntry::Window {
-            session_name,
-            index,
-            ..
-        } = e
-        {
-            if collapsed.contains(session_name) {
-                continue;
-            }
-            let keep_panes_visible = focus.as_ref().is_some_and(|f| {
-                f.session_name == *session_name && f.window_index == *index
-            });
-            if !keep_panes_visible {
-                collapsed_windows.insert((session_name.clone(), *index));
-            }
-        }
-    }
-    let selected = initial_session_chooser_selection(
-        entries,
-        &collapsed,
-        &collapsed_windows,
-        focus.as_ref(),
-    );
-    (collapsed, collapsed_windows, selected)
-}
-
-fn initial_session_chooser_selection(
-    entries: &[SessionTreeEntry],
-    collapsed: &std::collections::HashSet<String>,
-    collapsed_windows: &std::collections::HashSet<(String, usize)>,
-    focus: Option<&SessionChooserFocus>,
-) -> usize {
-    let visible = visible_entries_full(entries, collapsed, collapsed_windows);
-    if let Some(focus) = focus {
-        if let Some(pos) = visible.iter().position(|e| {
-            matches!(
-                e,
-                SessionTreeEntry::Pane {
-                    session_name,
-                    window_index,
-                    pane_id,
-                    ..
-                } if session_name == &focus.session_name
-                    && *window_index == focus.window_index
-                    && *pane_id == focus.pane_id
-            )
-        }) {
-            return pos;
-        }
-    }
-    visible
-        .iter()
-        .position(|e| {
-            matches!(
-                e,
-                SessionTreeEntry::Pane {
-                    is_active: true,
-                    ..
-                }
-            )
-        })
-        .or_else(|| {
-            visible.iter().position(|e| {
-                matches!(
-                    e,
-                    SessionTreeEntry::Window {
-                        is_active: true,
-                        ..
-                    }
-                )
-            })
-        })
-        .or_else(|| {
-            visible.iter().position(|e| {
-                matches!(
-                    e,
-                    SessionTreeEntry::Session {
-                        is_active: true,
-                        ..
-                    }
-                )
-            })
-        })
-        .unwrap_or(0)
-}
-
-fn clamp_session_chooser_selected(
-    selected: usize,
-    visible_len: usize,
-) -> usize {
-    if visible_len == 0 {
-        0
-    } else {
-        selected.min(visible_len - 1)
-    }
-}
-
-fn visible_entries_full<'a>(
-    entries: &'a [SessionTreeEntry],
-    collapsed: &std::collections::HashSet<String>,
-    collapsed_windows: &std::collections::HashSet<(String, usize)>,
-) -> Vec<&'a SessionTreeEntry> {
-    entries
-        .iter()
-        .filter(|e| match e {
-            SessionTreeEntry::Session { .. } => true,
-            SessionTreeEntry::Window { session_name, .. } => {
-                !collapsed.contains(session_name)
-            }
-            SessionTreeEntry::Pane {
-                session_name,
-                window_index,
-                ..
-            } => {
-                !collapsed.contains(session_name)
-                    && !collapsed_windows
-                        .contains(&(session_name.clone(), *window_index))
-            }
-        })
-        .collect()
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn client_log_path() -> std::path::PathBuf {
@@ -6433,16 +6151,6 @@ fn install_client_panic_hook() {
 }
 
 #[cfg(unix)]
-fn cleanup_killed_socket(socket_name: &str) {
-    if let Ok(path) = crate::ipc::socket_path(socket_name) {
-        let _ = std::fs::remove_file(path);
-    }
-}
-
-#[cfg(windows)]
-fn cleanup_killed_socket(_socket_name: &str) {}
-
-#[cfg(unix)]
 fn cleanup_stale_socket(socket_name: &str, error: &io::Error) {
     use std::os::unix::fs::FileTypeExt;
 
@@ -6469,12 +6177,12 @@ fn cleanup_stale_socket(_socket_name: &str, _error: &io::Error) {}
 #[cfg(unix)]
 fn discover_all_socket_names(socket_name: &str) -> io::Result<Vec<String>> {
     use std::collections::BTreeSet;
+    use std::os::unix::fs::FileTypeExt;
 
     let socket_path = crate::ipc::socket_path(socket_name)?;
     let Some(dir) = socket_path.parent() else {
         return Ok(vec![socket_name.to_string()]);
     };
-    let tab_prefix = format!("{}.tab.", socket_name);
     let mut names = BTreeSet::new();
     if socket_path.exists() {
         names.insert(socket_name.to_string());
@@ -6485,12 +6193,14 @@ fn discover_all_socket_names(socket_name: &str) -> io::Result<Vec<String>> {
             else {
                 continue;
             };
-            if name.starts_with(&tab_prefix) {
+            if entry.file_type().is_ok_and(|kind| kind.is_socket()) {
                 names.insert(name);
             }
         }
     }
-    Ok(names.into_iter().collect())
+    let mut names: Vec<_> = names.into_iter().collect();
+    names.sort_by_key(|name| name != socket_name);
+    Ok(names)
 }
 
 #[cfg(windows)]
@@ -6498,21 +6208,18 @@ fn discover_all_socket_names(socket_name: &str) -> io::Result<Vec<String>> {
     use std::collections::BTreeSet;
 
     let pipe_prefix = "zmux-";
-    let tab_pipe_prefix = format!("{}{}.tab.", pipe_prefix, socket_name);
     let mut names = BTreeSet::new();
     if let Ok(entries) = std::fs::read_dir(r"\\.\pipe\") {
         for entry in entries.flatten() {
             let pipe_name = entry.file_name().to_string_lossy().to_string();
-            if pipe_name == format!("{}{}", pipe_prefix, socket_name)
-                || pipe_name.starts_with(&tab_pipe_prefix)
-            {
-                if let Some(socket) = pipe_name.strip_prefix(pipe_prefix) {
-                    names.insert(socket.to_string());
-                }
+            if let Some(socket) = pipe_name.strip_prefix(pipe_prefix) {
+                names.insert(socket.to_string());
             }
         }
     }
-    Ok(names.into_iter().collect())
+    let mut names: Vec<_> = names.into_iter().collect();
+    names.sort_by_key(|name| name != socket_name);
+    Ok(names)
 }
 
 fn ensure_server_and_connect(
@@ -6535,10 +6242,28 @@ fn ensure_server_and_connect(
             }
             Err(e) => {
                 log_client(&format!("connect failed: {}", e));
+                if !matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) {
+                    return Err(e);
+                }
             }
         }
     } else {
-        log_client("clean requested; skipping existing server connection");
+        // --clean is not permission to unlink a live, incompatible server.
+        match crate::ipc::connect_client(socket_name) {
+            Ok(stream) => {
+                crate::ipc::negotiate_client(stream)?;
+                return Err(io::Error::new(io::ErrorKind::AddrInUse, "--clean requires an unused socket; choose a new -L name or explicitly stop the existing server after saving sessions"));
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) => {}
+            Err(error) => return Err(error),
+        }
     }
 
     #[cfg(unix)]
@@ -6578,6 +6303,7 @@ fn ensure_server_and_connect(
                 log_client(&format!("connected after {}ms", (i + 1) * 50));
                 return Ok((client, false));
             }
+            Err(e) if crate::ipc::is_compatibility_error(&e) => return Err(e),
             Err(e) if i % 10 == 9 => {
                 log_client(&format!(
                     "still waiting ({}ms): {}",
@@ -6602,9 +6328,11 @@ fn detect_url_at_click(
     screen_row: u16,
     screen_col: u16,
     hide_borders: bool,
+
+    sidebar_visible: bool,
 ) -> Option<String> {
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
-    let layout_area = server_layout_area(cols, rows);
+    let layout_area = server_layout_area(cols, rows, sidebar_visible);
     let (row_texts, content_area) =
         find_active_pane_content(&fd.layout, layout_area, hide_borders);
     if screen_row < content_area.y
@@ -6677,7 +6405,132 @@ mod tests {
     use super::*;
 
     #[test]
-    fn start_dir_command_output_is_preserved_for_new_tabs() {
+    fn workspace_viewport_reserves_left_sidebar_without_top_bar() {
+        let areas = workspace_areas(120, 24, true);
+        assert_eq!(areas.sidebar, ratatui::layout::Rect::new(0, 0, 30, 24));
+        assert_eq!(areas.frame, ratatui::layout::Rect::new(30, 0, 90, 24));
+        assert_eq!(areas.layout, ratatui::layout::Rect::new(30, 0, 90, 23));
+        let size = server_content_size(120, 24, true);
+        assert_eq!((size.rows, size.cols, size.x, size.y), (24, 90, 30, 0));
+
+        assert_eq!(workspace_areas(80, 24, true).sidebar.width, 22);
+        assert_eq!(workspace_areas(200, 24, true).sidebar.width, 32);
+        assert_eq!(workspace_areas(30, 24, true).sidebar.width, 10);
+        assert_eq!(workspace_areas(30, 24, true).frame.width, 20);
+        let hidden = workspace_areas(120, 24, false);
+        assert_eq!(hidden.sidebar.width, 0);
+        assert_eq!(hidden.frame, ratatui::layout::Rect::new(0, 0, 120, 24));
+        let size = server_content_size(120, 24, false);
+        assert_eq!((size.rows, size.cols, size.x, size.y), (24, 120, 0, 0));
+    }
+
+    #[test]
+    fn command_quoting_keeps_rename_text_in_one_command() {
+        let name = r#"editor; kill-window \ "notes""#;
+        let commands = ParsedCommand::parse(&format!(
+            "rename-window -- {}",
+            shell_quote(name)
+        ));
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].name, "rename-window");
+        assert_eq!(commands[0].args, [name]);
+    }
+
+    #[test]
+    fn floating_navigation_survives_node_prompts_but_closes_on_activation() {
+        assert!(retains_navigation_popup(&InputMode::Navigator));
+        assert!(retains_navigation_popup(&InputMode::Prefix));
+        assert!(retains_navigation_popup(&InputMode::NavigationHelp {
+            scroll: 0
+        }));
+        assert!(retains_navigation_popup(&InputMode::RenamePane {
+            buf: String::new(),
+            cursor: 0,
+            return_to_navigator: true,
+        }));
+        assert!(!retains_navigation_popup(&InputMode::Normal));
+        assert!(!retains_navigation_popup(&InputMode::Command {
+            buf: String::new(),
+            cursor: 0
+        }));
+        assert!(!retains_navigation_popup(&InputMode::RenamePane {
+            buf: String::new(),
+            cursor: 0,
+            return_to_navigator: false,
+        }));
+    }
+
+    #[test]
+    fn navigation_refresh_tracks_structural_command_chains() {
+        assert!(command_changes_navigation(
+            "switch-client -t main; select-pane -t %2"
+        ));
+        assert!(command_changes_navigation("split-window -h"));
+        assert!(command_changes_navigation("new -s work"));
+        assert!(command_changes_navigation("splitw -h"));
+        assert!(!command_changes_navigation("clear-pane"));
+    }
+
+    #[test]
+    fn remote_machine_ids_do_not_collide_with_alias_path_characters() {
+        assert_ne!(
+            remote_machine_id(&["a/b".to_string()]),
+            remote_machine_id(&["a".to_string(), "b".to_string()])
+        );
+        assert_ne!(
+            remote_machine_id(&["local".to_string()]),
+            "local".to_string()
+        );
+    }
+
+    #[test]
+    fn remote_registry_starts_empty_until_user_adds_a_machine() {
+        assert!(RemoteRegistry::new().machines.is_empty());
+    }
+
+    #[test]
+    fn probing_machine_remembers_activation_and_disconnect_schedules_retry() {
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let id = remote_machine_id(&["prod".to_string()]);
+        let mut remotes = RemoteRegistry {
+            machines: vec![RemoteMachine {
+                host: "prod".to_string(),
+                id: id.clone(),
+                route: vec!["prod".to_string()],
+                state: RemoteMachineState::Probing,
+                error: None,
+                retry_attempt: 0,
+                retry_at: None,
+                activate_after_probe: false,
+            }],
+            result_tx,
+            result_rx,
+        };
+        assert!(!remotes.start_probe(&id, true));
+        assert!(remotes.machines[0].activate_after_probe);
+        remotes.mark_disconnected(&id, "closed".to_string());
+        assert_eq!(remotes.machines[0].retry_attempt, 1);
+        assert!(remotes.machines[0].retry_at.is_some());
+        remotes.mark_failure(
+            &id,
+            remote::RemoteFailure::permanent("protocol mismatch"),
+        );
+        assert!(remotes.machines[0].retry_at.is_none());
+        assert!(remotes
+            .due_retries(Instant::now() + Duration::from_secs(120))
+            .is_empty());
+        assert_eq!(
+            remotes.machines[0].error.as_deref(),
+            Some("protocol mismatch")
+        );
+        remotes.mark_disconnected(&id, "network down".to_string());
+        assert!(!remotes
+            .due_retries(Instant::now() + Duration::from_secs(120))
+            .is_empty());
+    }
+
+    #[test]
+    fn start_dir_command_output_is_preserved_for_future_splits() {
         assert_eq!(
             start_dir_from_command_output("  /Users/me/project\n"),
             Some("/Users/me/project".to_string())
@@ -6686,48 +6539,11 @@ mod tests {
     }
 
     #[test]
-    fn attach_tab_title_uses_socket_id_suffix() {
-        assert_eq!(
-            attach_tab_title("default", "default.tab.12345.2"),
-            "default:2"
-        );
-        assert_eq!(attach_tab_title("default", "default"), "default");
-    }
-
-    #[test]
-    fn title_from_stored_keeps_custom_and_empty_titles() {
-        let named = StoredTabMetadata {
-            code: Some("AB".into()),
-            title: Some("work".into()),
-            visible: Some(false),
-        };
-        assert_eq!(title_from_stored(Some(&named)), "work");
-
-        let empty = StoredTabMetadata {
-            code: Some("AC".into()),
-            title: Some(String::new()),
-            visible: Some(false),
-        };
-        assert_eq!(title_from_stored(Some(&empty)), "");
-        assert_eq!(title_from_stored(None), "");
-    }
-
-    #[test]
-    fn meaningful_session_title_skips_default_session() {
-        assert_eq!(meaningful_session_title("0"), None);
-        assert_eq!(meaningful_session_title("  "), None);
-        assert_eq!(
-            meaningful_session_title(" work "),
-            Some("work".to_string())
-        );
-    }
-
-    #[test]
     fn server_ansi_keeps_painting_while_overlay_or_prompt_is_visible() {
         assert!(should_write_server_ansi(false, false));
         assert!(
             should_write_server_ansi(true, false),
-            "overlay must not freeze pane ANSI (Prefix+t / chooser)"
+            "overlay must not freeze pane ANSI (navigation / help)"
         );
         assert!(
             should_write_server_ansi(false, true),
@@ -6802,17 +6618,17 @@ mod tests {
         let (cols, rows) = (80u16, 24u16);
         let (_, content) = find_active_pane_content(
             &fd.layout,
-            server_layout_area(cols, rows),
+            server_layout_area(cols, rows, true),
             true,
         );
         assert_eq!(
             mouse_pointer_shape_at(
-                content.y, content.x, cols, rows, &fd, true, false,
+                content.y, content.x, cols, rows, &fd, true, false, true,
             ),
             MousePointerShape::Text
         );
         assert_eq!(
-            mouse_pointer_shape_at(0, 0, cols, rows, &fd, true, false),
+            mouse_pointer_shape_at(0, 0, cols, rows, &fd, true, false, true),
             MousePointerShape::Default
         );
     }
@@ -6865,7 +6681,7 @@ mod tests {
             yank_text: None,
         };
         let (cols, rows) = (101u16, 22u16);
-        let layout_area = server_layout_area(cols, rows);
+        let layout_area = server_layout_area(cols, rows, true);
         let (_, active_content) =
             find_active_pane_content(&fd.layout, layout_area, false);
         assert_eq!(
@@ -6877,6 +6693,7 @@ mod tests {
                 &fd,
                 false,
                 false,
+                true,
             ),
             MousePointerShape::Text
         );
@@ -6889,6 +6706,7 @@ mod tests {
                 &fd,
                 false,
                 false,
+                true,
             ),
             MousePointerShape::Default
         );
@@ -6977,10 +6795,10 @@ mod tests {
     }
 
     #[test]
-    fn mouse_copy_uses_screen_coordinates_below_tab_bar() {
+    fn mouse_copy_uses_screen_coordinates_beside_sidebar() {
         let fd =
             test_frame(vec![test_row("hello", None), test_row("world", None)]);
-        let layout_area = server_layout_area(80, 24);
+        let layout_area = server_layout_area(80, 24, true);
         let (_, content_area) =
             find_active_pane_content(&fd.layout, layout_area, true);
         let sel = MouseSelection {
@@ -7002,14 +6820,14 @@ mod tests {
         };
 
         let layout_area = ratatui::layout::Rect {
-            x: 0,
-            y: 1,
-            width: 80,
-            height: 22,
+            x: 30,
+            y: 0,
+            width: 50,
+            height: 23,
         };
         let fd = test_frame(vec![test_row("hello", None)]);
 
-        let screen_col = 10u16;
+        let screen_col = 40u16;
         let screen_row = 5u16;
         let mouse = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -7019,7 +6837,7 @@ mod tests {
         };
         let pane_mouse =
             mouse_for_pane(mouse, &fd, layout_area, true).expect("inside pane");
-        assert_eq!(pane_mouse.column, screen_col);
+        assert_eq!(pane_mouse.column, screen_col - layout_area.x);
         assert_eq!(pane_mouse.row, screen_row - layout_area.y);
 
         let bytes = mouse_to_bytes(pane_mouse);
@@ -7038,10 +6856,10 @@ mod tests {
         };
 
         let layout_area = ratatui::layout::Rect {
-            x: 0,
-            y: 1,
-            width: 80,
-            height: 22,
+            x: 30,
+            y: 0,
+            width: 50,
+            height: 23,
         };
         let fd = test_frame(vec![test_row("hello", None)]);
         let (_, pa) = find_active_pane_content(&fd.layout, layout_area, false);
@@ -7067,104 +6885,35 @@ mod tests {
     }
 
     #[test]
-    fn mouse_for_pane_ignores_tab_row_and_outside_content() {
+    fn mouse_for_pane_ignores_sidebar_and_border() {
         use crossterm::event::{
             KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
         };
 
         let layout_area = ratatui::layout::Rect {
-            x: 0,
-            y: 1,
-            width: 80,
-            height: 22,
+            x: 30,
+            y: 0,
+            width: 50,
+            height: 23,
         };
         let fd = test_frame(vec![test_row("hello", None)]);
-        let tab_mouse = MouseEvent {
+        let sidebar_mouse = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 5,
             row: 0,
             modifiers: KeyModifiers::empty(),
         };
-        assert!(mouse_for_pane(tab_mouse, &fd, layout_area, false).is_none());
+        assert!(
+            mouse_for_pane(sidebar_mouse, &fd, layout_area, false).is_none()
+        );
 
         let border_mouse = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
-            column: 0,
-            row: 1,
+            column: 30,
+            row: 0,
             modifiers: KeyModifiers::empty(),
         };
         assert!(mouse_for_pane(border_mouse, &fd, layout_area, false).is_none());
-    }
-
-    #[test]
-    fn session_chooser_opens_on_current_pane_from_frame() {
-        let entries = vec![
-            SessionTreeEntry::Session {
-                name: "main".to_string(),
-                window_count: 2,
-                is_active: true,
-            },
-            SessionTreeEntry::Window {
-                session_name: "main".to_string(),
-                index: 0,
-                name: "dev".to_string(),
-                pane_count: 2,
-                is_active: true,
-            },
-            SessionTreeEntry::Pane {
-                session_name: "main".to_string(),
-                window_index: 0,
-                pane_id: 10,
-                index: 0,
-                is_active: false,
-            },
-            SessionTreeEntry::Pane {
-                session_name: "main".to_string(),
-                window_index: 0,
-                pane_id: 11,
-                index: 1,
-                is_active: true,
-            },
-            SessionTreeEntry::Window {
-                session_name: "main".to_string(),
-                index: 1,
-                name: "logs".to_string(),
-                pane_count: 1,
-                is_active: false,
-            },
-            SessionTreeEntry::Pane {
-                session_name: "main".to_string(),
-                window_index: 1,
-                pane_id: 20,
-                index: 0,
-                is_active: false,
-            },
-        ];
-        let focus = SessionChooserFocus {
-            session_name: "main".to_string(),
-            window_index: 0,
-            pane_id: 11,
-        };
-        let (collapsed, collapsed_windows, selected) =
-            build_initial_session_chooser_state(&entries, Some(focus));
-        let visible =
-            visible_entries_full(&entries, &collapsed, &collapsed_windows);
-        assert!(!collapsed_windows.contains(&("main".to_string(), 0)));
-        assert!(collapsed_windows.contains(&("main".to_string(), 1)));
-        assert!(matches!(
-            visible[selected],
-            SessionTreeEntry::Pane {
-                pane_id: 11,
-                index: 1,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn session_chooser_selected_clamps_after_collapse() {
-        assert_eq!(clamp_session_chooser_selected(5, 3), 2);
-        assert_eq!(clamp_session_chooser_selected(0, 0), 0);
     }
 
     fn test_frame(rows_v2: Vec<RowRunsJson>) -> FrameData {
@@ -7238,7 +6987,7 @@ mod tests {
     #[test]
     fn mouse_copy_reads_single_char_from_server_frame() {
         let fd = test_frame(vec![test_row("abc", None)]);
-        let layout_area = server_layout_area(80, 24);
+        let layout_area = server_layout_area(80, 24, true);
         let (_, content_area) =
             find_active_pane_content(&fd.layout, layout_area, true);
         let sel = MouseSelection {
@@ -7256,13 +7005,14 @@ mod tests {
     #[test]
     fn mouse_copy_reads_word_from_server_frame() {
         let fd = test_frame(vec![test_row("foo bar", None)]);
-        let layout_area = server_layout_area(80, 24);
+        let layout_area = server_layout_area(80, 24, true);
         let (_, content_area) =
             find_active_pane_content(&fd.layout, layout_area, true);
         let sel = word_selection_at_click(
             &fd,
             content_area.y,
             content_area.x + 1,
+            true,
             true,
         )
         .expect("word selection");
@@ -7291,18 +7041,17 @@ mod tests {
         const PANE_COLS: u16 = 128;
 
         fn terminal_size() -> (u16, u16) {
-            // Tab bar + pane + status bar.
-            (PANE_COLS, PANE_ROWS + 2)
+            // Sidebar + pane viewport + status bar.
+            (PANE_COLS + SIDEBAR_MAX_WIDTH, PANE_ROWS + 1)
         }
 
         fn server_size() -> Size {
             let (cols, rows) = terminal_size();
-            Size::new(rows.saturating_sub(1).max(1), cols.max(1))
+            server_content_size(cols, rows, true)
         }
 
         fn layout_area() -> Rect {
-            let sz = server_size();
-            Rect::new(0, 0, sz.cols.max(1), sz.rows.saturating_sub(1).max(1))
+            frame_ansi_area(server_size())
         }
 
         fn silent_test_pane() -> io::Result<Pane> {
@@ -7387,7 +7136,7 @@ mod tests {
 
         fn mouse_copy_first_row(fd: &FrameData, text_len: u16) -> String {
             let (term_cols, term_rows) = terminal_size();
-            let layout_area = server_layout_area(term_cols, term_rows);
+            let layout_area = server_layout_area(term_cols, term_rows, true);
             let (_, content_area) =
                 find_active_pane_content(&fd.layout, layout_area, true);
             let sel = MouseSelection {
@@ -7468,7 +7217,7 @@ mod tests {
             let win = test_window(pane);
             let fd = build_frame_data(&win);
             let (term_cols, term_rows) = terminal_size();
-            let layout_area = server_layout_area(term_cols, term_rows);
+            let layout_area = server_layout_area(term_cols, term_rows, true);
             let (_, content_area) =
                 find_active_pane_content(&fd.layout, layout_area, true);
             let sel = MouseSelection {
