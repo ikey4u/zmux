@@ -14,10 +14,14 @@ use super::{
 
 const MAX_SSH_COMMAND_OUTPUT: u64 = 8 * 1024 * 1024;
 const DISCOVERY_MARKER: &str = "ZMUX DISCOVERY 1";
+const WORKSPACE_LIST_MARKER: &str = "ZMUX WORKSPACES 1";
+const WORKSPACE_CREATE_MARKER: &str = "ZMUX WORKSPACE CREATED 1";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteProbe {
     pub executable: String,
+    pub workspaces: Vec<String>,
+    pub workspace_management: bool,
 }
 
 #[derive(Clone)]
@@ -25,6 +29,7 @@ struct SshConnector {
     route: Vec<String>,
     socket_name: String,
     executable: String,
+    start_if_missing: bool,
 }
 
 impl SocketConnector for SshConnector {
@@ -39,11 +44,18 @@ impl SocketConnector for SshConnector {
         let route = self.route.clone();
         let socket_name = self.socket_name.clone();
         let executable = self.executable.clone();
+        let start_if_missing = self.start_if_missing;
         let label = route.join("/");
         thread::Builder::new()
             .name(format!("zmux-ssh-{label}"))
             .spawn(move || {
-                run_ssh_bridge(bridge, &route, &socket_name, &executable)
+                run_ssh_bridge(
+                    bridge,
+                    &route,
+                    &socket_name,
+                    &executable,
+                    start_if_missing,
+                )
             })
             .map_err(io::Error::other)?;
         Ok(Box::new(client))
@@ -63,6 +75,7 @@ pub fn connect_remote(
     executable: &str,
     socket_name: &str,
     size: Size,
+    start_if_missing: bool,
 ) -> io::Result<SocketClient> {
     validate_remote_executable(executable)?;
     SocketClient::connect_with(
@@ -72,6 +85,7 @@ pub fn connect_remote(
             route: route.to_vec(),
             socket_name: socket_name.to_string(),
             executable: executable.to_string(),
+            start_if_missing,
         }),
     )
 }
@@ -106,7 +120,10 @@ impl RemoteFailure {
     }
 }
 
-pub fn probe(route: &[String]) -> Result<RemoteProbe, RemoteFailure> {
+pub fn probe(
+    route: &[String],
+    base_socket: &str,
+) -> Result<RemoteProbe, RemoteFailure> {
     let payload = discovery_command()
         .map_err(|error| RemoteFailure::permanent(error.to_string()))?;
     let mut command = ssh_command(route, &payload)
@@ -158,7 +175,181 @@ pub fn probe(route: &[String]) -> Result<RemoteProbe, RemoteFailure> {
     {
         return Err(RemoteFailure::permanent("missing_capability: remote lacks ssh-stdio-v1; upgrade remote zmux"));
     }
-    Ok(RemoteProbe { executable })
+    let workspace_management = negotiated
+        .capabilities
+        .iter()
+        .any(|cap| cap == crate::ipc::WORKSPACE_MANAGEMENT_CAPABILITY);
+    let workspaces = if workspace_management {
+        list_workspaces(route, &executable, base_socket)?
+    } else {
+        vec![base_socket.to_string()]
+    };
+    Ok(RemoteProbe {
+        executable,
+        workspaces,
+        workspace_management,
+    })
+}
+
+pub fn create_workspace(
+    route: &[String],
+    executable: &str,
+    base_socket: &str,
+) -> Result<String, RemoteFailure> {
+    validate_remote_executable(executable)
+        .map_err(|error| RemoteFailure::permanent(error.to_string()))?;
+    validate_socket_name(base_socket)
+        .map_err(|error| RemoteFailure::permanent(error.to_string()))?;
+    let quoted_executable = crate::domain::quote::posix_quote(executable)
+        .map_err(|error| RemoteFailure::permanent(error.to_string()))?;
+    let quoted_base = crate::domain::quote::posix_quote(base_socket)
+        .map_err(|error| RemoteFailure::permanent(error.to_string()))?;
+    let payload = format!(
+        "printf '%s\\n' '{WORKSPACE_CREATE_MARKER}'; exec {quoted_executable} -L {quoted_base} workspace-create"
+    );
+    let stdout = run_remote_command(route, &payload, "Workspace creation")?;
+    let socket = parse_framed_line(&stdout, WORKSPACE_CREATE_MARKER)
+        .map_err(|error| RemoteFailure::permanent(error.to_string()))?;
+    validate_workspace_family(&socket, base_socket)
+        .map_err(|error| RemoteFailure::permanent(error.to_string()))?;
+    Ok(socket)
+}
+
+fn list_workspaces(
+    route: &[String],
+    executable: &str,
+    base_socket: &str,
+) -> Result<Vec<String>, RemoteFailure> {
+    validate_socket_name(base_socket)
+        .map_err(|error| RemoteFailure::permanent(error.to_string()))?;
+    let quoted_executable = crate::domain::quote::posix_quote(executable)
+        .map_err(|error| RemoteFailure::permanent(error.to_string()))?;
+    let quoted_base = crate::domain::quote::posix_quote(base_socket)
+        .map_err(|error| RemoteFailure::permanent(error.to_string()))?;
+    let payload = format!(
+        "printf '%s\\n' '{WORKSPACE_LIST_MARKER}'; exec {quoted_executable} -L {quoted_base} workspace-list"
+    );
+    let stdout = run_remote_command(route, &payload, "Workspace discovery")?;
+    let json = parse_framed_line(&stdout, WORKSPACE_LIST_MARKER)
+        .map_err(|error| RemoteFailure::permanent(error.to_string()))?;
+    let mut workspaces: Vec<String> = serde_json::from_str(&json).map_err(|_| {
+        RemoteFailure::permanent(
+            "workspace_discovery_failed: remote returned invalid Workspace JSON",
+        )
+    })?;
+    if workspaces.len() > 1024 {
+        return Err(RemoteFailure::permanent(
+            "workspace_discovery_failed: remote returned too many Workspaces",
+        ));
+    }
+    for socket in &workspaces {
+        validate_workspace_family(socket, base_socket)
+            .map_err(|error| RemoteFailure::permanent(error.to_string()))?;
+    }
+    workspaces.sort();
+    workspaces.dedup();
+    workspaces.retain(|socket| socket != base_socket);
+    workspaces.insert(0, base_socket.to_string());
+    Ok(workspaces)
+}
+
+fn run_remote_command(
+    route: &[String],
+    payload: &str,
+    operation: &str,
+) -> Result<Vec<u8>, RemoteFailure> {
+    let mut command = ssh_command(route, payload)
+        .map_err(|error| RemoteFailure::permanent(error.to_string()))?;
+    command.stdin(Stdio::null());
+    let (status, stdout, stderr) =
+        run_with_timeout(command, Duration::from_secs(15))
+            .map_err(|error| RemoteFailure::from_io(&error))?;
+    if status.success() {
+        return Ok(stdout);
+    }
+    let error = String::from_utf8_lossy(&stderr).trim().to_string();
+    if matches!(status.code(), Some(255) | None) {
+        Err(RemoteFailure::transient(if error.is_empty() {
+            format!("{operation} SSH transport unavailable")
+        } else {
+            error
+        }))
+    } else {
+        let detail = if error.is_empty() {
+            String::new()
+        } else {
+            format!(": {error}")
+        };
+        Err(RemoteFailure::permanent(format!(
+            "{} failed on {} (exit {}){}",
+            operation,
+            route.join("/"),
+            status.code().unwrap_or(-1),
+            detail
+        )))
+    }
+}
+
+fn parse_framed_line(output: &[u8], marker: &str) -> io::Result<String> {
+    let lines = output
+        .split(|byte| *byte == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .collect::<Vec<_>>();
+    let marker = lines
+        .iter()
+        .rposition(|line| *line == marker.as_bytes())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "remote response omitted its Workspace protocol frame",
+            )
+        })?;
+    let value = lines
+        .get(marker + 1)
+        .filter(|line| !line.is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "remote Workspace protocol frame omitted its payload",
+            )
+        })?;
+    std::str::from_utf8(value)
+        .map(str::to_string)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn validate_socket_name(socket: &str) -> io::Result<()> {
+    if socket.is_empty()
+        || socket.len() > 255
+        || socket == "."
+        || socket == ".."
+        || socket
+            .chars()
+            .any(|ch| ch.is_control() || matches!(ch, '/' | '\\'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "remote Workspace socket name is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_workspace_family(
+    socket: &str,
+    base_socket: &str,
+) -> io::Result<()> {
+    validate_socket_name(socket)?;
+    if socket != base_socket
+        && !socket.starts_with(&format!("{base_socket}.tab."))
+        && !socket.starts_with(&format!("{base_socket}.ws."))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "remote returned a Workspace outside the requested socket family",
+        ));
+    }
+    Ok(())
 }
 
 fn discovery_command() -> io::Result<String> {
@@ -328,11 +519,13 @@ fn run_ssh_bridge(
     route: &[String],
     socket_name: &str,
     executable: &str,
+    start_if_missing: bool,
 ) {
-    let remote_command = match bridge_command(executable, socket_name) {
-        Ok(command) => command,
-        Err(_) => return,
-    };
+    let remote_command =
+        match bridge_command(executable, socket_name, start_if_missing) {
+            Ok(command) => command,
+            Err(_) => return,
+        };
     let mut command = match ssh_command(route, &remote_command) {
         Ok(command) => command,
         Err(_) => return,
@@ -378,12 +571,21 @@ fn run_ssh_bridge(
     let _ = child.wait();
 }
 
-fn bridge_command(executable: &str, socket_name: &str) -> io::Result<String> {
+fn bridge_command(
+    executable: &str,
+    socket_name: &str,
+    start_if_missing: bool,
+) -> io::Result<String> {
     validate_remote_executable(executable)?;
     let quoted_socket = crate::domain::quote::posix_quote(socket_name)?;
     let quoted_executable = crate::domain::quote::posix_quote(executable)?;
     Ok(format!(
-        "exec {quoted_executable} -L {quoted_socket} mux --stdio --start-if-missing"
+        "exec {quoted_executable} -L {quoted_socket} mux --stdio{}",
+        if start_if_missing {
+            " --start-if-missing"
+        } else {
+            ""
+        }
     ))
 }
 
@@ -446,6 +648,20 @@ mod tests {
     }
 
     #[test]
+    fn workspace_frames_ignore_shell_noise_and_reject_other_families() {
+        let output =
+            b"login banner\nZMUX WORKSPACES 1\n[\"dev\",\"dev.ws.abc\"]\n";
+        assert_eq!(
+            parse_framed_line(output, WORKSPACE_LIST_MARKER).unwrap(),
+            "[\"dev\",\"dev.ws.abc\"]"
+        );
+        assert!(validate_workspace_family("dev.ws.abc", "dev").is_ok());
+        assert!(validate_workspace_family("dev.tab.1.2", "dev").is_ok());
+        assert!(validate_workspace_family("other.ws.abc", "dev").is_err());
+        assert!(validate_workspace_family("../dev.ws.abc", "dev").is_err());
+    }
+
+    #[test]
     fn discovery_path_is_available_when_protocol_command_fails() {
         let output =
             format!("shell noise\n{DISCOVERY_MARKER}\n/home/dev/bin/zmux\n");
@@ -472,14 +688,21 @@ mod tests {
 
     #[test]
     fn bridge_uses_the_verified_absolute_executable() {
-        let command =
-            bridge_command("/home/dev/tools with spaces/zmux", "work space")
-                .unwrap();
+        let command = bridge_command(
+            "/home/dev/tools with spaces/zmux",
+            "work space",
+            true,
+        )
+        .unwrap();
         assert_eq!(
             command,
             "exec '/home/dev/tools with spaces/zmux' -L 'work space' mux --stdio --start-if-missing"
         );
-        assert!(bridge_command("zmux", "default").is_err());
+        assert_eq!(
+            bridge_command("/usr/bin/zmux", "existing", false).unwrap(),
+            "exec /usr/bin/zmux -L existing mux --stdio"
+        );
+        assert!(bridge_command("zmux", "default", true).is_err());
     }
 
     #[cfg(unix)]

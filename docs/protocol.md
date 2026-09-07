@@ -32,8 +32,11 @@ Both endpoints independently apply the same checks:
 
 Current required capabilities are `control-v1`, `frame-json-v1`,
 `session-tree-v1`, and `workspace-home-v1`. SSH discovery additionally requires
-`ssh-stdio-v1`. These names describe explicit wire contracts, not installed
-third-party tools; clipboard availability is still checked at operation time.
+`ssh-stdio-v1`. `workspace-management-v1` is optional and gates remote
+Workspace enumeration and creation. Peers without it can still attach to the
+base Workspace, but must reject or avoid the newer management operations. These
+names describe explicit wire contracts, not installed third-party tools;
+clipboard availability is still checked at operation time.
 
 Within a major version, minor additions must preserve old message meanings,
 field defaults, and commands. Optional new behavior must be capability-gated;
@@ -71,6 +74,17 @@ noise outside that frame is ignored. Every bridge then invokes that quoted
 absolute path instead of searching a potentially different `PATH`. The running
 server is checked again over the actual stream. Replacing a remote binary does
 not upgrade an already-running server.
+
+When `workspace-management-v1` is negotiated, discovery invokes the verified
+remote executable through stateless `workspace-list` and `workspace-create`
+operations. Their output is marker-framed so login-shell noise cannot be
+mistaken for protocol data. Returned socket names are bounded, validated, and
+restricted to the requested base family (`BASE`, `BASE.ws.*`, and legacy
+`BASE.tab.*`). A discovered sibling Workspace is attached without
+`--start-if-missing`, so a stale listing can never resurrect a stopped server.
+The base Workspace alone retains automatic startup behavior. Client-side
+Workspace identity is the pair `(Machine, socket name)`, preventing equal local
+and remote socket names from selecting or rendering the wrong Workspace.
 
 Negotiation is a compatibility check, not authentication. Local IPC permissions
 and SSH host-key verification/authentication remain the trust boundary.

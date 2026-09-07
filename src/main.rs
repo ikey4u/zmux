@@ -60,6 +60,12 @@ enum Cmd {
     /// Print a machine-readable protocol declaration; does not start a server.
     #[command(name = "protocol-info")]
     ProtocolInfo,
+    /// List live Workspace sockets in this socket family as JSON.
+    #[command(name = "workspace-list", hide = true)]
+    WorkspaceList,
+    /// Create a new Workspace beside the selected base socket.
+    #[command(name = "workspace-create", hide = true)]
+    WorkspaceCreate,
     #[command(name = "mux", hide = true)]
     Mux {
         #[arg(long)]
@@ -83,6 +89,15 @@ fn main() -> io::Result<()> {
                 "{}",
                 serde_json::to_string(&zmux::ipc::ProtocolInfo::current())?
             );
+        }
+        Some(Cmd::WorkspaceList) => {
+            println!(
+                "{}",
+                serde_json::to_string(&matching_socket_names(&socket)?)?
+            );
+        }
+        Some(Cmd::WorkspaceCreate) => {
+            println!("{}", create_workspace_server(&socket)?);
         }
         Some(Cmd::Server) => {
             run_server_daemon(
@@ -232,6 +247,56 @@ fn run_server_daemon(
         start_dir.map(|dir| dir.to_string()),
     )?;
     server.run_socket_server(socket_name)
+}
+
+fn create_workspace_server(base_socket: &str) -> io::Result<String> {
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use sha2::{Digest, Sha256};
+    use zmux::ipc::{connect_client, negotiate_client};
+
+    let exe = std::env::current_exe()?;
+    for _ in 0..32 {
+        let digest = Sha256::digest(zmux::domain::new_instance_id().as_bytes());
+        let suffix = digest[..6]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let socket_name = format!("{base_socket}.ws.{suffix}");
+
+        // A live socket is never reused. A stale socket is safe because the
+        // normal server bind path verifies ownership before replacing it.
+        if connect_client(&socket_name).is_ok() {
+            continue;
+        }
+        zmux::platform::spawn_server_background(&exe, &socket_name, "0", None)?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match connect_client(&socket_name) {
+                Ok(stream) => {
+                    negotiate_client(stream)?;
+                    return Ok(socket_name);
+                }
+                Err(error) if Instant::now() < deadline => {
+                    let _ = error;
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(error) => {
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!("new Workspace server did not start: {error}"),
+                    ))
+                }
+            }
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique Workspace socket",
+    ))
 }
 
 fn run_ls(socket_name: &str) -> io::Result<()> {
@@ -399,6 +464,7 @@ fn matching_socket_names(socket_name: &str) -> io::Result<Vec<String>> {
         return Ok(vec![socket_name.to_string()]);
     };
     let tab_prefix = format!("{}.tab.", socket_name);
+    let workspace_prefix = format!("{}.ws.", socket_name);
     let mut names = BTreeSet::new();
     if socket_path.exists() {
         names.insert(socket_name.to_string());
@@ -409,7 +475,9 @@ fn matching_socket_names(socket_name: &str) -> io::Result<Vec<String>> {
             else {
                 continue;
             };
-            if name.starts_with(&tab_prefix) {
+            if name.starts_with(&tab_prefix)
+                || name.starts_with(&workspace_prefix)
+            {
                 names.insert(name);
             }
         }
@@ -424,6 +492,7 @@ fn matching_socket_names(socket_name: &str) -> io::Result<Vec<String>> {
     let pipe_prefix = "zmux-";
     let base_pipe = format!("{}{}", pipe_prefix, socket_name);
     let tab_pipe_prefix = format!("{}{}.tab.", pipe_prefix, socket_name);
+    let workspace_pipe_prefix = format!("{}{}.ws.", pipe_prefix, socket_name);
     let mut names = BTreeSet::new();
 
     if let Ok(entries) = std::fs::read_dir(r"\\.\pipe\") {
@@ -431,7 +500,9 @@ fn matching_socket_names(socket_name: &str) -> io::Result<Vec<String>> {
             let pipe_name = entry.file_name().to_string_lossy().to_string();
             if pipe_name == base_pipe {
                 names.insert(socket_name.to_string());
-            } else if pipe_name.starts_with(&tab_pipe_prefix) {
+            } else if pipe_name.starts_with(&tab_pipe_prefix)
+                || pipe_name.starts_with(&workspace_pipe_prefix)
+            {
                 if let Some(socket) = pipe_name.strip_prefix(pipe_prefix) {
                     names.insert(socket.to_string());
                 }

@@ -97,9 +97,10 @@ An SSH config alias works too, for example `new -m production`.
 3. zmux attaches through the bridge and negotiates again with the **running
    server** before sending commands or resizing panes. If the socket is absent,
    the bridge starts a server with an initial session named `0`.
-4. Once attached, zmux automatically loads and displays that Workspace's
-   sessions, windows, and panes under the remote Machine. There is no separate
-   nested remote TUI to open or list of sessions to enter manually.
+4. Once attached, zmux enumerates the compatible Workspace socket family and
+   displays every live Workspace, session, window, and pane under the remote
+   Machine. There is no separate nested remote TUI to open or list of sessions
+   to enter manually.
 5. The tree refreshes in the background as sessions and layouts change. Select
    a remote node and use the same navigation, rename, close, split, and focus
    controls as for local work.
@@ -138,10 +139,15 @@ refuses a live socket. See [protocol design and upgrade rules](docs/protocol.md)
   password prompts, for example through keys or an SSH agent. Host-key trust
   must also be established. OpenSSH handles aliases, `ProxyJump`, `ProxyCommand`,
   `IdentityFile`, authentication, and host-key checking.
-- The remote Workspace uses the client's base socket name: `default` for
-  `zmux`, or `dev` when the client was started with `zmux -L dev`. Discovery
-  includes all sessions in that remote Workspace, **not every server socket
-  on the remote host**. Local `zmux a` can discover multiple local Workspaces.
+- Remote discovery is scoped to the client's socket family: `default` plus
+  `default.ws.*` (and legacy `default.tab.*`), or the equivalent family for a
+  custom `-L` name. It never imports unrelated server sockets on the remote
+  host. Each discovered Workspace receives its own negotiated stdio bridge.
+- `new -t <name>` creates the Workspace on the Machine that owns the currently
+  active Workspace and switches to it. On a remote Machine this is allowed only
+  when the negotiated peer advertises `workspace-management-v1`; an older peer
+  remains usable but remote Workspace creation fails explicitly instead of
+  silently creating a local Workspace.
 - Automatic discovery begins after `new -m` connects. A plain `ssh host`
   typed inside a pane remains a normal shell command; it does **not** currently
   create a Machine node automatically. zmux also does not import every host
@@ -277,7 +283,7 @@ are added again with `:new -m <SSH_HOST>` and reuse their saved names.
 |---------|--------|
 | `zmux` | Start zmux. If a background server already exists, it attaches automatically |
 | `zmux a` / `zmux attach` | Attach to running servers and show their sessions in the machine tree; use `--single` for only the selected socket |
-| `zmux ls` / `zmux list-sessions` | List sessions for the base socket and any legacy derived server sockets |
+| `zmux ls` / `zmux list-sessions` | List sessions across the base socket and its `.ws.*` / legacy `.tab.*` Workspace family |
 | `zmux -L <name>` | Specify the server socket name, defaulting to `default` |
 | `zmux -s <name>` | Specify the name of the new session |
 | `zmux server` | Start the server in daemon mode. This is usually invoked automatically by zmux and does not need to be run manually |
@@ -288,7 +294,7 @@ are added again with `:new -m <SSH_HOST>` and reuse their saved names.
 
 | Command | Action |
 |---------|--------|
-| `new -t <WORKSPACE_NAME>` | Create a local Workspace, persist its display name, and switch to it |
+| `new -t <WORKSPACE_NAME>` | Create a Workspace on the currently active Machine, persist its display name, and switch to it |
 | `new -m <SSH_HOST>` | Add/connect an SSH machine in the navigation tree |
 | `new -s <name>` | Create a new session and switch to it |
 | `new -s <name> -d` | Create a new session in the background without switching to it |

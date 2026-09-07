@@ -138,6 +138,13 @@ case "$previous" in
     protocol-legacy)
         printf 'unknown command protocol-info\n' >&2
         exit 2 ;;
+    protocol-no-workspaces)
+        case "$last" in
+            *'ZMUX DISCOVERY 1'*)
+                printf 'ZMUX DISCOVERY 1\n%s\n' "$ZMUX_TEST_ROOT/bin/zmux"
+                cat "$ZMUX_TEST_ROOT/$previous.json"
+                exit 0 ;;
+        esac ;;
     protocol-major|protocol-caps|protocol-schema|protocol-noisy)
         printf 'ZMUX DISCOVERY 1\n%s\n' "$ZMUX_TEST_ROOT/bin/zmux"
         cat "$ZMUX_TEST_ROOT/$previous.json"
@@ -318,6 +325,13 @@ exec /bin/sh -c "$last"
         }
     }
 
+    fn pump_for(&mut self, duration: Duration) {
+        let start = Instant::now();
+        while start.elapsed() < duration {
+            self.pump();
+        }
+    }
+
     fn wait(&mut self, label: &str, predicate: impl Fn(&[String]) -> bool) {
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(8) {
@@ -380,7 +394,7 @@ impl Drop for Tui {
             .stderr(Stdio::null())
             .status();
         let _ = Command::new(BIN)
-            .args(["-L", "ui", "kill-server"])
+            .args(["-L", "ui", "kill-server", "--all"])
             .env("TMPDIR", self.root.join("remote"))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -413,6 +427,100 @@ fn remote_login_shell_path_is_discovered_and_reused_by_the_bridge() {
             .contains(&format!("exec '{}' -L ui mux", executable.display())),
         "bridge did not reuse discovered absolute path:\n{commands}"
     );
+}
+
+#[test]
+fn new_t_on_remote_creates_and_rediscovers_a_remote_workspace() {
+    let mut tui = Tui::start();
+    tui.ready();
+    tui.command("new -m loopback");
+    tui.wait("remote base Workspace connected", |rows| {
+        rows.iter().any(|line| line.contains("● loopback"))
+            && rows.iter().any(|line| line.contains("◆ 0"))
+    });
+
+    tui.command("new -t Remote-build");
+    tui.wait("new -t creates under the active remote Machine", |rows| {
+        rows.iter().any(|line| line.contains("▣ Remote-build"))
+            && rows.iter().any(|line| line.contains("*[0] shell*"))
+    });
+    tui.send(b"printf 'REMOTE_SCOPE=%s\\n' \"${TMPDIR##*/}\"\r");
+    tui.wait("new remote Workspace executes on the remote host", |rows| {
+        rows.iter().any(|line| line.contains("REMOTE_SCOPE=remote"))
+    });
+
+    let names = zmux::config::machines::MachineNames::load(
+        &tui.root.join("machines.json"),
+    )
+    .unwrap();
+    let remote_socket = names
+        .workspaces
+        .get("ssh:8#loopback")
+        .and_then(|workspaces| {
+            workspaces.iter().find_map(|(socket, name)| {
+                (name == "Remote-build").then_some(socket.clone())
+            })
+        })
+        .expect("remote Workspace name was not persisted under its Machine");
+    assert!(remote_socket.starts_with("ui.ws."));
+    let runtime = format!("zmux-{}", unsafe { libc::getuid() });
+    assert!(tui
+        .root
+        .join("remote")
+        .join(&runtime)
+        .join(&remote_socket)
+        .exists());
+    assert!(!tui.root.join(&runtime).join(&remote_socket).exists());
+
+    // A fresh client must discover the sibling remote socket instead of
+    // leaving the newly-created Workspace reachable only by its creator.
+    let mut observer = Tui::attach(tui.root.clone());
+    observer.command("new -m loopback");
+    observer.wait("remote Workspace is rediscovered after reconnect", |rows| {
+        rows.iter().any(|line| line.contains("▣ Remote-build"))
+            && rows.iter().any(|line| line.contains("● loopback"))
+    });
+}
+
+#[test]
+fn remote_new_t_requires_the_negotiated_workspace_capability() {
+    let mut tui = Tui::start();
+    tui.ready();
+    let mut legacy = zmux::ipc::ProtocolInfo::current();
+    legacy
+        .capabilities
+        .retain(|cap| cap != zmux::ipc::WORKSPACE_MANAGEMENT_CAPABILITY);
+    fs::write(
+        tui.root.join("protocol-no-workspaces.json"),
+        serde_json::to_vec(&legacy).unwrap(),
+    )
+    .unwrap();
+    tui.command("new -m protocol-no-workspaces");
+    tui.wait("older compatible remote connects", |rows| {
+        rows.iter()
+            .any(|line| line.contains("● protocol-no-workspaces"))
+            && rows.iter().any(|line| line.contains("◆ 0"))
+    });
+    tui.command("new -t must-not-be-local");
+    // Let the command-mode Enter event complete before sending pane input;
+    // otherwise a heavily loaded parallel test run can coalesce the two PTY
+    // writes while the UI is still leaving command mode.
+    tui.pump_for(Duration::from_secs(1));
+    tui.send(b"printf 'CAP_%s\\n' 'GUARD_DONE'\r");
+    tui.wait(
+        "unsupported remote creation stays on the existing Workspace",
+        |rows| rows.iter().any(|line| line.contains("CAP_GUARD_DONE")),
+    );
+    let names = zmux::config::machines::MachineNames::load(
+        &tui.root.join("machines.json"),
+    )
+    .unwrap();
+    assert!(!names.workspaces.values().any(|workspaces| workspaces
+        .values()
+        .any(|name| name == "must-not-be-local")));
+    assert!(!fs::read_to_string(tui.root.join("ssh-commands"))
+        .unwrap()
+        .contains("workspace-create"));
 }
 
 #[test]
@@ -617,7 +725,7 @@ fn remote_tree_focus_rename_split_close_and_offline_rename() {
     assert_eq!(saved.names["ssh:11#unavailable"], "Offline server");
     assert_eq!(saved.names["ssh:8#loopback"], "远程开发机");
     assert_eq!(
-        saved.workspace_name("ssh:8#loopback", "ssh://ssh:8#loopback/ui"),
+        saved.workspace_name("ssh:8#loopback", "ui"),
         Some("Remote workspace")
     );
     tui.send(b"K");
@@ -999,7 +1107,7 @@ fn command_new_t_creates_names_and_switches_to_a_workspace() {
             })
         })
         .expect("new Workspace name was not persisted");
-    assert!(workbench_socket.starts_with("ui.tab."));
+    assert!(workbench_socket.starts_with("ui.ws."));
 }
 
 #[test]

@@ -166,6 +166,7 @@ struct RemoteMachine {
     id: String,
     route: Vec<String>,
     executable: Option<String>,
+    workspace_management: bool,
     state: RemoteMachineState,
     error: Option<String>,
     retry_attempt: u32,
@@ -175,6 +176,7 @@ struct RemoteMachine {
 
 struct RemoteRegistry {
     machines: Vec<RemoteMachine>,
+    base_socket: String,
     result_tx: std::sync::mpsc::Sender<(
         String,
         Result<remote::RemoteProbe, remote::RemoteFailure>,
@@ -194,10 +196,11 @@ fn remote_machine_id(route: &[String]) -> String {
 }
 
 impl RemoteRegistry {
-    fn new() -> Self {
+    fn new(base_socket: &str) -> Self {
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         Self {
             machines: Vec::new(),
+            base_socket: base_socket.to_string(),
             result_tx,
             result_rx,
         }
@@ -220,6 +223,7 @@ impl RemoteRegistry {
                 id: id.clone(),
                 route,
                 executable: None,
+                workspace_management: false,
                 state: RemoteMachineState::Disconnected,
                 error: None,
                 retry_attempt: 0,
@@ -244,13 +248,15 @@ impl RemoteRegistry {
         machine.state = RemoteMachineState::Probing;
         machine.error = None;
         machine.executable = None;
+        machine.workspace_management = false;
         machine.retry_at = None;
         machine.activate_after_probe |= activate;
         let id = alias.to_string();
         let route = machine.route.clone();
+        let base_socket = self.base_socket.clone();
         let tx = self.result_tx.clone();
         std::thread::spawn(move || {
-            let result = remote::probe(&route);
+            let result = remote::probe(&route, &base_socket);
             let _ = tx.send((id, result));
         });
         true
@@ -361,10 +367,12 @@ fn open_navigation_entry(
                 "remote zmux executable has not been discovered".to_string(),
             );
         };
+        let remote_sockets = vec![workspaces.base_socket.clone()];
         return match workspaces.connect_remote_machine(
             machine_id,
             &route,
             &executable,
+            &remote_sockets,
             size,
             true,
         ) {
@@ -667,12 +675,12 @@ impl WorkspaceManager {
         })
     }
 
-    fn create_workspace(&mut self, size: Size) -> io::Result<String> {
+    fn create_local_workspace(&mut self, size: Size) -> io::Result<String> {
         for _ in 0..1024 {
             let id = self.next_workspace_id;
             self.next_workspace_id = self.next_workspace_id.saturating_add(1);
             let socket_name = format!(
-                "{}.tab.{}.{}",
+                "{}.ws.{}.{}",
                 self.base_socket,
                 std::process::id(),
                 id
@@ -899,20 +907,29 @@ impl WorkspaceManager {
         self.invalidate_active_navigation_tree();
     }
 
-    fn active_socket_name(&self) -> String {
-        self.workspaces[self.active].socket_name.clone()
+    fn active_workspace_key(&self) -> String {
+        let workspace = &self.workspaces[self.active];
+        format!(
+            "{}#{}{}",
+            workspace.machine_id.len(),
+            workspace.machine_id,
+            workspace.socket_name
+        )
     }
 
     fn active_machine_id(&self) -> String {
         self.workspaces[self.active].machine_id.clone()
     }
 
-    fn select_socket(&mut self, socket_name: &str) -> bool {
-        if let Some(index) = self
-            .workspaces
-            .iter()
-            .position(|workspace| workspace.socket_name == socket_name)
-        {
+    fn select_workspace(
+        &mut self,
+        machine_id: &str,
+        socket_name: &str,
+    ) -> bool {
+        if let Some(index) = self.workspaces.iter().position(|workspace| {
+            workspace.machine_id == machine_id
+                && workspace.socket_name == socket_name
+        }) {
             self.active = index;
             true
         } else {
@@ -942,7 +959,7 @@ impl WorkspaceManager {
 
     fn remove_dead_inactive(&mut self) -> (usize, Vec<String>) {
         let mut removed = 0;
-        let mut removed_machines = Vec::new();
+        let mut affected_machines = std::collections::BTreeSet::new();
         let mut index = 0;
         while index < self.workspaces.len() {
             let dead = index != self.active
@@ -953,8 +970,8 @@ impl WorkspaceManager {
                     .is_some_and(|frame| frame.exit);
             if dead {
                 if self.workspaces[index].machine_id != "local" {
-                    removed_machines
-                        .push(self.workspaces[index].machine_id.clone());
+                    affected_machines
+                        .insert(self.workspaces[index].machine_id.clone());
                 }
                 self.workspaces[index].client.shutdown();
                 self.workspaces.remove(index);
@@ -966,7 +983,16 @@ impl WorkspaceManager {
                 index += 1;
             }
         }
-        (removed, removed_machines)
+        let disconnected_machines = affected_machines
+            .into_iter()
+            .filter(|machine_id| {
+                !self
+                    .workspaces
+                    .iter()
+                    .any(|workspace| workspace.machine_id == *machine_id)
+            })
+            .collect();
+        (removed, disconnected_machines)
     }
 
     fn detach_all(&self) {
@@ -1045,7 +1071,7 @@ impl WorkspaceManager {
                         .map(|(index, workspace)| {
                             navigation::WorkspaceNavigationView {
                                 socket_name: &workspace.socket_name,
-                                title: &self.base_socket,
+                                title: "",
                                 active: index == self.active,
                                 tree: &workspace.navigation_tree,
                             }
@@ -1090,26 +1116,70 @@ impl WorkspaceManager {
         machine_id: &str,
         route: &[String],
         executable: &str,
+        remote_sockets: &[String],
         size: Size,
         activate: bool,
     ) -> io::Result<()> {
-        if let Some(index) = self
-            .workspaces
-            .iter()
-            .position(|workspace| workspace.machine_id == machine_id)
-        {
-            if activate {
-                self.active = index;
-            }
-            self.workspaces[index].client.resize(size);
-            return Ok(());
-        }
-        let socket_name = self.base_socket.clone();
-        let client =
-            remote::connect_remote(route, executable, &socket_name, size)?;
         let previous_active = self.active;
+        let mut first_connected = None;
+        let mut first_error = None;
+        for socket_name in remote_sockets {
+            match self.connect_remote_workspace(
+                machine_id,
+                route,
+                executable,
+                socket_name,
+                size,
+                socket_name == &self.base_socket,
+            ) {
+                Ok(index) => first_connected.get_or_insert(index),
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                    continue;
+                }
+            };
+        }
+        let Some(first_connected) = first_connected else {
+            return Err(first_error.unwrap_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "remote machine has no attachable Workspaces",
+                )
+            }));
+        };
+        self.active = if activate {
+            first_connected
+        } else {
+            previous_active
+        };
+        Ok(())
+    }
+
+    fn connect_remote_workspace(
+        &mut self,
+        machine_id: &str,
+        route: &[String],
+        executable: &str,
+        socket_name: &str,
+        size: Size,
+        start_if_missing: bool,
+    ) -> io::Result<usize> {
+        if let Some(index) = self.workspaces.iter().position(|workspace| {
+            workspace.machine_id == machine_id
+                && workspace.socket_name == socket_name
+        }) {
+            self.workspaces[index].client.resize(size);
+            return Ok(index);
+        }
+        let client = remote::connect_remote(
+            route,
+            executable,
+            socket_name,
+            size,
+            start_if_missing,
+        )?;
         self.workspaces.push(WorkspaceConnection {
-            socket_name: format!("ssh://{machine_id}/{socket_name}"),
+            socket_name: socket_name.to_string(),
             machine_id: machine_id.to_string(),
             client: Box::new(client),
             visual_focus: VisualFocus::Local { pane_id: None },
@@ -1117,12 +1187,7 @@ impl WorkspaceManager {
             navigation_tree_at: None,
             navigation_refresh_until: None,
         });
-        self.active = if activate {
-            self.workspaces.len() - 1
-        } else {
-            previous_active
-        };
-        Ok(())
+        Ok(self.workspaces.len() - 1)
     }
 
     fn activate_navigation_entry(
@@ -1131,21 +1196,29 @@ impl WorkspaceManager {
         size: Size,
     ) -> bool {
         use navigation::NavigationNodeId;
-        let (workspace, command) = match &entry.id {
+        let (machine, workspace, command) = match &entry.id {
             NavigationNodeId::Machine(_) => return false,
-            NavigationNodeId::Workspace { workspace, .. } => (workspace.as_str(), None),
+            NavigationNodeId::Workspace { machine, workspace } => {
+                (machine.as_str(), workspace.as_str(), None)
+            }
             NavigationNodeId::Session {
-                workspace, name, ..
+                machine,
+                workspace,
+                name,
+                ..
             } => (
+                machine.as_str(),
                 workspace.as_str(),
                 Some(format!("switch-client -t {}", shell_quote(name))),
             ),
             NavigationNodeId::Window {
+                machine,
                 workspace,
                 session,
                 index,
                 ..
             } => (
+                machine.as_str(),
                 workspace.as_str(),
                 Some(format!(
                     "switch-client -t {}; select-window -t {}",
@@ -1154,12 +1227,14 @@ impl WorkspaceManager {
                 )),
             ),
             NavigationNodeId::Pane {
+                machine,
                 workspace,
                 session,
                 window,
                 pane_id,
                 ..
             } => (
+                machine.as_str(),
                 workspace.as_str(),
                 Some(format!(
                     "switch-client -t {}; select-window -t {}; select-pane -t %{}",
@@ -1169,7 +1244,7 @@ impl WorkspaceManager {
                 )),
             ),
         };
-        if !self.select_socket(workspace) {
+        if !self.select_workspace(machine, workspace) {
             return false;
         }
         self.active_client().resize(size);
@@ -1309,7 +1384,7 @@ impl ClientApp {
                 self.start_dir.clone(),
             )?
         };
-        let mut remotes = RemoteRegistry::new();
+        let mut remotes = RemoteRegistry::new(&self.socket_name);
         let machine_config = crate::config::machines::config_path()?;
         let mut machine_names =
             crate::config::machines::MachineNames::load(&machine_config)?;
@@ -1397,6 +1472,8 @@ impl ClientApp {
                                 .map(|machine| {
                                     machine.executable =
                                         Some(probe.executable.clone());
+                                    machine.workspace_management =
+                                        probe.workspace_management;
                                     (
                                         machine.route.clone(),
                                         machine.activate_after_probe,
@@ -1409,6 +1486,7 @@ impl ClientApp {
                                 &alias,
                                 &route,
                                 &probe.executable,
+                                &probe.workspaces,
                                 server_content_size(
                                     cols,
                                     rows,
@@ -1463,7 +1541,7 @@ impl ClientApp {
                     }
                 }
                 let (frame, current_counter) = workspaces.display_snapshot();
-                let active_socket_name = workspaces.active_socket_name();
+                let active_workspace_key = workspaces.active_workspace_key();
                 if matches!(
                     copy_mode_sync_suppress_frame,
                     Some(counter) if counter != current_counter
@@ -1478,7 +1556,11 @@ impl ClientApp {
                         if workspaces.close_dead_active() {
                             break;
                         }
-                        if disconnected_machine != "local" {
+                        if disconnected_machine != "local"
+                            && !workspaces.workspaces.iter().any(|workspace| {
+                                workspace.machine_id == disconnected_machine
+                            })
+                        {
                             remotes.mark_disconnected(
                                 &disconnected_machine,
                                 "SSH connection closed".to_string(),
@@ -1657,8 +1739,8 @@ impl ClientApp {
                         || last_drawn_mode.as_ref() != Some(&mode)
                         || last_drawn_sidebar != sidebar_visible);
                 let server_frame_new = last_ansi_frame.as_ref().is_none_or(
-                    |(socket_name, counter)| {
-                        socket_name != &active_socket_name
+                    |(workspace_key, counter)| {
+                        workspace_key != &active_workspace_key
                             || *counter != current_counter
                     },
                 );
@@ -1945,7 +2027,7 @@ sidebar_visible,
                     last_drawn_counter = current_counter;
                     if server_frame_new {
                         last_ansi_frame =
-                            Some((active_socket_name, current_counter));
+                            Some((active_workspace_key, current_counter));
                     }
                     last_overlay_rect = current_overlay_rect;
                     last_navigation_entries = navigation_entries.clone();
@@ -5632,11 +5714,12 @@ fn run_client_command(
                         )));
                     }
                 };
-            match workspaces.create_workspace(size) {
-                Ok(socket_name) => {
+            match create_workspace_for_active_machine(workspaces, remotes, size)
+            {
+                Ok((machine_id, socket_name)) => {
                     let message = match machine_names.rename_workspace(
                         machine_config,
-                        "local",
+                        &machine_id,
                         &socket_name,
                         &name,
                     ) {
@@ -5671,6 +5754,61 @@ fn run_client_command(
         },
         _ => ClientCommandResult::NotHandled,
     }
+}
+
+fn create_workspace_for_active_machine(
+    workspaces: &mut WorkspaceManager,
+    remotes: &RemoteRegistry,
+    size: Size,
+) -> Result<(String, String), String> {
+    let machine_id = workspaces.active_machine_id();
+    if machine_id == "local" {
+        return workspaces
+            .create_local_workspace(size)
+            .map(|socket| (machine_id, socket))
+            .map_err(|error| error.to_string());
+    }
+
+    let machine = remotes
+        .machines
+        .iter()
+        .find(|machine| machine.id == machine_id)
+        .ok_or_else(|| "active remote Machine is unavailable".to_string())?;
+    if machine.state != RemoteMachineState::Connected {
+        return Err("active remote Machine is not connected".to_string());
+    }
+    if !machine.workspace_management {
+        return Err(format!(
+            "{} lacks {}; upgrade remote zmux before creating a Workspace",
+            machine.host,
+            crate::ipc::WORKSPACE_MANAGEMENT_CAPABILITY
+        ));
+    }
+    let executable = machine.executable.as_deref().ok_or_else(|| {
+        "remote zmux executable has not been discovered".to_string()
+    })?;
+    let socket_name = remote::create_workspace(
+        &machine.route,
+        executable,
+        &workspaces.base_socket,
+    )
+    .map_err(|error| error.message)?;
+    let index = workspaces
+        .connect_remote_workspace(
+            &machine_id,
+            &machine.route,
+            executable,
+            &socket_name,
+            size,
+            false,
+        )
+        .map_err(|error| {
+            format!(
+                "remote Workspace {socket_name} was created but could not be attached: {error}"
+            )
+        })?;
+    workspaces.active = index;
+    Ok((machine_id, socket_name))
 }
 
 fn run_command_notice(server: &dyn DomainHandle, cmd: &str) -> Option<String> {
@@ -6612,7 +6750,7 @@ mod tests {
 
     #[test]
     fn remote_registry_starts_empty_until_user_adds_a_machine() {
-        assert!(RemoteRegistry::new().machines.is_empty());
+        assert!(RemoteRegistry::new("default").machines.is_empty());
     }
 
     #[test]
@@ -6625,12 +6763,14 @@ mod tests {
                 id: id.clone(),
                 route: vec!["prod".to_string()],
                 executable: None,
+                workspace_management: false,
                 state: RemoteMachineState::Probing,
                 error: None,
                 retry_attempt: 0,
                 retry_at: None,
                 activate_after_probe: false,
             }],
+            base_socket: "default".to_string(),
             result_tx,
             result_rx,
         };

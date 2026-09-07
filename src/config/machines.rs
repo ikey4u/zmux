@@ -76,9 +76,17 @@ impl MachineNames {
         machine: &str,
         workspace: &str,
     ) -> Option<&str> {
-        self.workspaces
-            .get(machine)?
+        let names = self.workspaces.get(machine)?;
+        names
             .get(workspace)
+            .or_else(|| {
+                // Versions before remote multi-Workspace support stored a UI-only
+                // ssh:// identity instead of the real remote socket name. Keep
+                // those labels visible while new writes use the canonical key.
+                (machine != "local")
+                    .then(|| format!("ssh://{machine}/{workspace}"))
+                    .and_then(|legacy| names.get(&legacy))
+            })
             .map(String::as_str)
     }
 
@@ -211,6 +219,14 @@ mod tests {
         other
             .rename_workspace(&config.0, "remote", "default", "Deploy")
             .unwrap();
+        other
+            .rename_workspace(
+                &config.0,
+                "legacy-remote",
+                "ssh://legacy-remote/default",
+                "Legacy Deploy",
+            )
+            .unwrap();
         names
             .rename_workspace(&config.0, "local", "second", "Shells")
             .unwrap();
@@ -220,6 +236,10 @@ mod tests {
         assert_eq!(
             restored.workspace_name("remote", "default"),
             Some("Deploy")
+        );
+        assert_eq!(
+            restored.workspace_name("legacy-remote", "default"),
+            Some("Legacy Deploy")
         );
         assert_eq!(restored.workspace_name("local", "second"), Some("Shells"));
     }
