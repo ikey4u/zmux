@@ -775,7 +775,7 @@ impl WorkspaceManager {
             return true;
         }
         // No neighbour means a focus boundary. Do not ask the server to wrap
-        // focus while the client is entering the navigation sidebar.
+        // focus; the caller may move into an already-visible sidebar.
         false
     }
 
@@ -2430,13 +2430,13 @@ sidebar_visible,
                                                 if dir
                                                     == crate::layout::NavDir::Left
                                                     && !moved
+                                                    && workspaces.sidebar_visible
                                                 {
                                                     workspaces.sync_navigation_to_active(
                                                         &mut navigation_state,
                                                         &navigation_entries,
                                                     );
                                                     mode = InputMode::Navigator;
-                                                    workspaces.set_sidebar_visible(true, cols, rows);
                                                 }
                                             } else if matches!(
                                                 (key.code, key.modifiers),

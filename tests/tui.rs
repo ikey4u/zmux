@@ -658,8 +658,8 @@ fn remote_tree_focus_rename_split_close_and_offline_rename() {
         rows[0].starts_with('┌')
             && rows.iter().any(|l| l.contains("REMOTE_SENTINEL"))
     });
-    tui.send(b"\x01h\x01h");
-    tui.wait("remote sidebar restored", |rows| {
+    tui.send(b"\x01M\x01h");
+    tui.wait("remote sidebar explicitly restored", |rows| {
         rows.iter().any(|l| l.contains('▌'))
             && rows.iter().any(|l| l.contains("Remote workspace"))
     });
@@ -1418,6 +1418,36 @@ fn floating_sidebar_preserves_viewport_prompts_and_node_operations() {
 }
 
 #[test]
+fn left_boundary_navigation_does_not_open_hidden_sidebar() {
+    let mut tui = Tui::start_hidden();
+    tui.wait("hidden startup", |rows| {
+        rows[0].starts_with('┌')
+            && rows.iter().any(|line| line.contains("READY>"))
+            && !rows.iter().any(|line| line.contains("WORKSPACES"))
+    });
+
+    for key in [b"\x01h".as_slice(), b"\x01\x08"] {
+        tui.send(key);
+        tui.pump_for(Duration::from_millis(150));
+        let rows = tui.lines();
+        assert!(rows[0].starts_with('┌'));
+        assert!(!rows.iter().any(|line| {
+            line.contains("WORKSPACES") || line.contains('▌')
+        }));
+    }
+
+    tui.send(b"\x01M");
+    tui.wait("Prefix+M explicitly opens fixed sidebar", |rows| {
+        rows[0].contains('●')
+    });
+    tui.send(b"\x01h");
+    tui.wait(
+        "left boundary can focus an already-visible sidebar",
+        |rows| rows.iter().any(|line| line.contains('▌')),
+    );
+}
+
+#[test]
 fn removed_shortcuts_are_inert_and_k_confirms_each_node_operation() {
     let mut tui = Tui::start_hidden();
     tui.wait("hidden startup", |rows| {
@@ -1713,11 +1743,14 @@ fn sidebar_toggle_help_and_workspace_rename() {
             rows[0].starts_with('┌')
                 && !rows.iter().any(|l| l.contains("WORKSPACES"))
         });
-        tui.send(b"\x01h\x01h");
-        tui.wait("Prefix+h opens sidebar at left boundary", |rows| {
-            rows.iter().any(|l| l.contains('▌'))
-                && rows.iter().any(|l| l.contains("项目空间"))
-        });
+        tui.send(b"\x01M\x01h");
+        tui.wait(
+            "Prefix+M opens sidebar before Prefix+h focuses it",
+            |rows| {
+                rows.iter().any(|l| l.contains('▌'))
+                    && rows.iter().any(|l| l.contains("项目空间"))
+            },
+        );
     }
     tui.assert_preserved_since(start, "TOGGLE_SENTINEL");
     tui.send(b"\x01l\x01M");
@@ -1733,8 +1766,8 @@ fn sidebar_toggle_help_and_workspace_rename() {
                 .sum::<usize>()
                 >= 2
     });
-    tui.send(b"\x01h\x01h");
-    tui.wait("open sidebar with split panes", |rows| {
+    tui.send(b"\x01M\x01h");
+    tui.wait("open sidebar explicitly with split panes", |rows| {
         rows.iter().any(|l| l.contains('▌'))
             && rows.iter().any(|l| l.contains("pane 1"))
     });

@@ -228,7 +228,7 @@ legacy tab server sockets. All levels use the same tree controls below.
 | `Prefix + m` | Open/close the floating sidebar tree without resizing panes |
 | `Prefix + M` | Toggle the fixed sidebar, hidden by default |
 | `H` (sidebar focused) | Show the complete shortcut reference; `j/k`, `Ctrl+b/f`, PageUp/PageDown or mouse wheel scroll, `Esc` or `H` returns |
-| `Prefix + h` | Move to the pane on the left; when already at the left edge, enter the machine tree |
+| `Prefix + h` | Move to the pane on the left; when the fixed sidebar is already visible and the pane is at the left edge, enter the machine tree |
 | `Prefix + l` (tree focused) | Return focus to the terminal |
 | `↑`/`↓` or `j`/`k` | Move through visible tree nodes |
 | `←`/`h` | Collapse the selected node, or move to its parent |
