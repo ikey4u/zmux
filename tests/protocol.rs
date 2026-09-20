@@ -5,7 +5,7 @@ use std::{
     fs,
     io::{BufReader, Write},
     os::unix::{
-        fs::MetadataExt,
+        fs::{MetadataExt, PermissionsExt},
         net::{UnixListener, UnixStream},
     },
     path::PathBuf,
@@ -185,6 +185,66 @@ fn fragmented_hello_and_persistent_readonly_channel_work() {
     assert!(fixture
         .request("CMD_OUTPUT set-workspace-home")
         .starts_with('/'));
+}
+
+#[test]
+fn remote_clipboard_paste_runs_zsync_in_the_server_drop_directory() {
+    let mut fixture = Fixture::new(false);
+    let zsync = fixture.root.join("fake-zsync");
+    fs::write(
+        &zsync,
+        "#!/bin/sh\n[ \"$1\" = p ] || exit 2\nprintf png > \"$PWD/synced-image.png\"\nprintf '%s\\n' \"$PWD/synced-image.png\"\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&zsync).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&zsync, permissions).unwrap();
+    fixture.server = Some(
+        fixture
+            .command()
+            .env("HOME", &fixture.root)
+            .env("ZSYNC_BIN", &zsync)
+            .arg("server")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !fixture.socket.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(fixture.socket.exists(), "isolated server did not start");
+
+    assert_eq!(fixture.request("PASTE_CLOUD"), "OK pasted 1 path(s)");
+    assert_eq!(
+        fs::read(fixture.root.join(".zmux/drop/synced-image.png")).unwrap(),
+        b"png"
+    );
+}
+
+#[test]
+fn remote_clipboard_command_is_capability_gated() {
+    let fixture = Fixture::new(true);
+    let mut peer = ProtocolInfo::current();
+    peer.capabilities.retain(|capability| {
+        capability != zmux::ipc::REMOTE_CLIPBOARD_PASTE_CAPABILITY
+    });
+    let mut stream = fixture.stream();
+    writeln!(
+        stream,
+        "ZMUX HELLO {}",
+        serde_json::to_string(&peer).unwrap()
+    )
+    .unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    assert!(recv_line(&mut reader).unwrap().starts_with("ZMUX WELCOME "));
+    stream.write_all(b"PASTE_CLOUD\n").unwrap();
+    assert_eq!(
+        recv_resp(&mut reader).unwrap(),
+        "ERROR remote clipboard paste capability was not negotiated"
+    );
 }
 
 #[test]

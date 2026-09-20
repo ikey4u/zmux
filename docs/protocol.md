@@ -35,8 +35,11 @@ Current required capabilities are `control-v1`, `frame-json-v1`,
 `ssh-stdio-v1`. `workspace-management-v1` is optional and gates remote
 Workspace enumeration and creation. Peers without it can still attach to the
 base Workspace, but must reject or avoid the newer management operations. These
-names describe explicit wire contracts, not installed third-party tools;
-clipboard availability is still checked at operation time.
+names describe explicit wire contracts, not installed third-party tools.
+`remote-clipboard-paste-v1` is optional and lets an SSH client ask the remote
+server to materialize its synchronized zsync clipboard and paste the resulting
+remote path into the active pane. Clipboard and zsync availability are still
+checked at operation time.
 
 Within a major version, minor additions must preserve old message meanings,
 field defaults, and commands. Optional new behavior must be capability-gated;
@@ -57,13 +60,13 @@ server -> client: ZMUX WELCOME {"peer": <ProtocolInfo>, "negotiated": <selection
 ```
 
 Only after WELCOME may the client send ATTACH/size, FRAME?, INPUT, commands,
-SESSION_TREE, OPTIONS, COPY_YANK, LIST, or KILL_SERVER. The server rejects an
-unnegotiated first command before dispatching it or resizing panes. Control,
-frame, read-only tree polling, and one-shot management connections all use this
-gate, including reconnections. Headers are bounded at 8 KiB and reads have
-transport timeouts. Buffered data after the handshake remains available to the
-business-protocol reader. An open connection retains its negotiated contract
-for its lifetime; its peer cannot change versions mid-stream.
+SESSION_TREE, OPTIONS, COPY_YANK, PASTE_CLOUD, LIST, or KILL_SERVER. The server
+rejects an unnegotiated first command before dispatching it or resizing panes.
+Control, frame, read-only tree polling, and one-shot management connections all
+use this gate, including reconnections. Headers are bounded at 8 KiB and reads
+have transport timeouts. Buffered data after the handshake remains available to
+the business-protocol reader. An open connection retains its negotiated
+contract for its lifetime; its peer cannot change versions mid-stream.
 
 Unix sockets and Windows named pipes use the same handshake. SSH stdio is a
 transparent transport for that exchange, not an alternative protocol. The

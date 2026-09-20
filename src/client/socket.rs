@@ -465,6 +465,50 @@ impl SocketClient {
         kill_server_with(&self.connector)
     }
 
+    pub fn is_remote(&self) -> bool {
+        self.connector.is_remote()
+    }
+
+    pub fn paste_synced_clipboard(&self) -> Result<String, String> {
+        let mut stream = self.connector.connect().map_err(|error| {
+            format!("remote clipboard unavailable: {error}")
+        })?;
+        stream
+            .set_read_timeout(Some(self.connector.initial_read_timeout()))
+            .map_err(|error| {
+                format!("remote clipboard unavailable: {error}")
+            })?;
+        let negotiated = crate::ipc::client_handshake(stream.as_mut())
+            .map_err(|error| {
+                format!("remote clipboard unavailable: {error}")
+            })?;
+        if !negotiated.capabilities.iter().any(|capability| {
+            capability == crate::ipc::REMOTE_CLIPBOARD_PASTE_CAPABILITY
+        }) {
+            return Err(
+                "remote zmux does not support synchronized clipboard paste; upgrade and restart the remote zmux server"
+                    .into(),
+            );
+        }
+        stream
+            .write_all(b"PASTE_CLOUD\n")
+            .and_then(|_| stream.flush())
+            .map_err(|error| {
+                format!("remote clipboard request failed: {error}")
+            })?;
+        let response = crate::ipc::recv_resp(&mut BufReader::new(stream))
+            .map_err(|error| {
+                format!("remote clipboard response failed: {error}")
+            })?;
+        if let Some(message) = response.strip_prefix("OK ") {
+            Ok(message.to_string())
+        } else if let Some(error) = response.strip_prefix("ERROR ") {
+            Err(error.to_string())
+        } else {
+            Err("remote clipboard returned an invalid response".into())
+        }
+    }
+
     pub fn run_command_with_output(&self, cmd: &str) -> String {
         let stream = match self.connector.connect_compatible() {
             Ok(s) => s,

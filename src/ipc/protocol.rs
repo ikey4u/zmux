@@ -10,6 +10,7 @@ pub const MIN_PEER_MINOR: u16 = 0;
 pub const HANDSHAKE_SCHEMA: u16 = 1;
 pub const HANDSHAKE_MAGIC: &str = "ZMUX";
 pub const WORKSPACE_MANAGEMENT_CAPABILITY: &str = "workspace-management-v1";
+pub const REMOTE_CLIPBOARD_PASTE_CAPABILITY: &str = "remote-clipboard-paste-v1";
 pub const HANDSHAKE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(5);
 const MAX_HEADER_BYTES: usize = 8 * 1024;
@@ -45,7 +46,11 @@ impl ProtocolInfo {
             capabilities: required
                 .iter()
                 .copied()
-                .chain(["ssh-stdio-v1", WORKSPACE_MANAGEMENT_CAPABILITY])
+                .chain([
+                    "ssh-stdio-v1",
+                    WORKSPACE_MANAGEMENT_CAPABILITY,
+                    REMOTE_CLIPBOARD_PASTE_CAPABILITY,
+                ])
                 .map(str::to_string)
                 .collect(),
             required_capabilities: required

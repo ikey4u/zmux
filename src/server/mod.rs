@@ -659,7 +659,8 @@ where
     stream.set_read_timeout(Some(crate::ipc::HANDSHAKE_TIMEOUT))?;
     let mut write_stream = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
-    crate::ipc::server_handshake(&mut reader, &mut write_stream)?;
+    let negotiated =
+        crate::ipc::server_handshake(&mut reader, &mut write_stream)?;
     reader.get_ref().set_read_timeout(None)?;
 
     let hello = recv_line(&mut reader)?;
@@ -734,6 +735,26 @@ where
             log_server("COPY_YANK served, closing");
             return Ok(());
         }
+        "PASTE_CLOUD"
+            if negotiated.capabilities.iter().any(|capability| {
+                capability == crate::ipc::REMOTE_CLIPBOARD_PASTE_CAPABILITY
+            }) =>
+        {
+            let response = match paste_synced_clipboard_to_pane(&state) {
+                Ok(message) => format!("OK {message}"),
+                Err(error) => format!("ERROR {error}"),
+            };
+            send_resp(&mut write_stream, &response)?;
+            log_server("PASTE_CLOUD served, closing");
+            return Ok(());
+        }
+        "PASTE_CLOUD" => {
+            send_resp(
+                &mut write_stream,
+                "ERROR remote clipboard paste capability was not negotiated",
+            )?;
+            return Ok(());
+        }
         line if line.starts_with("ATTACH") => {}
         _ => {
             log_server(&format!("unknown hello {:?}, closing", hello));
@@ -791,7 +812,11 @@ where
             let rest = &line["PASTE ".len()..];
             let (pane_id, hex) = parse_input_line(rest);
             if let Ok(bytes) = decode_hex(hex) {
-                paste_bytes_to_pane(&state, pane_id, &bytes, false);
+                if let Err(error) =
+                    paste_bytes_to_pane(&state, pane_id, &bytes, false)
+                {
+                    log_server(&format!("paste input failed: {error}"));
+                }
             }
         } else if line.starts_with("CMD ") {
             let cmd = &line["CMD ".len()..];
@@ -1434,24 +1459,23 @@ fn paste_bytes_to_pane(
     pane_id: Option<usize>,
     bytes: &[u8],
     raw: bool,
-) {
-    let Ok(s) = state.lock() else {
-        return;
-    };
-    let Some(session) = s.active_session() else {
-        return;
-    };
-    let Some(win) = session.windows.get(session.active_window_idx) else {
-        return;
-    };
+) -> Result<(), String> {
+    let s = state
+        .lock()
+        .map_err(|_| "server state is unavailable".to_string())?;
+    let session = s
+        .active_session()
+        .ok_or_else(|| "no active session".to_string())?;
+    let win = session
+        .windows
+        .get(session.active_window_idx)
+        .ok_or_else(|| "no active window".to_string())?;
     let pane = if let Some(id) = pane_id {
         crate::layout::find_pane_by_id(&win.root, id)
     } else {
         crate::layout::active_pane(&win.root, &win.active_pane_path)
     };
-    let Some(pane) = pane else {
-        return;
-    };
+    let pane = pane.ok_or_else(|| "no active pane".to_string())?;
     let bracketed = pane
         .parser
         .lock()
@@ -1468,7 +1492,39 @@ fn paste_bytes_to_pane(
         out.extend_from_slice(b"\x1b[201~");
         out
     };
-    let _ = write_pty_writer(&writer, &payload);
+    write_pty_writer(&writer, &payload).map_err(|error| error.to_string())
+}
+
+fn paste_synced_clipboard_to_pane(
+    state: &Arc<Mutex<Server>>,
+) -> Result<String, String> {
+    let item = crate::domain::clip::read_zsync_clipboard()?;
+    crate::domain::clip::validate_or_text(&item, false)?;
+    let (text, message) = match item {
+        crate::domain::clip::ClipboardItem::Text(text) => {
+            let message = format!("pasted {} chars", text.chars().count());
+            (text, message)
+        }
+        crate::domain::clip::ClipboardItem::ImagePng { bytes, .. } => {
+            let path = crate::domain::clip::save_local_image(&bytes)?;
+            let quoted = crate::domain::clip::quote_paths(
+                &[path.to_string_lossy().into_owned()],
+                false,
+            )?;
+            (quoted, "pasted remote image path".into())
+        }
+        crate::domain::clip::ClipboardItem::Files(files) => {
+            let paths: Vec<String> = files
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect();
+            let quoted = crate::domain::clip::quote_paths(&paths, false)?;
+            let message = format!("pasted {} path(s)", paths.len());
+            (quoted, message)
+        }
+    };
+    paste_bytes_to_pane(state, None, text.as_bytes(), false)?;
+    Ok(message)
 }
 
 fn write_pty_writer(

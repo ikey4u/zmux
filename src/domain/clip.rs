@@ -71,11 +71,18 @@ fn zsync_command() -> Command {
 }
 
 fn zsync_bin() -> PathBuf {
+    if let Some(path) = std::env::var_os("ZSYNC_BIN")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+    {
+        return path;
+    }
     extra_zsync_dirs()
         .into_iter()
         .map(|dir| dir.join("zsync"))
         .chain(path_lookup("zsync"))
         .find(|p| p.is_file())
+        .or_else(zsync_from_login_shell)
         .unwrap_or_else(|| PathBuf::from("zsync"))
 }
 
@@ -85,8 +92,70 @@ fn extra_zsync_dirs() -> Vec<PathBuf> {
     };
     vec![
         home.join(".local").join("bin"),
+        home.join("bin"),
         home.join(".cargo").join("bin"),
+        home.join(".local").join("share").join("mise").join("shims"),
+        home.join(".asdf").join("shims"),
+        home.join(".nix-profile").join("bin"),
     ]
+}
+
+#[cfg(unix)]
+fn zsync_from_login_shell() -> Option<PathBuf> {
+    let shell = std::env::var_os("SHELL").map(PathBuf::from)?;
+    zsync_from_shell(&shell)
+}
+
+#[cfg(unix)]
+fn zsync_from_shell(shell: &Path) -> Option<PathBuf> {
+    const MARKER: &str = "ZMUX_ZSYNC_PATH:";
+    if !shell.is_file() {
+        return None;
+    }
+    let mut command = Command::new(shell);
+    command
+        .args([
+            "-lic",
+            "candidate=$(command -v zsync 2>/dev/null) || exit 127; printf 'ZMUX_ZSYNC_PATH:%s\\n' \"$candidate\"",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = thread::spawn(move || {
+        let mut buf = Vec::new();
+        stdout
+            .by_ref()
+            .take(64 * 1024 + 1)
+            .read_to_end(&mut buf)
+            .ok()?;
+        Some(buf)
+    });
+    if !wait_child(&mut child, ZSYNC_TIMEOUT) {
+        // A startup script may leave a descendant holding stdout. Detach the
+        // bounded reader instead of defeating the lookup timeout by joining it.
+        drop(reader);
+        return None;
+    }
+    let output = reader.join().ok()??;
+    if output.len() > 64 * 1024 {
+        return None;
+    }
+    String::from_utf8(output)
+        .ok()?
+        .lines()
+        .rev()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix(MARKER))
+        .filter(|line| line.starts_with('/'))
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
+}
+
+#[cfg(not(unix))]
+fn zsync_from_login_shell() -> Option<PathBuf> {
+    None
 }
 
 fn path_lookup(name: &str) -> impl Iterator<Item = PathBuf> {
@@ -456,6 +525,39 @@ mod tests {
                 |d| d.ends_with(std::path::Path::new(".cargo").join("bin"))
             ));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn login_shell_lookup_accepts_an_absolute_zsync_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "zmux zsync shell test {}",
+            crate::domain::ids::new_instance_id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let zsync = dir.join("zsync");
+        fs::write(&zsync, b"#!/bin/sh\n").unwrap();
+        let shell = dir.join("login-shell");
+        fs::write(
+            &shell,
+            format!(
+                "#!/bin/sh\nprintf 'startup noise\\nZMUX_ZSYNC_PATH:%s\\n' '{}'\n",
+                zsync.display()
+            ),
+        )
+        .unwrap();
+        for path in [&zsync, &shell] {
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(path, permissions).unwrap();
+        }
+
+        assert_eq!(zsync_from_shell(&shell).as_deref(), Some(zsync.as_path()));
+        fs::remove_file(zsync).unwrap();
+        fs::remove_file(shell).unwrap();
+        fs::remove_dir(dir).unwrap();
     }
 
     #[test]

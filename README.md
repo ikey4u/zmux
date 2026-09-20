@@ -386,7 +386,7 @@ A headless Linux host has no OS clipboard. zmux uses [zsync](https://github.com/
 On both machines, run `zsync daemon`, then pair once (`zsync pair` on one side, `zsync connect <ticket>` on the other). After that:
 
 - Copy mode `y` / `Enter` writes into zsync (and into the local OS clipboard when one exists). Over a nested SSH session without a display, this is the path that reaches the laptop.
-- `Prefix + ]` reads the OS clipboard first; if that is empty (typical on the server), it runs `zsync p` in `~/.zmux/drop`.
+- `Prefix + ]` reads the OS clipboard for a local Workspace. For a remote Workspace, it asks the remote zmux server to run `zsync p` in its own `~/.zmux/drop`.
 - Synced text is pasted as text. For a synced image or file, zsync materializes the bytes under `~/.zmux/drop` and zmux pastes its shell-quoted, absolute Linux path. The private drop directory is also covered by zmux's 24-hour/1-GiB cleanup policy.
 - `Cmd+V` / `Super+V` invokes the same operation when the terminal forwards that key to zmux using the enhanced keyboard protocol. `Prefix + ]` remains the terminal-independent fallback.
 - Programs in a pane that emit OSC 52 (for example Neovim's osc52 provider) are still relayed to the attached terminal, and the decoded text is also copied into zsync.

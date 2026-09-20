@@ -197,7 +197,11 @@ impl DomainHandle for SocketClient {
     }
 
     fn paste_cloud(&self) -> Result<String, String> {
-        local_paste_cloud(|text| self.send_input(text.as_bytes()))
+        if self.is_remote() {
+            self.paste_synced_clipboard()
+        } else {
+            local_paste_cloud(|text| self.send_input(text.as_bytes()))
+        }
     }
 }
 
