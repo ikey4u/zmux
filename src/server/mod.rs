@@ -35,6 +35,7 @@ struct FrameStore {
     ansi_history: VecDeque<(u64, Vec<u8>)>,
     ansi_history_bytes: usize,
     history_floor: u64,
+    overlay_restore: Option<(u64, String)>,
 }
 
 impl FrameStore {
@@ -70,10 +71,36 @@ impl FrameStore {
         self.latest = Some(frame);
     }
 
+    fn publish_authoritative(&mut self, frame: FrameData) {
+        // Full repaints establish a new absolute-coordinate viewport. Never
+        // merge deltas from the previous viewport ahead of them: those bytes
+        // can paint pane borders/text into a newly exposed sidebar or leave a
+        // staircase of borders across rapid terminal resizes.
+        self.ansi_history.clear();
+        self.ansi_history_bytes = 0;
+        // The new frame is self-contained, so even a connection older than
+        // the discarded deltas can recover by consuming it directly. A future
+        // capacity eviction will raise the floor again if this snapshot leaves
+        // the replay window.
+        self.history_floor = 0;
+        self.publish(frame);
+    }
+
     fn frame_since(&self, sequence: u64) -> (Option<FrameData>, u64, bool) {
         let mut frame = self.latest.clone();
         let needs_snapshot = sequence < self.history_floor;
         if let Some(frame) = frame.as_mut() {
+            // A busy pane may publish another incremental frame between a
+            // REFRESH_FRAME request and this connection's next poll. Preserve
+            // the restore marker as a sequence property so the merged payload
+            // is still recognized as authoritative by the client.
+            if let Some((restore_sequence, frame_type)) =
+                self.overlay_restore.as_ref()
+            {
+                if *restore_sequence > sequence {
+                    frame.frame_type = frame_type.clone();
+                }
+            }
             let mut ansi = Vec::new();
             if !needs_snapshot {
                 for (_, bytes) in self
@@ -90,6 +117,25 @@ impl FrameStore {
             frame.ansi = Some(STANDARD.encode(ansi));
         }
         (frame, self.sequence, needs_snapshot)
+    }
+
+    fn mark_overlay_restore(&mut self) {
+        let frame_type = format!(
+            "overlay-restore-{}",
+            OVERLAY_RESTORE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        );
+        if let Some(frame) = self.latest.as_mut() {
+            frame.frame_type = frame_type.clone();
+            self.overlay_restore = Some((self.sequence, frame_type));
+        }
+    }
+
+    fn publish_overlay_restore(&mut self, frame: FrameData) {
+        // Keep publication and marker assignment under the same lock. A frame
+        // connection must never acknowledge the full repaint in the tiny gap
+        // before it becomes recognizable as an overlay restore.
+        self.publish_authoritative(frame);
+        self.mark_overlay_restore();
     }
 }
 
@@ -769,10 +815,10 @@ where
     let mut last_frame_sequence =
         latest_frame.lock().map(|store| store.sequence).unwrap_or(0);
     {
-        if let Ok(mut sz) = size_arc.lock() {
-            *sz = new_size;
-        }
         if let Ok(mut s) = state.lock() {
+            if let Ok(mut sz) = size_arc.lock() {
+                *sz = new_size;
+            }
             resize_all_panes(&mut s, new_size);
             refresh_latest_frame(&latest_frame, &s, new_size);
         }
@@ -862,10 +908,10 @@ where
         } else if line.starts_with("RESIZE ") {
             let rest = &line["RESIZE ".len()..];
             if let Some(new_size) = parse_size_line(rest) {
-                if let Ok(mut sz) = size_arc.lock() {
-                    *sz = new_size;
-                }
                 if let Ok(mut s) = state.lock() {
+                    if let Ok(mut sz) = size_arc.lock() {
+                        *sz = new_size;
+                    }
                     resize_all_panes(&mut s, new_size);
                 }
                 schedule_delayed_frame_refresh(
@@ -881,16 +927,7 @@ where
                 // A floating overlay is drawn only by the client. Once it closes,
                 // the next frame must contain every pane so its covered rectangle
                 // is restored instead of replaying a ping-only incremental frame.
-                refresh_latest_frame(&latest_frame, &s, size);
-                if let Ok(mut latest) = latest_frame.lock() {
-                    if let Some(frame) = latest.latest.as_mut() {
-                        frame.frame_type = format!(
-                            "overlay-restore-{}",
-                            OVERLAY_RESTORE_SEQUENCE
-                                .fetch_add(1, Ordering::Relaxed,)
-                        );
-                    }
-                }
+                refresh_overlay_restore_frame(&latest_frame, &s, size);
             }
         } else if line.starts_with("OPTION ") {
             let rest = &line["OPTION ".len()..];
@@ -925,6 +962,12 @@ where
                     .map(|store| store.frame_since(last_frame_sequence))
                     .unwrap_or((None, last_frame_sequence, false));
             if needs_snapshot {
+                let restore_frame_type = frame
+                    .as_ref()
+                    .filter(|frame| {
+                        frame.frame_type.starts_with("overlay-restore-")
+                    })
+                    .map(|frame| frame.frame_type.clone());
                 let size = size_arc
                     .lock()
                     .map(|size| *size)
@@ -935,6 +978,11 @@ where
                 frame = state.lock().ok().and_then(|state| {
                     build_private_snapshot_frame(&state, size)
                 });
+                if let (Some(frame), Some(frame_type)) =
+                    (frame.as_mut(), restore_frame_type)
+                {
+                    frame.frame_type = frame_type;
+                }
             }
             if frame.is_none() {
                 let is_empty = state
@@ -1208,10 +1256,14 @@ fn schedule_delayed_frame_refresh(
     let size_arc = Arc::clone(size_arc);
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(60));
-        if size_arc.lock().map(|size| *size).ok() != Some(target_size) {
-            return;
-        }
         if let Ok(state) = state.lock() {
+            // RESIZE commits the viewport and PTY grids while holding the same
+            // state -> size lock order. Checking the target under the state
+            // lock prevents an old delayed refresh from publishing after a
+            // newer resize with mismatched absolute coordinates.
+            if size_arc.lock().map(|size| *size).ok() != Some(target_size) {
+                return;
+            }
             refresh_latest_frame(&latest_frame, &state, target_size);
             mark_data_ready();
         }
@@ -1244,7 +1296,38 @@ fn refresh_latest_frame(
     );
     if let Ok(fd) = serde_json::from_str::<FrameData>(&json) {
         if let Ok(mut frame) = latest_frame.lock() {
-            frame.publish(fd);
+            frame.publish_authoritative(fd);
+        }
+    }
+}
+
+fn refresh_overlay_restore_frame(
+    latest_frame: &Arc<Mutex<FrameStore>>,
+    state: &Server,
+    size: Size,
+) {
+    let Some(session) = state.active_session() else {
+        return;
+    };
+    let Some(win) = session.windows.get(session.active_window_idx) else {
+        return;
+    };
+    let json = build_frame_json(
+        session,
+        win,
+        frame_layout_area(size),
+        None,
+        state.hide_borders,
+        size,
+        FrameAnsiOptions {
+            clear_display: true,
+            force_repaint: true,
+        },
+        "",
+    );
+    if let Ok(fd) = serde_json::from_str::<FrameData>(&json) {
+        if let Ok(mut frame) = latest_frame.lock() {
+            frame.publish_overlay_restore(fd);
         }
     }
 }
@@ -1697,7 +1780,7 @@ fn render_loop(
             std::process::exit(0);
         }
 
-        let frame_json = {
+        let (frame_json, authoritative) = {
             let mut s = match state.lock() {
                 Ok(s) => s,
                 Err(_) => continue,
@@ -1763,15 +1846,22 @@ fn render_loop(
                 },
             );
             let ansi_b64 = encode_ansi_base64(&ansi);
-            format!(
-                "{{\"type\":\"frame\",\"layout\":{},\"status\":{},\"ansi\":\"{}\"}}",
-                layout_part, status, ansi_b64
+            (
+                format!(
+                    "{{\"type\":\"frame\",\"layout\":{},\"status\":{},\"ansi\":\"{}\"}}",
+                    layout_part, status, ansi_b64
+                ),
+                clear_display,
             )
         };
 
         if let Ok(fd) = serde_json::from_str::<FrameData>(&frame_json) {
             if let Ok(mut frame) = latest_frame.lock() {
-                frame.publish(fd);
+                if authoritative {
+                    frame.publish_authoritative(fd);
+                } else {
+                    frame.publish(fd);
+                }
                 last_published_at = Instant::now();
             }
         }
@@ -3666,11 +3756,14 @@ mod tests {
         assert!(retained_bytes <= FRAME_HISTORY_BYTES);
         assert!(store.ansi_history.len() <= FRAME_HISTORY_ENTRIES);
 
+        store.mark_overlay_restore();
         let (frame, sequence, needs_snapshot) = store.frame_since(0);
         assert_eq!(sequence, publications as u64);
         assert!(needs_snapshot);
+        let frame = frame.unwrap();
+        assert!(frame.frame_type.starts_with("overlay-restore-"));
         let ansi = STANDARD
-            .decode(frame.unwrap().ansi.unwrap())
+            .decode(frame.ansi.unwrap())
             .expect("snapshot fallback ANSI marker must remain valid base64");
         assert!(
             ansi.is_empty(),
@@ -3691,6 +3784,57 @@ mod tests {
             .decode(frame.unwrap().ansi.unwrap())
             .expect("empty ANSI must remain valid base64");
         assert!(ansi.is_empty());
+    }
+
+    #[test]
+    fn frame_store_preserves_restore_marker_across_newer_pane_output() {
+        let mut store = FrameStore::default();
+        let mut restore = test_frame();
+        restore.ansi = Some(STANDARD.encode(b"full-snapshot"));
+        store.publish_overlay_restore(restore);
+
+        let mut spinner = test_frame();
+        spinner.ansi = Some(STANDARD.encode(b"spinner-delta"));
+        store.publish(spinner);
+
+        let (frame, sequence, missed) = store.frame_since(0);
+        let frame = frame.unwrap();
+        assert!(frame.frame_type.starts_with("overlay-restore-"));
+        assert_eq!(
+            STANDARD.decode(frame.ansi.unwrap()).unwrap(),
+            b"full-snapshotspinner-delta"
+        );
+        assert_eq!(sequence, 2);
+        assert!(!missed);
+
+        let (acknowledged, _, _) = store.frame_since(sequence);
+        assert_eq!(acknowledged.unwrap().frame_type, "frame");
+    }
+
+    #[test]
+    fn authoritative_frame_drops_deltas_from_the_previous_viewport() {
+        let mut store = FrameStore::default();
+        let mut old_viewport = test_frame();
+        old_viewport.ansi = Some(STANDARD.encode(b"old-absolute-coordinates"));
+        store.publish(old_viewport);
+        let previous_sequence = store.sequence;
+
+        let mut resized = test_frame();
+        resized.ansi = Some(STANDARD.encode(b"new-full-viewport"));
+        store.publish_authoritative(resized);
+
+        let (frame, _, missed) = store.frame_since(previous_sequence);
+        assert!(!missed);
+        assert_eq!(
+            STANDARD.decode(frame.unwrap().ansi.unwrap()).unwrap(),
+            b"new-full-viewport"
+        );
+        let (from_start, _, missed) = store.frame_since(0);
+        assert!(!missed);
+        assert_eq!(
+            STANDARD.decode(from_start.unwrap().ansi.unwrap()).unwrap(),
+            b"new-full-viewport"
+        );
     }
 
     #[test]

@@ -567,6 +567,7 @@ fn mark_split_gaps_skip(f: &mut Frame, direction: &str, chunks: &[Rect]) {
 }
 
 fn mark_rect_skip(f: &mut Frame, area: Rect) {
+    let area = area.intersection(f.area());
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -2130,6 +2131,20 @@ pub fn render_options_panel(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ansi_skip_area_is_clipped_to_the_live_ratatui_buffer() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                // A terminal resize can race the server frame and briefly
+                // leave a 120x30 layout beside an 80x24 Ratatui buffer.
+                mark_rect_skip(frame, Rect::new(0, 0, 120, 30));
+            })
+            .unwrap();
+    }
+
     #[test]
     fn floating_navigation_geometry_stays_inside_tiny_and_large_terminals() {
         for (width, height) in

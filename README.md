@@ -152,8 +152,10 @@ refuses a live socket. See [protocol design and upgrade rules](docs/protocol.md)
   typed inside a pane remains a normal shell command; it does **not** currently
   create a Machine node automatically. zmux also does not import every host
   from `~/.ssh/config` or modify remote shell startup files.
-- Display names persist, but the remote connection list is not restored on
-  client restart. Run `new -m` again to reconnect and reuse the saved labels.
+- Remote Machines added with `new -m` are saved and re-probed when a client
+  starts. Thus `Prefix+d` followed by `zmux a` restores the remote roots and
+  reconnects their live Workspaces. Explicitly closing a Machine removes it
+  from this saved connection list.
 
 If the remote node reports unavailable, verify authentication and the same login
 environment used by discovery:
@@ -259,11 +261,11 @@ held after the prefix (including Ctrl+h / Backspace).
 
 #### Display-name persistence
 
-Machine and workspace display names are persisted in `~/.config/zmux/machines.json` (or
+Machine routes and machine/workspace display names are persisted in `~/.config/zmux/machines.json` (or
 `$XDG_CONFIG_HOME/zmux/machines.json`). When `ZMUX_CONFIG` is set, `machines.json`
 is stored beside that configuration file. Renaming changes only the display
-name, never the SSH destination. Names survive detach/restart; remote roots
-are added again with `:new -m <SSH_HOST>` and reuse their saved names.
+name, never the SSH destination. Both names and remote roots survive
+detach/restart; closing a remote Machine explicitly forgets its saved route.
 
 ---
 

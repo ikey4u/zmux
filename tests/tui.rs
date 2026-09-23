@@ -371,6 +371,35 @@ exec /bin/sh -c "$last"
             );
         }
     }
+
+    fn wait_for_exit(&mut self, label: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            self.pump();
+            if self.child.try_wait().unwrap().is_some() {
+                self.pump_for(Duration::from_millis(100));
+                return;
+            }
+        }
+        panic!("{label}: client did not exit");
+    }
+
+    fn assert_terminal_modes_restored(&self) {
+        for sequence in [
+            b"\x1b[<1u".as_slice(),
+            b"\x1b[?1006l",
+            b"\x1b[?1000l",
+            b"\x1b[?2004l",
+            b"\x1b[?7h",
+        ] {
+            assert!(
+                self.raw
+                    .windows(sequence.len())
+                    .any(|part| part == sequence),
+                "missing terminal cleanup sequence {sequence:?}"
+            );
+        }
+    }
 }
 
 impl Drop for Tui {
@@ -426,6 +455,220 @@ fn remote_login_shell_path_is_discovered_and_reused_by_the_bridge() {
         commands
             .contains(&format!("exec '{}' -L ui mux", executable.display())),
         "bridge did not reuse discovered absolute path:\n{commands}"
+    );
+}
+
+#[test]
+fn navigation_popup_stays_stable_over_busy_spinner_and_restores_output() {
+    let mut tui = Tui::start_hidden();
+    tui.wait("initial pane ready", |rows| {
+        rows.iter().any(|line| line.contains("READY>"))
+    });
+    tui.master
+        .resize(PtySize {
+            rows: 60,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    tui.screen.resize(60, 120);
+    tui.wait("tall viewport leaves pane content outside popup", |rows| {
+        rows.last().is_some_and(|line| line.contains("[main]"))
+            && rows.iter().any(|line| line.contains("READY>"))
+    });
+    tui.send(
+        b"i=0; while [ $i -lt 150 ]; do printf '\\rSPIN_%03d' \"$i\"; i=$((i+1)); sleep 0.02; done; printf '\\nSPIN_DONE\\n'\r",
+    );
+    let spinner_value = |rows: &[String]| {
+        rows.iter().find_map(|line| {
+            let at = line.find("SPIN_")? + "SPIN_".len();
+            line.get(at..at + 3)?.parse::<u16>().ok()
+        })
+    };
+    tui.wait("spinner becomes visible", |rows| {
+        spinner_value(rows).is_some()
+    });
+    tui.send(b"\x01m");
+    tui.wait("navigation popup opens over spinner", |rows| {
+        rows.iter()
+            .any(|line| line.contains("Navigation · Esc close"))
+    });
+
+    let before = spinner_value(&tui.lines()).unwrap();
+    let baseline = tui.frames.len();
+    tui.pump_for(Duration::from_secs(1));
+    assert!(
+        spinner_value(&tui.lines()).is_some_and(|after| after > before),
+        "pane output stopped while the popup was open"
+    );
+    tui.assert_preserved_since(baseline, "Navigation · Esc close");
+
+    tui.send(b"q");
+    tui.wait("closing popup restores pane output", |rows| {
+        !rows
+            .iter()
+            .any(|line| line.contains("Navigation · Esc close"))
+            && rows.iter().any(|line| line.contains("SPIN_DONE"))
+    });
+}
+
+#[test]
+fn popup_restores_after_another_client_attaches_at_a_different_size() {
+    let mut first = Tui::start_hidden();
+    first.wait("first client ready", |rows| {
+        rows.iter().any(|line| line.contains("READY>"))
+    });
+    first
+        .master
+        .resize(PtySize {
+            rows: 40,
+            cols: 140,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    first.screen.resize(40, 140);
+    first.wait("first client resized", |rows| {
+        rows.last().is_some_and(|line| line.contains("[main]"))
+            && rows.iter().any(|line| line.contains("READY>"))
+    });
+
+    let mut second = Tui::attach_raw(first.root.clone(), false);
+    second.wait("smaller second client ready", |rows| {
+        rows.iter().any(|line| line.contains("READY>"))
+    });
+
+    first.send(b"\x01m");
+    first.wait("first client popup opens", |rows| {
+        rows.iter()
+            .any(|line| line.contains("Navigation · Esc close"))
+    });
+    first.send(b"q");
+    first.wait("first client popup closes without freezing", |rows| {
+        !rows
+            .iter()
+            .any(|line| line.contains("Navigation · Esc close"))
+            && rows.iter().any(|line| line.contains("READY>"))
+    });
+    first.send(b"printf 'TWO_CLIENTS_%s\\n' 'STILL_RESPONSIVE'\r");
+    first.wait("first client still renders pane output", |rows| {
+        rows.iter()
+            .any(|line| line.contains("TWO_CLIENTS_STILL_RESPONSIVE"))
+    });
+}
+
+#[test]
+fn detach_restores_keyboard_mouse_and_terminal_modes() {
+    let mut tui = Tui::start_hidden();
+    tui.wait("client ready", |rows| {
+        rows.iter().any(|line| line.contains("READY>"))
+    });
+    tui.send(b"\x01d");
+    tui.wait_for_exit("detach");
+    tui.assert_terminal_modes_restored();
+}
+
+#[test]
+fn sigterm_restores_keyboard_mouse_and_terminal_modes() {
+    let mut tui = Tui::start_hidden();
+    tui.wait("client ready", |rows| {
+        rows.iter().any(|line| line.contains("READY>"))
+    });
+    let pid = tui.child.process_id().expect("child process id");
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) }, 0);
+    tui.wait_for_exit("SIGTERM");
+    tui.assert_terminal_modes_restored();
+}
+
+#[test]
+fn long_shell_output_leaves_cursor_at_the_latest_prompt() {
+    fn assert_prompt_cursor(tui: &Tui) {
+        let lines = tui.lines();
+        let prompt_row = lines
+            .iter()
+            .rposition(|line| line.contains("READY>"))
+            .expect("visible shell prompt");
+        let prompt_col =
+            lines[prompt_row].rfind("READY>").unwrap() + "READY>".len();
+        let (cursor_row, cursor_col) = tui.screen.cursor_position();
+        assert_eq!(cursor_row, prompt_row as u16);
+        assert!(
+            (prompt_col as u16).saturating_sub(1) <= cursor_col
+                && cursor_col <= prompt_col as u16 + 2,
+            "cursor does not follow the current prompt:\n{}",
+            lines.join("\n")
+        );
+    }
+
+    let mut tui = Tui::start_hidden();
+    tui.wait("initial pane ready", |rows| {
+        rows.iter().any(|line| line.contains("READY>"))
+    });
+    tui.send(
+        b"i=0; while [ $i -lt 90 ]; do printf 'OUTPUT_%03d\r\n' \"$i\"; i=$((i+1)); done; printf 'OUTPUT_DONE\r\n'\r",
+    );
+    tui.wait("long output has completed", |rows| {
+        rows.iter().any(|line| line.contains("OUTPUT_DONE"))
+            && rows.iter().any(|line| line.contains("READY>"))
+    });
+    tui.pump_for(Duration::from_millis(150));
+    assert_prompt_cursor(&tui);
+
+    for (rows, cols) in [(40, 140), (24, 100)] {
+        tui.master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        tui.screen.resize(rows, cols);
+        tui.wait("resized output and status are visible", |lines| {
+            lines.first().and_then(|line| line.chars().last()) == Some('┐')
+                && lines.last().is_some_and(|line| line.contains("[main]"))
+                && lines.iter().any(|line| line.contains("READY>"))
+        });
+        tui.pump_for(Duration::from_millis(150));
+        assert_prompt_cursor(&tui);
+    }
+}
+
+#[test]
+fn detached_client_restores_remote_machines_on_attach() {
+    let mut tui = Tui::start();
+    tui.ready();
+    tui.command("new -m loopback");
+    tui.wait("remote connected before detach", |rows| {
+        rows.iter().any(|line| line.contains("● loopback"))
+            && rows.iter().any(|line| line.contains("▣ ui"))
+    });
+    let saved = zmux::config::machines::MachineNames::load(
+        &tui.root.join("machines.json"),
+    )
+    .unwrap();
+    assert_eq!(saved.routes["ssh:8#loopback"], vec!["loopback".to_string()]);
+
+    tui.send(b"\x01d");
+    let until = Instant::now() + Duration::from_secs(8);
+    let mut detached = false;
+    while Instant::now() < until {
+        tui.pump();
+        if tui.child.try_wait().unwrap().is_some() {
+            detached = true;
+            break;
+        }
+    }
+    assert!(detached, "Prefix+d did not detach the original client");
+
+    let mut attached = Tui::attach_with_all(tui.root.clone(), true);
+    attached.wait(
+        "zmux a restores and reconnects saved remote Machine",
+        |rows| {
+            rows.iter().any(|line| line.contains("● loopback"))
+                && rows.iter().any(|line| line.contains("▣ ui"))
+        },
     );
 }
 
@@ -945,7 +1188,10 @@ fn command_edit_focus_split_close_refresh_and_resize() {
     });
     tui.assert_preserved_since(baseline, "LEFT_SENTINEL");
 
-    tui.send(b"\x01\"");
+    // With REPORT_ALL_KEYS, Alacritty first reports the standalone left-Shift
+    // press (57441), then Shift+' as the unshifted key plus SHIFT. The modifier
+    // event must not consume Prefix before CSI 39;2u arrives.
+    tui.send(b"\x01\x1b[57441;2u\x1b[39;2u");
     tui.wait("vertical split", |rows| {
         rows.iter().any(|l| l.contains("pane 1"))
             && rows.iter().filter(|l| l.contains("READY>")).count() >= 2
@@ -1669,6 +1915,16 @@ fn global_shortcuts_help_aliases_restore_split_panes() {
 fn sidebar_toggle_help_and_workspace_rename() {
     let mut tui = Tui::start();
     tui.ready();
+    // Alacritty sends the Shift press before the shifted M. The global
+    // Prefix+M shortcut must retain its chord across that modifier event.
+    tui.send(b"\x01\x1b[57441;2u\x1b[109;2u");
+    tui.wait("shifted prefix hides sidebar", |rows| {
+        rows[0].starts_with('┌')
+    });
+    tui.send(b"\x01\x1b[57441;2u\x1b[109;2u");
+    tui.wait("shifted prefix restores sidebar", |rows| {
+        rows.iter().any(|line| line.contains("pane 0"))
+    });
     tui.send(b"echo TOGGLE_SENTINEL\r");
     tui.wait("original output", |rows| {
         rows.iter()

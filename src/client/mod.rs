@@ -1,5 +1,6 @@
 use std::{
     io::{self, Write},
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
@@ -16,7 +17,8 @@ use crossterm::{
     },
     execute,
     terminal::{
-        self, DisableLineWrap, EnterAlternateScreen, LeaveAlternateScreen,
+        self, DisableLineWrap, EnableLineWrap, EnterAlternateScreen,
+        LeaveAlternateScreen,
     },
 };
 use ratatui::Terminal;
@@ -46,6 +48,98 @@ pub struct ClientApp {
     pub clean: bool,
     pub start_dir: Option<String>,
     pub attach_all: bool,
+}
+
+static CLIENT_TERMINAL_ACTIVE: AtomicBool = AtomicBool::new(false);
+static CLIENT_KEYBOARD_ENHANCEMENT_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Own terminal modes from the first successful raw-mode change onward. A
+/// normal return, including any `?` during initialization, restores them.
+/// The panic hook invokes the same routine because release builds abort on
+/// panic and therefore do not run destructors.
+struct ClientTerminalGuard;
+
+impl ClientTerminalGuard {
+    fn new() -> Self {
+        CLIENT_TERMINAL_ACTIVE.store(true, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for ClientTerminalGuard {
+    fn drop(&mut self) {
+        restore_client_terminal();
+    }
+}
+
+fn restore_client_terminal() {
+    if !CLIENT_TERMINAL_ACTIVE.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    let mut out = io::stdout();
+    if CLIENT_KEYBOARD_ENHANCEMENT_ACTIVE.swap(false, Ordering::SeqCst) {
+        let _ = execute!(out, PopKeyboardEnhancementFlags);
+    }
+    let _ = execute!(out, DisableMouseCapture, DisableBracketedPaste);
+    let _ = execute!(
+        out,
+        LeaveAlternateScreen,
+        EnableLineWrap,
+        SetCursorStyle::DefaultUserShape,
+        cursor::Show
+    );
+    let _ = write_mouse_pointer_shape(&mut out, MousePointerShape::Default);
+    let _ = terminal::disable_raw_mode();
+}
+
+#[cfg(unix)]
+static CLIENT_TERMINATION_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn request_client_termination(_: libc::c_int) {
+    CLIENT_TERMINATION_REQUESTED.store(true, Ordering::Relaxed);
+}
+
+/// Turn a catchable termination signal into a normal exit from the event
+/// loop, so the terminal guard can emit its cleanup sequences. SIGKILL cannot
+/// be caught and a dead terminal cannot receive cleanup output.
+#[cfg(unix)]
+struct ClientTerminationGuard {
+    previous: Vec<(nix::sys::signal::Signal, nix::sys::signal::SigAction)>,
+}
+
+#[cfg(unix)]
+impl ClientTerminationGuard {
+    fn install() -> io::Result<Self> {
+        use nix::sys::signal::{
+            sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal,
+        };
+
+        CLIENT_TERMINATION_REQUESTED.store(false, Ordering::Relaxed);
+        let action = SigAction::new(
+            SigHandler::Handler(request_client_termination),
+            SaFlags::empty(),
+            SigSet::empty(),
+        );
+        let mut guard = Self {
+            previous: Vec::new(),
+        };
+        for signal in [Signal::SIGTERM, Signal::SIGINT, Signal::SIGQUIT] {
+            let previous = unsafe { sigaction(signal, &action) }
+                .map_err(io::Error::other)?;
+            guard.previous.push((signal, previous));
+        }
+        Ok(guard)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ClientTerminationGuard {
+    fn drop(&mut self) {
+        for (signal, previous) in self.previous.drain(..).rev() {
+            let _ = unsafe { nix::sys::signal::sigaction(signal, &previous) };
+        }
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -212,10 +306,10 @@ impl RemoteRegistry {
         activate: bool,
     ) -> Result<String, String> {
         let host = host.trim();
-        if host.is_empty() || host.starts_with('-') {
+        let route = vec![host.to_string()];
+        if !crate::config::machines::MachineNames::valid_remote_route(&route) {
             return Err("usage: new -m <SSH_HOST>".to_string());
         }
-        let route = vec![host.to_string()];
         let id = remote_machine_id(&route);
         if !self.machines.iter().any(|machine| machine.id == id) {
             self.machines.push(RemoteMachine {
@@ -233,6 +327,36 @@ impl RemoteRegistry {
         }
         self.start_probe(&id, activate);
         Ok(id)
+    }
+
+    fn restore_and_probe(
+        &mut self,
+        routes: &std::collections::BTreeMap<String, Vec<String>>,
+    ) {
+        let mut restored = Vec::new();
+        for (id, route) in routes {
+            if !crate::config::machines::MachineNames::valid_remote_route(route)
+                || remote_machine_id(route) != *id
+            {
+                continue;
+            }
+            self.machines.push(RemoteMachine {
+                host: route.last().cloned().unwrap_or_default(),
+                id: id.clone(),
+                route: route.clone(),
+                executable: None,
+                workspace_management: false,
+                state: RemoteMachineState::Disconnected,
+                error: None,
+                retry_attempt: 0,
+                retry_at: None,
+                activate_after_probe: false,
+            });
+            restored.push(id.clone());
+        }
+        for id in restored {
+            self.start_probe(&id, false);
+        }
     }
 
     fn start_probe(&mut self, alias: &str, activate: bool) -> bool {
@@ -570,6 +694,8 @@ fn navigation_delete_effect(
 fn close_navigation_entry(
     workspaces: &mut WorkspaceManager,
     remotes: &mut RemoteRegistry,
+    machine_names: &mut crate::config::machines::MachineNames,
+    machine_config: &std::path::Path,
     entries: &[navigation::NavigationEntry],
     entry: &navigation::NavigationEntry,
     size: Size,
@@ -586,10 +712,20 @@ fn close_navigation_entry(
                 .map(|workspace| workspace.socket_name.clone())
             {
                 if workspaces.kill_workspace(&machine_id, &workspace)? {
+                    machine_names
+                        .forget_remote(machine_config, &machine_id)
+                        .map_err(|error| {
+                            format!("could not forget remote Machine: {error}")
+                        })?;
                     remotes.machines.retain(|machine| machine.id != machine_id);
                     return Ok(true);
                 }
             }
+            machine_names
+                .forget_remote(machine_config, &machine_id)
+                .map_err(|error| {
+                    format!("could not forget remote Machine: {error}")
+                })?;
             remotes.machines.retain(|machine| machine.id != machine_id);
             Ok(false)
         }
@@ -1392,6 +1528,8 @@ impl ClientApp {
 
     pub fn run(&self) -> io::Result<()> {
         install_client_panic_hook();
+        #[cfg(unix)]
+        let _termination_guard = ClientTerminationGuard::install()?;
         let sidebar_visible = false;
         let (cols, rows) = terminal::size().unwrap_or((80, 24));
         let size = server_content_size(cols, rows, sidebar_visible);
@@ -1431,12 +1569,14 @@ impl ClientApp {
                 self.start_dir.clone(),
             )?
         };
-        let mut remotes = RemoteRegistry::new(&self.socket_name);
         let machine_config = crate::config::machines::config_path()?;
         let mut machine_names =
             crate::config::machines::MachineNames::load(&machine_config)?;
+        let mut remotes = RemoteRegistry::new(&self.socket_name);
+        remotes.restore_and_probe(&machine_names.routes);
 
         terminal::enable_raw_mode()?;
+        let terminal_guard = ClientTerminalGuard::new();
         let mut stdout = io::stdout();
         execute!(
             stdout,
@@ -1446,19 +1586,23 @@ impl ClientApp {
             EnableBracketedPaste,
             EnableMouseCapture
         )?;
-        let keyboard_enhancement_enabled = match execute!(
+        match execute!(
             stdout,
             PushKeyboardEnhancementFlags(
                 KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
                     | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
             )
         ) {
-            Ok(()) => true,
-            Err(e) if e.kind() == io::ErrorKind::Unsupported => false,
+            Ok(()) => {
+                CLIENT_KEYBOARD_ENHANCEMENT_ACTIVE.store(true, Ordering::SeqCst)
+            }
+            Err(e) if e.kind() == io::ErrorKind::Unsupported => {}
             Err(e) => return Err(e),
-        };
+        }
         let backend = TerminalBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
+        let mut last_terminal_area = *terminal.current_buffer_mut().area();
         let mut mouse_select: Option<MouseSelection> = None;
         let mut mouse_drag_origin: Option<MouseDragOrigin> = None;
         let mut last_mouse_click: Option<LastMouseClick> = None;
@@ -1485,6 +1629,8 @@ impl ClientApp {
         let mut last_drawn_counter: u64 = 0;
         let mut last_ansi_frame: Option<(String, u64)> = None;
         let mut last_overlay_rect: Option<ratatui::layout::Rect> = None;
+        let mut overlay_restore_pending = false;
+        let mut terminal_resize_pending = false;
         let mut last_navigation_entries = Vec::new();
         let mut last_drawn_mode: Option<InputMode> = None;
         let mut last_drawn_sidebar = false;
@@ -1492,8 +1638,35 @@ impl ClientApp {
         let mut global_prefix_origin = InputMode::Normal;
         let run_result: io::Result<()> = (|| {
             loop {
+                #[cfg(unix)]
+                if CLIENT_TERMINATION_REQUESTED.load(Ordering::Relaxed) {
+                    break;
+                }
                 navigation_popup &= retains_navigation_popup(&mode);
                 let sidebar_visible = workspaces.sidebar_visible;
+                // Use the exact area backing Ratatui's current buffer. During
+                // rapid Alacritty startup/maximize resizes, a separate ioctl
+                // can briefly disagree with the Resize event and with
+                // Ratatui's autoresized buffer.
+                terminal.autoresize()?;
+                let terminal_area = *terminal.current_buffer_mut().area();
+                let (cols, rows) = (terminal_area.width, terminal_area.height);
+                if terminal_area != last_terminal_area {
+                    // Ask the server for a new authoritative viewport. Do not
+                    // emit ED2 here: it would blank client-owned sidebar and
+                    // prompt cells, producing a visible flash. The matching
+                    // full server frame repaints pane blanks as well as text,
+                    // which removes old borders inside the resized viewport.
+                    workspaces.resize_all(server_content_size(
+                        cols,
+                        rows,
+                        sidebar_visible,
+                    ));
+                    last_terminal_area = terminal_area;
+                    terminal_resize_pending = true;
+                    last_drawn_counter = 0;
+                    last_ansi_frame = None;
+                }
                 for machine_id in remotes.due_retries(Instant::now()) {
                     remotes.start_probe(&machine_id, false);
                 }
@@ -1527,8 +1700,6 @@ impl ClientApp {
                                     )
                                 })
                                 .unwrap_or_default();
-                            let (cols, rows) =
-                                terminal::size().unwrap_or((80, 24));
                             match workspaces.connect_remote_machine(
                                 &alias,
                                 &route,
@@ -1720,7 +1891,6 @@ impl ClientApp {
                     );
                 let hide_status = has_prompt;
 
-                let (cols, rows) = terminal::size().unwrap_or((80, 24));
                 let mut navigation_entries = workspaces.navigation_entries(
                     &machine_name,
                     &remotes,
@@ -1747,8 +1917,6 @@ impl ClientApp {
                 navigation_state.clamp_selection(&navigation_entries);
                 let areas = workspace_areas(cols, rows, sidebar_visible);
                 let mut drew_terminal_output = false;
-                let terminal_area =
-                    ratatui::layout::Rect::new(0, 0, cols, rows);
                 let mut current_overlay_rect =
                     floating_overlay_rect(&mode, terminal_area);
                 if navigation_popup {
@@ -1770,21 +1938,49 @@ impl ClientApp {
                     // replaying the latest incremental frame would leave the
                     // covered portion of an inactive pane blank.
                     workspaces.active_client().refresh_display();
+                    overlay_restore_pending = true;
                     last_drawn_counter = current_counter;
                     last_overlay_rect = current_overlay_rect;
                 }
 
+                let restore_frame_ready = overlay_restore_pending
+                    && frame.as_ref().is_some_and(|frame| {
+                        frame.frame_type.starts_with("overlay-restore-")
+                    });
+
                 // A visibility change moves the server-owned ANSI viewport.
                 // Keep the old complete screen until a correctly sized frame
                 // arrives, then paint terminal and chrome in one sync update.
-                let viewport_ready = last_drawn_sidebar == sidebar_visible
-                    || frame.as_ref().is_some_and(|fd| {
-                        layout_fits_area(&fd.layout, areas.layout, hide_borders)
-                    });
+                let frame_layout_ready = frame.as_ref().is_some_and(|fd| {
+                    layout_fits_area(&fd.layout, areas.layout, hide_borders)
+                });
+                if restore_frame_ready && !frame_layout_ready {
+                    // The prioritized restore may have been generated just
+                    // before a resize reached the server. It has now been
+                    // consumed from the client slot, so explicitly request a
+                    // correctly sized successor instead of waiting forever on
+                    // a marker that this connection already acknowledged.
+                    workspaces.active_client().refresh_display();
+                }
+                let frame_changed = current_counter != last_drawn_counter;
+                let viewport_ready = frame_layout_ready
+                    || (!terminal_resize_pending
+                        && last_drawn_sidebar == sidebar_visible);
+                let client_redraw_requested = last_drawn_counter == 0
+                    || last_drawn_mode.as_ref() != Some(&mode)
+                    || last_drawn_sidebar != sidebar_visible
+                    || navigation_entries != last_navigation_entries;
+                // Pane ANSI and client-owned overlays are composed inside one
+                // synchronized update. Redraw the overlay over every pane
+                // frame so output outside the panel stays live while its
+                // covered cells remain stable. When the panel moves or closes,
+                // wait for an authoritative frame to restore the old region.
                 let redraw_needed = viewport_ready
-                    && (current_counter != last_drawn_counter
-                        || last_drawn_mode.as_ref() != Some(&mode)
-                        || last_drawn_sidebar != sidebar_visible);
+                    && (!overlay_restore_pending
+                        || (restore_frame_ready && frame_layout_ready))
+                    && (restore_frame_ready
+                        || client_redraw_requested
+                        || frame_changed);
                 let server_frame_new = last_ansi_frame.as_ref().is_none_or(
                     |(workspace_key, counter)| {
                         workspace_key != &active_workspace_key
@@ -1797,10 +1993,11 @@ impl ClientApp {
                     // must not expose their intermediate blanking writes.
                     begin_server_ansi_update(terminal.backend_mut())?;
                     let server_ansi_update_open = true;
+                    let mut consumed_server_frame = false;
                     if server_frame_new {
                         if let Some(ref fd) = frame {
-                            if should_write_server_ansi(has_overlay, has_prompt)
-                            {
+                            if frame_layout_ready {
+                                consumed_server_frame = true;
                                 if let Some(ref ansi) = fd.ansi {
                                     if !ansi.trim().is_empty() {
                                         if let Err(err) =
@@ -2047,18 +2244,20 @@ sidebar_visible,
                             {
                                 terminal.hide_cursor()?;
                             } else {
-                                let (cols, rows) =
-                                    terminal::size().unwrap_or((80, 24));
-                                let frame_area = server_frame_area(
-                                    cols,
-                                    rows,
-                                    sidebar_visible,
-                                );
-                                if let Some(pos) = active_cursor_screen_position(
-                                    fd,
-                                    frame_area,
-                                    hide_borders,
-                                ) {
+                                // Keep cursor placement in the same viewport
+                                // as this Ratatui draw and the pane ANSI frame.
+                                // A separate terminal::size() query can race a
+                                // resize and put the cursor on an old row.
+                                if let Some(pos) = frame_layout_ready
+                                    .then(|| {
+                                        active_cursor_screen_position(
+                                            fd,
+                                            areas.frame,
+                                            hide_borders,
+                                        )
+                                    })
+                                    .flatten()
+                                {
                                     terminal.set_cursor_position(pos)?;
                                     terminal.show_cursor()?;
                                 } else {
@@ -2071,9 +2270,15 @@ sidebar_visible,
                         end_server_ansi_update(terminal.backend_mut())?;
                     }
                     last_drawn_counter = current_counter;
-                    if server_frame_new {
+                    if consumed_server_frame {
                         last_ansi_frame =
                             Some((active_workspace_key, current_counter));
+                    }
+                    if restore_frame_ready {
+                        overlay_restore_pending = false;
+                    }
+                    if terminal_resize_pending && frame_layout_ready {
+                        terminal_resize_pending = false;
                     }
                     last_overlay_rect = current_overlay_rect;
                     last_navigation_entries = navigation_entries.clone();
@@ -2103,10 +2308,13 @@ sidebar_visible,
                             if key.kind == KeyEventKind::Press
                                 || key.kind == KeyEventKind::Repeat =>
                         {
-                            let sidebar_shortcut = global_prefix_pending;
-                            global_prefix_pending = (key.code, key.modifiers)
-                                == prefix_key
-                                && !sidebar_shortcut;
+                            let Some(sidebar_shortcut) = advance_global_prefix(
+                                &mut global_prefix_pending,
+                                key,
+                                prefix_key,
+                            ) else {
+                                continue;
+                            };
                             if global_prefix_pending
                                 && mode != InputMode::Prefix
                             {
@@ -2323,7 +2531,7 @@ sidebar_visible,
                                                 return_to_navigator: false,
                                             };
                                         }
-                                        (KeyCode::Char('$'), _) => {
+                                        _ if key_matches_char(key, '$') => {
                                             let cur = workspaces
                                                 .active_client()
                                                 .session_name();
@@ -2334,7 +2542,7 @@ sidebar_visible,
                                                 return_to_navigator: false,
                                             };
                                         }
-                                        (KeyCode::Char(':'), _) => {
+                                        _ if key_matches_char(key, ':') => {
                                             mode = InputMode::Command {
                                                 buf: String::new(),
                                                 cursor: 0,
@@ -2367,14 +2575,14 @@ sidebar_visible,
                                                 ));
                                             }
                                         }
-                                        (KeyCode::Char('('), _) => {
+                                        _ if key_matches_char(key, '(') => {
                                             workspaces
                                                 .active_client()
                                                 .run_command("prev-session");
                                             workspaces.invalidate_visual_pane();
                                             workspaces.invalidate_active_navigation_tree();
                                         }
-                                        (KeyCode::Char(')'), _) => {
+                                        _ if key_matches_char(key, ')') => {
                                             workspaces
                                                 .active_client()
                                                 .run_command("next-session");
@@ -2449,16 +2657,14 @@ sidebar_visible,
                                                 workspaces
                                                     .invalidate_visual_pane();
                                             } else {
-                                                let invalidate_focus =
-                                                    matches!(
+                                                let split_shortcut =
+                                                    key_matches_char(key, '%')
+                                                        || key_matches_char(
+                                                            key, '"',
+                                                        );
+                                                let ordinary_focus_shortcut = matches!(
                                                     (key.code, key.modifiers),
                                                     (
-                                                        KeyCode::Char('%'),
-                                                        _
-                                                    ) | (
-                                                        KeyCode::Char('"'),
-                                                        _
-                                                    ) | (
                                                         KeyCode::Char('c'),
                                                         KeyModifiers::NONE
                                                     ) | (
@@ -2467,31 +2673,27 @@ sidebar_visible,
                                                     ) | (
                                                         KeyCode::Char('p'),
                                                         KeyModifiers::NONE
+                                                    ) | (KeyCode::Char('z'), _)
+                                                );
+                                                let ordinary_navigation_shortcut = matches!(
+                                                    (key.code, key.modifiers),
+                                                    (
+                                                        KeyCode::Char('c'),
+                                                        KeyModifiers::NONE
                                                     ) | (
-                                                        KeyCode::Char('z'),
-                                                        _
+                                                        KeyCode::Char('n'),
+                                                        KeyModifiers::NONE
+                                                    ) | (
+                                                        KeyCode::Char('p'),
+                                                        KeyModifiers::NONE
                                                     )
                                                 );
-                                                let invalidate_navigation = matches!(
-                                                    (key.code, key.modifiers),
-                                                    (KeyCode::Char('%'), _)
-                                                        | (
-                                                            KeyCode::Char('"'),
-                                                            _
-                                                        )
-                                                        | (
-                                                            KeyCode::Char('c'),
-                                                            KeyModifiers::NONE
-                                                        )
-                                                        | (
-                                                            KeyCode::Char('n'),
-                                                            KeyModifiers::NONE
-                                                        )
-                                                        | (
-                                                            KeyCode::Char('p'),
-                                                            KeyModifiers::NONE
-                                                        )
-                                                );
+                                                let invalidate_focus =
+                                                    split_shortcut
+                                                        || ordinary_focus_shortcut;
+                                                let invalidate_navigation =
+                                                    split_shortcut
+                                                        || ordinary_navigation_shortcut;
                                                 if let Some(message) =
                                                     handle_prefix_key(
                                                         workspaces
@@ -3493,6 +3695,8 @@ sidebar_visible,
                                             match close_navigation_entry(
                                                 &mut workspaces,
                                                 &mut remotes,
+                                                &mut machine_names,
+                                                &machine_config,
                                                 &navigation_entries,
                                                 &entry,
                                                 server_content_size(
@@ -4570,23 +4774,8 @@ sidebar_visible,
             Ok(())
         })();
 
-        let _ = terminal::disable_raw_mode();
-        if keyboard_enhancement_enabled {
-            let _ =
-                execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
-        }
-        let _ = execute!(
-            terminal.backend_mut(),
-            DisableBracketedPaste,
-            DisableMouseCapture,
-            LeaveAlternateScreen,
-            SetCursorStyle::DefaultUserShape,
-            cursor::Show
-        );
-        let _ = write_mouse_pointer_shape(
-            terminal.backend_mut(),
-            MousePointerShape::Default,
-        );
+        drop(terminal);
+        drop(terminal_guard);
         run_result
     }
 }
@@ -5612,6 +5801,55 @@ fn is_shifted_letter(key: KeyEvent, letter: char) -> bool {
             || key.modifiers.contains(KeyModifiers::SHIFT))
 }
 
+/// Match a printable shortcut regardless of whether the terminal reports the
+/// shifted character itself or the unshifted key plus `SHIFT`.  The latter is
+/// the canonical kitty-keyboard encoding used by Alacritty when alternate-key
+/// reporting is unavailable or ignored.
+fn key_matches_char(key: KeyEvent, expected: char) -> bool {
+    if key.modifiers.intersects(
+        KeyModifiers::CONTROL
+            | KeyModifiers::ALT
+            | KeyModifiers::SUPER
+            | KeyModifiers::HYPER
+            | KeyModifiers::META,
+    ) {
+        return false;
+    }
+    let KeyCode::Char(actual) = key.code else {
+        return false;
+    };
+    actual == expected
+        || (key.modifiers.contains(KeyModifiers::SHIFT)
+            && shifted_ascii_base(expected) == Some(actual))
+}
+
+fn shifted_ascii_base(shifted: char) -> Option<char> {
+    Some(match shifted {
+        '~' => '`',
+        '!' => '1',
+        '@' => '2',
+        '#' => '3',
+        '$' => '4',
+        '%' => '5',
+        '^' => '6',
+        '&' => '7',
+        '*' => '8',
+        '(' => '9',
+        ')' => '0',
+        '_' => '-',
+        '+' => '=',
+        '{' => '[',
+        '}' => ']',
+        '|' => '\\',
+        ':' => ';',
+        '"' => '\'',
+        '<' => ',',
+        '>' => '.',
+        '?' => '/',
+        _ => return None,
+    })
+}
+
 fn prefix_nav_dir(key: KeyEvent) -> Option<crate::layout::NavDir> {
     // Holding Ctrl after Ctrl-A is common; accept both Ctrl-H and plain H.
     if key
@@ -5688,24 +5926,28 @@ fn handle_prefix_key(
     server: &dyn DomainHandle,
     key: KeyEvent,
 ) -> Option<String> {
-    let cmd = match (key.code, key.modifiers) {
-        (KeyCode::Char('%'), _) => "split-window -h",
-        (KeyCode::Char('"'), _) => "split-window -v",
-        (KeyCode::Char('c'), KeyModifiers::NONE) => "new-window",
-        (KeyCode::Char('n'), KeyModifiers::NONE) => "select-window -n",
-        (KeyCode::Char('p'), KeyModifiers::NONE) => "select-window -p",
-        (KeyCode::Char('x'), KeyModifiers::NONE) => "kill-pane",
-        (KeyCode::Char('z'), KeyModifiers::NONE) => "zoom-pane",
-        _ if is_shifted_letter(key, 'K') => "clear-pane",
-        (KeyCode::Char('h'), KeyModifiers::NONE) => "select-pane -L",
-        (KeyCode::Char('j'), KeyModifiers::NONE) => "select-pane -D",
-        (KeyCode::Char('k'), KeyModifiers::NONE) => "select-pane -U",
-        (KeyCode::Char('l'), KeyModifiers::NONE) => "select-pane -R",
-        (KeyCode::Up, _) => "select-pane -U",
-        (KeyCode::Down, _) => "select-pane -D",
-        (KeyCode::Left, _) => "select-pane -L",
-        (KeyCode::Right, _) => "select-pane -R",
-        _ => return None,
+    let cmd = if key_matches_char(key, '%') {
+        "split-window -h"
+    } else if key_matches_char(key, '"') {
+        "split-window -v"
+    } else {
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::NONE) => "new-window",
+            (KeyCode::Char('n'), KeyModifiers::NONE) => "select-window -n",
+            (KeyCode::Char('p'), KeyModifiers::NONE) => "select-window -p",
+            (KeyCode::Char('x'), KeyModifiers::NONE) => "kill-pane",
+            (KeyCode::Char('z'), KeyModifiers::NONE) => "zoom-pane",
+            _ if is_shifted_letter(key, 'K') => "clear-pane",
+            (KeyCode::Char('h'), KeyModifiers::NONE) => "select-pane -L",
+            (KeyCode::Char('j'), KeyModifiers::NONE) => "select-pane -D",
+            (KeyCode::Char('k'), KeyModifiers::NONE) => "select-pane -U",
+            (KeyCode::Char('l'), KeyModifiers::NONE) => "select-pane -R",
+            (KeyCode::Up, _) => "select-pane -U",
+            (KeyCode::Down, _) => "select-pane -D",
+            (KeyCode::Left, _) => "select-pane -L",
+            (KeyCode::Right, _) => "select-pane -R",
+            _ => return None,
+        }
     };
     run_command_notice(server, cmd)
 }
@@ -5786,9 +6028,20 @@ fn run_client_command(
                 ));
             };
             match remotes.add_and_probe(host, true) {
-                Ok(_) => ClientCommandResult::Handled(Some(format!(
-                    "connecting to {host}"
-                ))),
+                Ok(id) => {
+                    let route = vec![host.trim().to_string()];
+                    let message = match machine_names.remember_remote(
+                        machine_config,
+                        &id,
+                        &route,
+                    ) {
+                        Ok(()) => format!("connecting to {host}"),
+                        Err(error) => format!(
+                            "connecting to {host}, but could not save the Machine: {error}"
+                        ),
+                    };
+                    ClientCommandResult::Handled(Some(message))
+                }
                 Err(error) => ClientCommandResult::Handled(Some(error)),
             }
         }
@@ -5936,6 +6189,43 @@ fn is_resize_modifier_key(key: KeyEvent) -> bool {
     )
 }
 
+fn is_passive_prefix_modifier(key: KeyEvent) -> bool {
+    matches!(
+        key.code,
+        KeyCode::Modifier(
+            ModifierKeyCode::LeftShift
+                | ModifierKeyCode::RightShift
+                | ModifierKeyCode::LeftControl
+                | ModifierKeyCode::RightControl
+                | ModifierKeyCode::LeftSuper
+                | ModifierKeyCode::RightSuper
+                | ModifierKeyCode::LeftHyper
+                | ModifierKeyCode::RightHyper
+                | ModifierKeyCode::LeftMeta
+                | ModifierKeyCode::RightMeta
+                | ModifierKeyCode::IsoLevel3Shift
+                | ModifierKeyCode::IsoLevel5Shift
+        )
+    )
+}
+
+/// Physical modifier presses are part of a later key chord, not a command.
+/// Filter them before either the global Prefix tracker or the active mode
+/// consumes an event. Alt is intentionally excluded because Prefix+Alt enters
+/// resize mode.
+fn advance_global_prefix(
+    pending: &mut bool,
+    key: KeyEvent,
+    prefix_key: (KeyCode, KeyModifiers),
+) -> Option<bool> {
+    if is_passive_prefix_modifier(key) {
+        return None;
+    }
+    let was_pending = *pending;
+    *pending = (key.code, key.modifiers) == prefix_key && !was_pending;
+    Some(was_pending)
+}
+
 fn resize_command_for_key(key: KeyEvent) -> Option<&'static str> {
     if !key.modifiers.contains(KeyModifiers::ALT) {
         return None;
@@ -5974,15 +6264,6 @@ fn status_banner_for_mode(
         (None, Some(notice)) => Some(notice.to_string()),
         (None, None) => None,
     }
-}
-
-/// Server ANSI writes directly to the terminal, bypassing Ratatui's buffer.
-/// Overlays/prompts still redraw on top in the same frame (`AlwaysUpdate` via
-/// `begin_floating_panel` / prompt row), so pane output can keep flowing while a
-/// chooser is open. Deferring ANSI made live pane output appear frozen until the
-/// overlay closed, then jump forward in one burst.
-fn should_write_server_ansi(_has_overlay: bool, _has_prompt: bool) -> bool {
-    true
 }
 
 enum ClipboardCopyResult {
@@ -6435,14 +6716,7 @@ fn install_client_panic_hook() {
         let default_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             let mut out = io::stdout();
-            let _ = terminal::disable_raw_mode();
-            let _ = execute!(
-                out,
-                DisableBracketedPaste,
-                DisableMouseCapture,
-                LeaveAlternateScreen,
-                cursor::Show
-            );
+            restore_client_terminal();
             let location = info
                 .location()
                 .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
@@ -6798,6 +7072,18 @@ mod tests {
     }
 
     #[test]
+    fn remote_registry_does_not_auto_connect_unsafe_saved_routes() {
+        let route = vec!["-oProxyCommand=unsafe".to_string()];
+        let id = remote_machine_id(&route);
+        let routes = std::collections::BTreeMap::from([(id, route)]);
+        let mut remotes = RemoteRegistry::new("default");
+
+        remotes.restore_and_probe(&routes);
+
+        assert!(remotes.machines.is_empty());
+    }
+
+    #[test]
     fn probing_machine_remembers_activation_and_disconnect_schedules_retry() {
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let id = remote_machine_id(&["prod".to_string()]);
@@ -6851,20 +7137,6 @@ mod tests {
     }
 
     #[test]
-    fn server_ansi_keeps_painting_while_overlay_or_prompt_is_visible() {
-        assert!(should_write_server_ansi(false, false));
-        assert!(
-            should_write_server_ansi(true, false),
-            "overlay must not freeze pane ANSI (navigation / help)"
-        );
-        assert!(
-            should_write_server_ansi(false, true),
-            "prompt must not freeze pane ANSI"
-        );
-        assert!(should_write_server_ansi(true, true));
-    }
-
-    #[test]
     fn build_osc52_sequence_base64_encodes_utf8_text() {
         assert_eq!(build_osc52_sequence("hello"), "\x1b]52;c;aGVsbG8=\x07");
         assert_eq!(build_osc52_sequence("中"), "\x1b]52;c;5Lit\x07");
@@ -6904,6 +7176,90 @@ mod tests {
             KeyCode::Char('v'),
             KeyModifiers::NONE,
         )));
+    }
+
+    #[test]
+    fn shifted_symbol_shortcuts_accept_literal_and_csi_u_forms() {
+        for (shifted, base) in [
+            ('"', '\''),
+            ('%', '5'),
+            ('$', '4'),
+            ('(', '9'),
+            (')', '0'),
+            (':', ';'),
+        ] {
+            assert!(key_matches_char(
+                KeyEvent::new(KeyCode::Char(shifted), KeyModifiers::NONE),
+                shifted,
+            ));
+            assert!(key_matches_char(
+                KeyEvent::new(KeyCode::Char(base), KeyModifiers::SHIFT),
+                shifted,
+            ));
+            assert!(!key_matches_char(
+                KeyEvent::new(
+                    KeyCode::Char(base),
+                    KeyModifiers::SHIFT | KeyModifiers::ALT,
+                ),
+                shifted,
+            ));
+        }
+    }
+
+    #[test]
+    fn prefix_ignores_standalone_modifiers_except_alt() {
+        for modifier in [
+            ModifierKeyCode::LeftShift,
+            ModifierKeyCode::RightShift,
+            ModifierKeyCode::LeftControl,
+            ModifierKeyCode::RightControl,
+            ModifierKeyCode::LeftSuper,
+            ModifierKeyCode::RightSuper,
+            ModifierKeyCode::IsoLevel3Shift,
+            ModifierKeyCode::IsoLevel5Shift,
+        ] {
+            assert!(is_passive_prefix_modifier(KeyEvent::new(
+                KeyCode::Modifier(modifier),
+                KeyModifiers::NONE,
+            )));
+        }
+        assert!(!is_passive_prefix_modifier(KeyEvent::new(
+            KeyCode::Modifier(ModifierKeyCode::LeftAlt),
+            KeyModifiers::ALT,
+        )));
+
+        let prefix = (KeyCode::Char('a'), KeyModifiers::CONTROL);
+        let mut pending = false;
+        assert_eq!(
+            advance_global_prefix(
+                &mut pending,
+                KeyEvent::new(prefix.0, prefix.1),
+                prefix,
+            ),
+            Some(false),
+        );
+        assert!(pending);
+        assert_eq!(
+            advance_global_prefix(
+                &mut pending,
+                KeyEvent::new(
+                    KeyCode::Modifier(ModifierKeyCode::LeftShift),
+                    KeyModifiers::SHIFT,
+                ),
+                prefix,
+            ),
+            None,
+        );
+        assert!(pending);
+        assert_eq!(
+            advance_global_prefix(
+                &mut pending,
+                KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT),
+                prefix,
+            ),
+            Some(true),
+        );
+        assert!(!pending);
     }
 
     #[test]

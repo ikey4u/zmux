@@ -1415,6 +1415,21 @@ mod tests {
     }
 
     #[test]
+    fn repeated_width_resize_keeps_visible_shell_output() {
+        let mut term = AlacrittyTermState::new(25, 117, 2_000);
+        term.process(
+            b"READY> echo TOGGLE_SENTINEL\r\nTOGGLE_SENTINEL\r\nREADY> ",
+        );
+
+        for _ in 0..4 {
+            term.resize(25, 88);
+            assert!(screen_text(&term).contains("TOGGLE_SENTINEL"));
+            term.resize(25, 117);
+            assert!(screen_text(&term).contains("TOGGLE_SENTINEL"));
+        }
+    }
+
+    #[test]
     fn completed_overflow_moves_to_pending_history() {
         let mut term = AlacrittyTermState::new(2, 20, 2);
         term.process(b"zero\r\none\r\ntwo\r\nthree\r\nfour");

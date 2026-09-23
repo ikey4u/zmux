@@ -12,6 +12,12 @@ pub struct MachineNames {
     pub names: BTreeMap<String, String>,
     #[serde(default)]
     pub workspaces: BTreeMap<String, BTreeMap<String, String>>,
+    /// SSH routes keyed by the stable Machine identity.  Keeping the route
+    /// separate from the display name lets a detached client reconstruct its
+    /// remote roots without turning a user-facing rename into a connection
+    /// change.
+    #[serde(default)]
+    pub routes: BTreeMap<String, Vec<String>>,
     #[serde(flatten)]
     extra: BTreeMap<String, serde_json::Value>,
 }
@@ -37,6 +43,15 @@ pub fn config_path() -> io::Result<PathBuf> {
 }
 
 impl MachineNames {
+    pub(crate) fn valid_remote_route(route: &[String]) -> bool {
+        !route.is_empty()
+            && route.iter().all(|host| {
+                !host.trim().is_empty()
+                    && !host.starts_with('-')
+                    && !host.chars().any(char::is_control)
+            })
+    }
+
     pub fn validate_name(name: &str) -> io::Result<&str> {
         let name = name.trim();
         if name.is_empty() || name.chars().any(char::is_control) {
@@ -66,7 +81,8 @@ impl MachineNames {
         id: &str,
         name: &str,
     ) -> io::Result<()> {
-        self.save_name(path, name, |updated, name| {
+        let name = Self::validate_name(name)?;
+        self.save(path, |updated| {
             updated.names.insert(id.to_string(), name.to_string());
         })
     }
@@ -97,7 +113,8 @@ impl MachineNames {
         workspace: &str,
         name: &str,
     ) -> io::Result<()> {
-        self.save_name(path, name, |updated, name| {
+        let name = Self::validate_name(name)?;
+        self.save(path, |updated| {
             updated
                 .workspaces
                 .entry(machine.to_string())
@@ -106,13 +123,34 @@ impl MachineNames {
         })
     }
 
-    fn save_name(
+    pub fn remember_remote(
         &mut self,
         path: &Path,
-        name: &str,
-        update: impl FnOnce(&mut Self, &str),
+        id: &str,
+        route: &[String],
     ) -> io::Result<()> {
-        let name = Self::validate_name(name)?;
+        if !Self::valid_remote_route(route) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SSH route must contain valid destinations",
+            ));
+        }
+        self.save(path, |updated| {
+            updated.routes.insert(id.to_string(), route.to_vec());
+        })
+    }
+
+    pub fn forget_remote(&mut self, path: &Path, id: &str) -> io::Result<()> {
+        self.save(path, |updated| {
+            updated.routes.remove(id);
+        })
+    }
+
+    fn save(
+        &mut self,
+        path: &Path,
+        update: impl FnOnce(&mut Self),
+    ) -> io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -126,7 +164,7 @@ impl MachineNames {
             .open(path.with_extension("lock"))?;
         lock.lock()?;
         let mut updated = Self::load(path)?;
-        update(&mut updated, name);
+        update(&mut updated);
         let data = serde_json::to_vec_pretty(&updated)?;
         let temporary =
             path.with_extension(format!("{}.tmp", std::process::id()));
@@ -242,6 +280,47 @@ mod tests {
             Some("Legacy Deploy")
         );
         assert_eq!(restored.workspace_name("local", "second"), Some("Shells"));
+    }
+
+    #[test]
+    fn remote_routes_persist_until_the_machine_is_forgotten() {
+        let config = TestConfig::new();
+        let mut machines = MachineNames::default();
+        let id = "ssh:10#production";
+        let route = vec!["production".to_string()];
+
+        machines.remember_remote(&config.0, id, &route).unwrap();
+        machines.rename(&config.0, id, "Deploy host").unwrap();
+
+        let restored = MachineNames::load(&config.0).unwrap();
+        assert_eq!(restored.routes[id], route);
+        assert_eq!(restored.names[id], "Deploy host");
+
+        machines.forget_remote(&config.0, id).unwrap();
+        let forgotten = MachineNames::load(&config.0).unwrap();
+        assert!(!forgotten.routes.contains_key(id));
+        assert_eq!(forgotten.names[id], "Deploy host");
+    }
+
+    #[test]
+    fn remote_routes_reject_ssh_options_and_control_characters() {
+        let config = TestConfig::new();
+        let mut machines = MachineNames::default();
+
+        for route in [
+            vec!["-oProxyCommand=unsafe".to_string()],
+            vec!["host\nother".to_string()],
+            vec!["   ".to_string()],
+        ] {
+            assert_eq!(
+                machines
+                    .remember_remote(&config.0, "ssh:test", &route)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        assert!(!config.0.exists());
     }
 
     #[test]

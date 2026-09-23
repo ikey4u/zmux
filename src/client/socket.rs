@@ -111,6 +111,9 @@ enum ControlWrite {
 
 pub struct SocketClient {
     connector: Arc<dyn SocketConnector>,
+    /// The viewport owned by this client, not the server's shared last size.
+    /// Another attached terminal may have changed the latter in the meantime.
+    desired_size: Mutex<Size>,
     frame_slot: Arc<Mutex<FrameSlot>>,
     session_tree_cache: Arc<Mutex<Vec<SessionTreeEntry>>>,
     session_tree_refresh: Arc<AtomicBool>,
@@ -121,15 +124,33 @@ pub struct SocketClient {
 struct FrameSlot {
     frame: Option<FrameData>,
     counter: u64,
+    /// A requested full repaint must reach the renderer even if a busy pane
+    /// publishes another incremental frame before the UI thread snapshots the
+    /// slot.  Without this hand-off, closing an overlay can wait forever for a
+    /// restore frame that was already overwritten by a spinner update.
+    pending_restore: Option<(FrameData, u64)>,
 }
 
 impl FrameSlot {
     fn publish(&mut self, frame: FrameData) {
-        self.frame = Some(frame);
         self.counter = self.counter.wrapping_add(1);
+        if frame.frame_type.starts_with("overlay-restore-") {
+            self.pending_restore = Some((frame.clone(), self.counter));
+        }
+        self.frame = Some(frame);
     }
 
-    fn snapshot(&self) -> (Option<FrameData>, u64) {
+    fn snapshot(&mut self) -> (Option<FrameData>, u64) {
+        if let Some((frame, counter)) = self.pending_restore.take() {
+            if self.counter == counter {
+                if let Some(latest) = self.frame.as_mut() {
+                    if latest.frame_type == frame.frame_type {
+                        latest.frame_type = "frame".to_string();
+                    }
+                }
+            }
+            return (Some(frame), counter);
+        }
         (self.frame.clone(), self.counter)
     }
 }
@@ -261,6 +282,7 @@ impl SocketClient {
         let frame_slot = Arc::new(Mutex::new(FrameSlot {
             frame: Some(first_frame),
             counter: 1,
+            pending_restore: None,
         }));
         let write_arc: Arc<Mutex<Box<dyn Write + Send>>> =
             Arc::new(Mutex::new(Box::new(control_stream)));
@@ -398,6 +420,7 @@ impl SocketClient {
 
         Ok(Self {
             connector,
+            desired_size: Mutex::new(size),
             frame_slot,
             session_tree_cache,
             session_tree_refresh,
@@ -423,7 +446,7 @@ impl SocketClient {
     pub fn frame_snapshot(&self) -> (Option<FrameData>, u64) {
         self.frame_slot
             .lock()
-            .map(|slot| slot.snapshot())
+            .map(|mut slot| slot.snapshot())
             .unwrap_or((None, 0))
     }
     pub fn send_input(&self, bytes: &[u8]) {
@@ -532,6 +555,9 @@ impl SocketClient {
     }
 
     pub fn resize(&self, size: Size) {
+        if let Ok(mut desired_size) = self.desired_size.lock() {
+            *desired_size = size;
+        }
         self.send_line(&format!(
             "RESIZE {}x{}+{}+{}",
             size.rows, size.cols, size.x, size.y
@@ -541,6 +567,14 @@ impl SocketClient {
     /// Request a complete pane repaint after a client-side overlay has covered
     /// server-rendered content. Incremental frames cannot restore that region.
     pub fn refresh_display(&self) {
+        // The server currently has one viewport per workspace. Reclaim this
+        // client's viewport before asking for a full frame; otherwise another
+        // differently sized attach can make overlay restoration wait forever
+        // for a frame that cannot fit this terminal. Both commands travel on
+        // the same ordered control connection (also to older remote servers).
+        if let Ok(size) = self.desired_size.lock().map(|size| *size) {
+            self.resize(size);
+        }
         self.send_line("REFRESH_FRAME");
     }
 
@@ -892,12 +926,58 @@ mod tests {
         let mut slot = FrameSlot {
             frame: None,
             counter: 7,
+            pending_restore: None,
         };
         slot.publish(exit_frame());
 
         let (frame, counter) = slot.snapshot();
         assert_eq!(counter, 8);
         assert!(frame.is_some_and(|frame| frame.exit));
+    }
+
+    #[test]
+    fn frame_slot_delivers_full_restore_before_newer_incremental_frame() {
+        let mut slot = FrameSlot {
+            frame: None,
+            counter: 0,
+            pending_restore: None,
+        };
+        let mut restore = exit_frame();
+        restore.exit = false;
+        restore.frame_type = "overlay-restore-1".to_string();
+        slot.publish(restore);
+        let mut incremental = exit_frame();
+        incremental.frame_type = "frame".to_string();
+        slot.publish(incremental);
+
+        let (first, first_counter) = slot.snapshot();
+        assert_eq!(first_counter, 1);
+        assert!(first.is_some_and(|frame| {
+            frame.frame_type.starts_with("overlay-restore-")
+        }));
+        let (second, second_counter) = slot.snapshot();
+        assert_eq!(second_counter, 2);
+        assert_eq!(second.unwrap().frame_type, "frame");
+    }
+
+    #[test]
+    fn frame_slot_delivers_each_restore_marker_only_once() {
+        let mut slot = FrameSlot {
+            frame: None,
+            counter: 0,
+            pending_restore: None,
+        };
+        let mut restore = exit_frame();
+        restore.frame_type = "overlay-restore-1".to_string();
+        slot.publish(restore);
+
+        assert!(slot
+            .snapshot()
+            .0
+            .unwrap()
+            .frame_type
+            .starts_with("overlay-restore-"));
+        assert_eq!(slot.snapshot().0.unwrap().frame_type, "frame");
     }
 
     #[test]
