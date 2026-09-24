@@ -2466,14 +2466,6 @@ sidebar_visible,
                                             current_counter,
                                         );
                                     }
-                                    if is_resize_modifier_key(key) {
-                                        mode = InputMode::Resize;
-                                        resize_deadline = Some(
-                                            Instant::now()
-                                                + RESIZE_IDLE_TIMEOUT,
-                                        );
-                                        continue;
-                                    }
                                     if let Some(cmd) =
                                         resize_command_for_key(key)
                                     {
@@ -3006,13 +2998,6 @@ sidebar_visible,
                                 }
 
                                 InputMode::Resize => {
-                                    if is_resize_modifier_key(key) {
-                                        resize_deadline = Some(
-                                            Instant::now()
-                                                + RESIZE_IDLE_TIMEOUT,
-                                        );
-                                        continue;
-                                    }
                                     if let Some(cmd) =
                                         resize_command_for_key(key)
                                     {
@@ -6181,19 +6166,13 @@ fn start_dir_from_command_output(output: &str) -> Option<String> {
     (!path.is_empty()).then(|| path.to_string())
 }
 
-fn is_resize_modifier_key(key: KeyEvent) -> bool {
-    matches!(
-        key.code,
-        KeyCode::Modifier(ModifierKeyCode::LeftAlt)
-            | KeyCode::Modifier(ModifierKeyCode::RightAlt)
-    )
-}
-
 fn is_passive_prefix_modifier(key: KeyEvent) -> bool {
     matches!(
         key.code,
         KeyCode::Modifier(
-            ModifierKeyCode::LeftShift
+            ModifierKeyCode::LeftAlt
+                | ModifierKeyCode::RightAlt
+                | ModifierKeyCode::LeftShift
                 | ModifierKeyCode::RightShift
                 | ModifierKeyCode::LeftControl
                 | ModifierKeyCode::RightControl
@@ -6210,9 +6189,8 @@ fn is_passive_prefix_modifier(key: KeyEvent) -> bool {
 }
 
 /// Physical modifier presses are part of a later key chord, not a command.
-/// Filter them before either the global Prefix tracker or the active mode
-/// consumes an event. Alt is intentionally excluded because Prefix+Alt enters
-/// resize mode.
+/// In particular, Alacritty reports Alt before Alt+h/j/k/l; starting resize
+/// mode on that first event would expire its timeout before the direction key.
 fn advance_global_prefix(
     pending: &mut bool,
     key: KeyEvent,
@@ -7207,8 +7185,10 @@ mod tests {
     }
 
     #[test]
-    fn prefix_ignores_standalone_modifiers_except_alt() {
+    fn prefix_ignores_standalone_modifiers_including_alt() {
         for modifier in [
+            ModifierKeyCode::LeftAlt,
+            ModifierKeyCode::RightAlt,
             ModifierKeyCode::LeftShift,
             ModifierKeyCode::RightShift,
             ModifierKeyCode::LeftControl,
@@ -7223,7 +7203,7 @@ mod tests {
                 KeyModifiers::NONE,
             )));
         }
-        assert!(!is_passive_prefix_modifier(KeyEvent::new(
+        assert!(is_passive_prefix_modifier(KeyEvent::new(
             KeyCode::Modifier(ModifierKeyCode::LeftAlt),
             KeyModifiers::ALT,
         )));
@@ -7237,6 +7217,18 @@ mod tests {
                 prefix,
             ),
             Some(false),
+        );
+        assert!(pending);
+        assert_eq!(
+            advance_global_prefix(
+                &mut pending,
+                KeyEvent::new(
+                    KeyCode::Modifier(ModifierKeyCode::LeftAlt),
+                    KeyModifiers::ALT,
+                ),
+                prefix,
+            ),
+            None,
         );
         assert!(pending);
         assert_eq!(
@@ -7260,6 +7252,33 @@ mod tests {
             Some(true),
         );
         assert!(!pending);
+    }
+
+    #[test]
+    fn alt_direction_shortcuts_map_all_four_letters_and_arrows() {
+        for (letter, arrow, command) in [
+            ('h', KeyCode::Left, "resize-pane -L"),
+            ('j', KeyCode::Down, "resize-pane -D"),
+            ('k', KeyCode::Up, "resize-pane -U"),
+            ('l', KeyCode::Right, "resize-pane -R"),
+        ] {
+            for code in [KeyCode::Char(letter), arrow] {
+                assert_eq!(
+                    resize_command_for_key(KeyEvent::new(
+                        code,
+                        KeyModifiers::ALT,
+                    )),
+                    Some(command)
+                );
+                assert_eq!(
+                    resize_command_for_key(KeyEvent::new(
+                        code,
+                        KeyModifiers::NONE,
+                    )),
+                    None
+                );
+            }
+        }
     }
 
     #[test]

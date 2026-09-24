@@ -203,7 +203,28 @@ The sidebar's bare `H` still opens its navigation-only help.
 | `Prefix + ↓` | Move focus to the pane below |
 | `Prefix + ↑` | Move focus to the pane above |
 | `Prefix + →` | Move focus to the pane on the right |
-| `Prefix + hold Alt/Option`, then press `h` `j` `k` `l` repeatedly | Resize the active pane left, down, up, or right while `Alt/Option` remains held. The first `Alt/Option+h` / `j` / `k` / `l` applies immediately. If there is no resize input for 500 ms, the sequence ends automatically |
+| `Prefix + hold Alt/Option`, then press `h` `j` `k` `l` or `←` `↓` `↑` `→` repeatedly | Resize the active pane left, down, up, or right while `Alt/Option` remains held. The first direction key applies immediately; after that, 500 ms without another resize input ends the sequence |
+
+On macOS, Alacritty defaults to treating Option as a character-composition key,
+not Alt for letter keys. To use these shortcuts with the left Option key, set
+the following in Alacritty's TOML configuration (or use `"Both"` for either
+Option key):
+
+```toml
+# Alacritty config file location
+
+# - macOS: ~/.config/alacritty/alacritty.toml 
+# - Linux: ~/.config/alacritty/alacritty.toml or $XDG_CONFIG_HOME/alacritty/alacritty.toml
+# - Windows: %APPDATA%\alacritty\alacritty.toml
+
+# option_as_alt is available only on macOS.
+[window]
+option_as_alt = "OnlyLeft"
+```
+
+This is an Alacritty input setting; zmux cannot recover an Alt modifier that
+the terminal did not send. The Option setting is only needed for the letter
+shortcuts; Option+arrow keys work without it.
 
 ---
 

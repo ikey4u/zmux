@@ -1808,6 +1808,7 @@ const PREFIX_HELP: &[&str] = &[
     "Prefix+arrows   Same directional pane navigation",
     "Prefix+h        At left edge, enter visible sidebar",
     "Prefix+Alt+h/j/k/l  Resize left/down/up/right",
+    "Prefix+Alt+arrows   Same directional pane resizing",
     "  Keep Alt held to repeat; idle timeout is 500 ms.",
     "Prefix+c        Create window",
     "Prefix+n / p    Next / previous window",
@@ -2235,6 +2236,7 @@ mod tests {
             .any(|line| line.starts_with("Prefix+H")
                 && line.contains("Workspace")));
         assert!(full.iter().any(|line| line.contains("h/help")));
+        assert!(full.iter().any(|line| line.contains("Prefix+Alt+arrows")));
         let area = Rect::new(0, 0, 30, 12);
         let wrapped = wrapped_help_lines(area, &full);
         assert_eq!(wrapped.concat(), full.concat());

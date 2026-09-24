@@ -1247,6 +1247,35 @@ fn command_edit_focus_split_close_refresh_and_resize() {
 }
 
 #[test]
+fn alacritty_alt_press_does_not_expire_prefix_before_resize_direction() {
+    let mut tui = Tui::start_hidden();
+    tui.wait("initial pane ready", |rows| {
+        rows.iter().any(|line| line.contains("READY>"))
+    });
+    tui.send(b"\x01%");
+    tui.wait("side-by-side split", |rows| {
+        rows[0].matches('┐').count() == 2
+            && rows
+                .iter()
+                .map(|row| row.matches("READY>").count())
+                .sum::<usize>()
+                >= 2
+    });
+    let border_before = tui.lines()[0].find('┐').unwrap();
+
+    // Alacritty's all-keys protocol reports physical Alt first. A human can
+    // hold it longer than resize mode's idle timeout before pressing h.
+    tui.send(b"\x01\x1b[57443;3u");
+    tui.pump_for(Duration::from_millis(650));
+    tui.send(b"\x1b[104;3u");
+    tui.wait("Alt+h resizes after the delayed modifier chord", |rows| {
+        rows[0]
+            .find('┐')
+            .is_some_and(|border_after| border_after != border_before)
+    });
+}
+
+#[test]
 fn windows_sessions_and_repeated_splits_restore_full_content() {
     let mut tui = Tui::start();
     tui.ready();
