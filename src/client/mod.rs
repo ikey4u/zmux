@@ -7870,6 +7870,28 @@ mod tests {
         }
 
         #[test]
+        fn server_frame_holds_alternate_screen_during_brief_exit() {
+            let pane = silent_test_pane().expect("test pane");
+            feed_pane(&pane, b"old primary");
+            feed_pane(&pane, b"\x1b[?1049h\x1b[Hcurrent view");
+            let win = test_window(pane);
+            let pane =
+                crate::layout::active_pane(&win.root, &win.active_pane_path)
+                    .unwrap();
+
+            feed_pane(pane, b"\x1b[?1049l");
+            let fd = build_frame_data(&win);
+            assert_ansi_paints(&win, "current view");
+            assert_eq!(
+                mouse_copy_first_row(&fd, "current view".len() as u16),
+                "current view"
+            );
+
+            feed_pane(pane, b"\x1b[?1049h\x1b[Hnew view");
+            assert_ansi_paints(&win, "new view");
+        }
+
+        #[test]
         fn large_synchronized_output_is_not_painted_mid_replay() {
             let pane = silent_test_pane().expect("test pane");
             let mut partial = b"\x1b[?2026;25h".to_vec();

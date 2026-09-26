@@ -31,6 +31,7 @@ pub use output_buffer::OutputBuffer;
 const PROCESS_CHUNK_BYTES: usize = 4 * 1024;
 const SYNC_OUTPUT_HISTORY_RESERVE: usize = PROCESS_CHUNK_BYTES;
 const PTY_BATCH_HISTORY_RESERVE: usize = PROCESS_CHUNK_BYTES;
+const ALTERNATE_SCREEN_REENTRY_GRACE: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Copy)]
 pub struct TermSize {
@@ -81,6 +82,7 @@ pub struct AlacrittyTermState {
     sync_last_activity_at: Option<Instant>,
     forced_sync_update: bool,
     sync_display_snapshot: Option<TerminalFrameSnapshot>,
+    pending_alternate_exit: Option<(TerminalFrameSnapshot, Instant)>,
     pending_history_rows: Vec<TerminalHistoryRow>,
     history_clear_requested: bool,
     history_control: HistoryControlTracker,
@@ -116,6 +118,7 @@ struct HistoryControlTracker {
     csi_params: Vec<u8>,
     alternate_screen: bool,
     alternate_enter_requested: bool,
+    alternate_exit_requested: bool,
     sync_update: bool,
     clear_requested: bool,
 }
@@ -195,6 +198,8 @@ impl HistoryControlTracker {
                     Some(1049) => {
                         if enabled && !self.alternate_screen {
                             self.alternate_enter_requested = true;
+                        } else if !enabled && self.alternate_screen {
+                            self.alternate_exit_requested = true;
                         }
                         self.alternate_screen = enabled;
                     }
@@ -211,6 +216,10 @@ impl HistoryControlTracker {
 
     fn take_alternate_enter_requested(&mut self) -> bool {
         std::mem::take(&mut self.alternate_enter_requested)
+    }
+
+    fn take_alternate_exit_requested(&mut self) -> bool {
+        std::mem::take(&mut self.alternate_exit_requested)
     }
 
     fn end_sync_update(&mut self) {
@@ -270,6 +279,7 @@ impl AlacrittyTermState {
             sync_last_activity_at: None,
             forced_sync_update: false,
             sync_display_snapshot: None,
+            pending_alternate_exit: None,
             pending_history_rows: Vec::new(),
             history_clear_requested: false,
             history_control: HistoryControlTracker::default(),
@@ -503,6 +513,7 @@ impl AlacrittyTermState {
                     segment_start = offset + 1;
                 } else if self.history_control.take_alternate_enter_requested()
                 {
+                    self.pending_alternate_exit = None;
                     // Feed the CSI prefix while the primary grid is still
                     // active, archive its complete scrollback, and only then
                     // feed the final `h` which swaps to alternate screen. The
@@ -515,6 +526,19 @@ impl AlacrittyTermState {
                     }
                     self.flush_sync_before_alternate_enter();
                     self.capture_history_rows_above(0);
+                    self.process_terminal_segment(&chunk[offset..=offset]);
+                    segment_start = offset + 1;
+                } else if self.history_control.take_alternate_exit_requested() {
+                    // A TUI can briefly leave and re-enter the alternate
+                    // screen while rebuilding its view. Hold its last complete
+                    // screen rather than exposing stale primary-screen text.
+                    if segment_start < offset {
+                        self.process_terminal_segment(
+                            &chunk[segment_start..offset],
+                        );
+                    }
+                    self.pending_alternate_exit =
+                        Some((self.frame_snapshot(), Instant::now()));
                     self.process_terminal_segment(&chunk[offset..=offset]);
                     segment_start = offset + 1;
                 }
@@ -657,6 +681,24 @@ impl AlacrittyTermState {
             return false;
         }
         self.apply_pending_sync();
+        true
+    }
+
+    /// Commit a real alternate-screen exit after the short re-entry window.
+    /// The server's periodic render loop calls this even if the child is idle.
+    pub fn flush_pending_alternate_exit_for_display(&mut self) -> bool {
+        let expired =
+            self.pending_alternate_exit
+                .as_ref()
+                .is_some_and(|(_, started)| {
+                    started.elapsed() >= ALTERNATE_SCREEN_REENTRY_GRACE
+                });
+        if !expired {
+            return false;
+        }
+        self.pending_alternate_exit = None;
+        self.output_buffer.update_all_lines();
+        self.rehash_all_rows();
         true
     }
 
@@ -809,6 +851,7 @@ impl AlacrittyTermState {
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
+        self.pending_alternate_exit = None;
         let size = TermSize::new(rows, cols);
         let alternate_screen = self.alternate_screen();
 
@@ -911,6 +954,11 @@ impl AlacrittyTermState {
     pub(crate) fn frame_snapshot(&self) -> TerminalFrameSnapshot {
         self.sync_display_snapshot
             .clone()
+            .or_else(|| {
+                self.pending_alternate_exit
+                    .as_ref()
+                    .map(|(snapshot, _)| snapshot.clone())
+            })
             .unwrap_or_else(|| self.current_frame_snapshot())
     }
 
@@ -1177,6 +1225,19 @@ mod tests {
             .to_string()
     }
 
+    fn displayed_first_row_text(term: &AlacrittyTermState) -> String {
+        term.frame_snapshot()
+            .rows
+            .into_iter()
+            .next()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|cell| cell.map(|cell| cell.text))
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
     fn screen_text(term: &AlacrittyTermState) -> String {
         term.visible_rows()
             .into_iter()
@@ -1300,6 +1361,43 @@ mod tests {
         assert!(!term.alternate_screen());
         assert!(screen_text(&term).contains("primary"));
         assert!(!screen_text(&term).contains("alternate"));
+    }
+
+    #[test]
+    fn brief_alternate_screen_exit_does_not_show_old_primary_content() {
+        let mut term = AlacrittyTermState::new(3, 20, 2000);
+        term.process(b"old primary");
+        term.process(b"\x1b[?1049h\x1b[Hcurrent view");
+        assert_eq!(displayed_first_row_text(&term), "current view");
+
+        term.process(b"\x1b[?1049");
+        term.process(b"l");
+        assert_eq!(first_row_text(&term), "old primary");
+        assert_eq!(displayed_first_row_text(&term), "current view");
+        if let Some((_, started)) = term.pending_alternate_exit.as_mut() {
+            *started = Instant::now() - Duration::from_millis(100);
+        }
+        assert!(!term.flush_pending_alternate_exit_for_display());
+
+        term.process(b"\x1b[?1049h\x1b[Hnew view");
+        assert_eq!(displayed_first_row_text(&term), "new view");
+        assert!(term.pending_alternate_exit.is_none());
+    }
+
+    #[test]
+    fn alternate_screen_exit_becomes_visible_when_not_reentered() {
+        let mut term = AlacrittyTermState::new(3, 20, 2000);
+        term.process(b"old primary");
+        term.process(b"\x1b[?1049h\x1b[Hcurrent view");
+        term.process(b"\x1b[?1049l");
+        term.process(b"\x1b[Hshell prompt");
+
+        if let Some((_, started)) = term.pending_alternate_exit.as_mut() {
+            *started = Instant::now() - Duration::from_millis(250);
+        }
+        assert!(term.flush_pending_alternate_exit_for_display());
+        assert_eq!(displayed_first_row_text(&term), "shell prompt");
+        assert!(!term.flush_pending_alternate_exit_for_display());
     }
 
     #[test]

@@ -561,13 +561,16 @@ fn write_pane(
     let snapshot = match pane.parser.lock() {
         Ok(mut parser) => {
             parser.flush_sync_for_display();
+            // Match layout metadata while a brief alternate-screen exit is
+            // held back; live rows would expose the stale primary screen.
+            let frame = parser.frame_snapshot();
             Some((
                 pane_default_codes(
                     parser.pane_default_fg(),
                     parser.pane_default_bg(),
                 ),
-                parser.alternate_screen(),
-                parser.visible_rows(),
+                frame.alternate_screen,
+                frame.rows,
             ))
         }
         Err(_) => None,

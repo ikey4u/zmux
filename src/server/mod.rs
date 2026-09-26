@@ -1689,23 +1689,28 @@ fn root_pane_size(size: Size) -> (u16, u16) {
     pane_viewport_size(frame_layout_area(size), false)
 }
 
-fn flush_sync_for_display_updates(state: &mut Server) -> bool {
+fn flush_deferred_display_updates(state: &mut Server) -> bool {
     let mut flushed = false;
     for session in &mut state.sessions {
         for window in &mut session.windows {
-            flush_sync_for_display_in_layout(&mut window.root, &mut flushed);
+            flush_deferred_display_in_layout(&mut window.root, &mut flushed);
         }
     }
     flushed
 }
 
-fn flush_sync_for_display_in_layout(node: &mut LayoutNode, flushed: &mut bool) {
+fn flush_deferred_display_in_layout(node: &mut LayoutNode, flushed: &mut bool) {
     match node {
         LayoutNode::Leaf(pane) => {
             let did_flush = pane
                 .parser
                 .lock()
-                .map(|mut parser| parser.flush_sync_for_display())
+                .map(|mut parser| {
+                    let sync = parser.flush_sync_for_display();
+                    let alternate_exit =
+                        parser.flush_pending_alternate_exit_for_display();
+                    sync || alternate_exit
+                })
                 .unwrap_or(false);
             if did_flush {
                 crate::pty::persist_pending_history(pane);
@@ -1716,7 +1721,7 @@ fn flush_sync_for_display_in_layout(node: &mut LayoutNode, flushed: &mut bool) {
         }
         LayoutNode::Split { children, .. } => {
             for child in children {
-                flush_sync_for_display_in_layout(child, flushed);
+                flush_deferred_display_in_layout(child, flushed);
             }
         }
     }
@@ -1746,7 +1751,7 @@ fn render_loop(
         let sync_flushed = state
             .lock()
             .ok()
-            .map(|mut s| flush_sync_for_display_updates(&mut s))
+            .map(|mut s| flush_deferred_display_updates(&mut s))
             .unwrap_or(false);
         let dirty = PTY_DATA_READY.swap(false, Ordering::Relaxed);
         let should_reap = first
