@@ -31,7 +31,10 @@ fn log_socket(msg: &str) {
     }
 }
 
-const INPUT_CHUNK_SIZE: usize = 4096;
+// INPUT lines are hex encoded. Include the command prefix and newline in the
+// server's bounded protocol header limit.
+const INPUT_CHUNK_SIZE: usize =
+    (crate::ipc::MAX_HEADER_BYTES - b"INPUT ".len() - 1) / 2;
 
 pub(crate) trait ClientStream: Read + Write + Send {
     fn try_clone_box(&self) -> io::Result<Box<dyn ClientStream>>;
@@ -890,17 +893,22 @@ fn pump_input_chunks(
     write_stream: &Arc<Mutex<Box<dyn Write + Send>>>,
     bytes: &[u8],
 ) -> bool {
-    let mut chunks = bytes.chunks(INPUT_CHUNK_SIZE).peekable();
-    while let Some(chunk) = chunks.next() {
-        if !send_line_on(write_stream, &format!("INPUT {}", encode_hex(chunk)))
-        {
+    let mut lines = input_lines(bytes).peekable();
+    while let Some(line) = lines.next() {
+        if !send_line_on(write_stream, &line) {
             return false;
         }
-        if chunks.peek().is_some() {
+        if lines.peek().is_some() {
             thread::sleep(Duration::from_millis(1));
         }
     }
     true
+}
+
+fn input_lines(bytes: &[u8]) -> impl Iterator<Item = String> + '_ {
+    bytes
+        .chunks(INPUT_CHUNK_SIZE)
+        .map(|chunk| format!("INPUT {}", encode_hex(chunk)))
 }
 
 fn server_reachable(socket_name: &str) -> bool {
@@ -920,6 +928,44 @@ fn cleanup_killed_socket(_socket_name: &str) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_chunks_stay_within_protocol_header_limit_and_round_trip() {
+        for len in [
+            INPUT_CHUNK_SIZE - 1,
+            INPUT_CHUNK_SIZE,
+            INPUT_CHUNK_SIZE + 1,
+            6457,
+            1024 * 1024,
+        ] {
+            let pasted = vec![b'x'; len];
+            assert_input_round_trip(&pasted);
+        }
+        assert_input_round_trip(
+            "// 中文代码\nfn main() { println!(\"你好\"); }\n"
+                .repeat(300)
+                .as_bytes(),
+        );
+    }
+
+    fn assert_input_round_trip(pasted: &[u8]) {
+        let mut restored = Vec::new();
+        for line in input_lines(pasted) {
+            let wire = format!("{line}\n");
+            assert!(wire.len() <= crate::ipc::MAX_HEADER_BYTES);
+            let decoded_line =
+                crate::ipc::recv_line(&mut BufReader::new(wire.as_bytes()))
+                    .expect("server accepts input header");
+            let hex = decoded_line.strip_prefix("INPUT ").unwrap();
+            for pair in hex.as_bytes().chunks_exact(2) {
+                restored.push(
+                    u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16)
+                        .unwrap(),
+                );
+            }
+        }
+        assert_eq!(restored, pasted);
+    }
 
     #[test]
     fn frame_slot_publishes_frame_and_generation_together() {

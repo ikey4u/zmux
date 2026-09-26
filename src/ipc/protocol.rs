@@ -13,7 +13,7 @@ pub const WORKSPACE_MANAGEMENT_CAPABILITY: &str = "workspace-management-v1";
 pub const REMOTE_CLIPBOARD_PASTE_CAPABILITY: &str = "remote-clipboard-paste-v1";
 pub const HANDSHAKE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(5);
-const MAX_HEADER_BYTES: usize = 8 * 1024;
+pub(crate) const MAX_HEADER_BYTES: usize = 8 * 1024;
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
