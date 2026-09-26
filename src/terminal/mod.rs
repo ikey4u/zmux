@@ -78,6 +78,7 @@ pub struct AlacrittyTermState {
     row_hashes: Vec<u64>,
     last_display_offset: usize,
     sync_started_at: Option<Instant>,
+    sync_last_activity_at: Option<Instant>,
     forced_sync_update: bool,
     sync_display_snapshot: Option<TerminalFrameSnapshot>,
     pending_history_rows: Vec<TerminalHistoryRow>,
@@ -266,6 +267,7 @@ impl AlacrittyTermState {
             row_hashes: Vec::new(),
             last_display_offset: 0,
             sync_started_at: None,
+            sync_last_activity_at: None,
             forced_sync_update: false,
             sync_display_snapshot: None,
             pending_history_rows: Vec::new(),
@@ -521,7 +523,7 @@ impl AlacrittyTermState {
                 self.process_terminal_segment(&chunk[segment_start..]);
             }
         }
-        self.track_sync_session();
+        self.track_sync_session(!data.is_empty());
         let flushed_after = self.flush_sync_if_timed_out();
         let changed = (!data.is_empty() && !self.sync_update_active())
             || flushed_before
@@ -596,11 +598,16 @@ impl AlacrittyTermState {
         self.capture_history_rows();
     }
 
-    fn track_sync_session(&mut self) {
-        if self.sync_update_active() && self.sync_started_at.is_none() {
-            self.sync_started_at = Some(Instant::now());
-        } else if !self.sync_update_active() && !self.sync_timeout_active() {
+    fn track_sync_session(&mut self, received_data: bool) {
+        if self.sync_update_active() {
+            let now = Instant::now();
+            self.sync_started_at.get_or_insert(now);
+            if received_data || self.sync_last_activity_at.is_none() {
+                self.sync_last_activity_at = Some(now);
+            }
+        } else if !self.sync_timeout_active() {
             self.sync_started_at = None;
+            self.sync_last_activity_at = None;
         }
     }
 
@@ -608,17 +615,15 @@ impl AlacrittyTermState {
         self.parser.sync_timeout().sync_timeout().is_some()
     }
 
-    fn sync_timeout_expired(&self) -> bool {
-        self.parser
-            .sync_timeout()
-            .sync_timeout()
-            .is_some_and(|deadline| Instant::now() >= deadline)
+    fn sync_session_idle(&self) -> bool {
+        self.sync_last_activity_at.is_some_and(|last_activity| {
+            last_activity.elapsed() >= Duration::from_millis(50)
+        })
     }
 
     fn sync_session_aged_out(&self) -> bool {
-        self.sync_started_at.is_some_and(|started| {
-            started.elapsed() >= Duration::from_millis(50)
-        })
+        self.sync_started_at
+            .is_some_and(|started| started.elapsed() >= Duration::from_secs(2))
     }
 
     /// Apply buffered synchronized-output bytes once their deadline passes.
@@ -633,18 +638,22 @@ impl AlacrittyTermState {
     pub fn flush_sync_for_display(&mut self) -> bool {
         if self.parser.sync_bytes_count() == 0 {
             if (self.forced_sync_update || self.history_control.sync_update)
-                && self.sync_session_aged_out()
+                && (self.sync_session_idle() || self.sync_session_aged_out())
             {
                 self.forced_sync_update = false;
                 self.history_control.end_sync_update();
                 self.sync_display_snapshot = None;
                 self.sync_started_at = None;
+                self.sync_last_activity_at = None;
                 self.capture_history_rows();
                 return true;
             }
             return false;
         }
-        if !(self.sync_timeout_expired() || self.sync_session_aged_out()) {
+        // A large synchronized repaint can take longer than VTE's fixed
+        // timeout while PTY chunks are still arriving. Exposing its buffered
+        // clear before the final rows arrive flashes an incomplete screen.
+        if !(self.sync_session_idle() || self.sync_session_aged_out()) {
             return false;
         }
         self.apply_pending_sync();
@@ -659,6 +668,7 @@ impl AlacrittyTermState {
                 self.history_control.end_sync_update();
                 self.sync_display_snapshot = None;
                 self.sync_started_at = None;
+                self.sync_last_activity_at = None;
                 self.capture_history_rows();
                 return true;
             }
@@ -674,6 +684,7 @@ impl AlacrittyTermState {
         self.history_control.end_sync_update();
         self.sync_display_snapshot = None;
         self.sync_started_at = None;
+        self.sync_last_activity_at = None;
         self.capture_history_rows();
     }
 
@@ -1146,6 +1157,8 @@ pub fn color_is_default(color: Color) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use alacritty_terminal::grid::Dimensions;
 
     use super::{
@@ -1751,6 +1764,33 @@ mod tests {
         assert_eq!(first_row_text(&term), "");
         assert!(!term.flush_sync_for_display());
         std::thread::sleep(std::time::Duration::from_millis(160));
+        assert!(term.flush_sync_for_display());
+        assert_eq!(first_row_text(&term), "hello");
+    }
+
+    #[test]
+    fn synchronized_output_keeps_streaming_repaint_hidden() {
+        let mut term = AlacrittyTermState::new(3, 20, 2000);
+
+        assert!(term.process(b"stable"));
+        assert!(!term.process(b"\x1b[?2026h\x1b[2J\x1b[Hfirst"));
+        // The repaint began over 50 ms ago, but a later PTY chunk arrived.
+        // Do not expose the cleared, incomplete screen between chunks.
+        term.sync_started_at = Some(Instant::now() - Duration::from_millis(75));
+        assert!(!term.process(b" second"));
+        assert!(!term.flush_sync_for_display());
+        assert_eq!(first_row_text(&term), "stable");
+
+        assert!(term.process(b"\x1b[?2026l"));
+        assert_eq!(first_row_text(&term), "first second");
+    }
+
+    #[test]
+    fn synchronized_output_has_a_hard_deadline() {
+        let mut term = AlacrittyTermState::new(3, 20, 2000);
+
+        assert!(!term.process(b"\x1b[?2026hhello"));
+        term.sync_started_at = Some(Instant::now() - Duration::from_secs(3));
         assert!(term.flush_sync_for_display());
         assert_eq!(first_row_text(&term), "hello");
     }
