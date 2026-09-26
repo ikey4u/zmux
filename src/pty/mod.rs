@@ -1,12 +1,12 @@
 use std::{
     collections::VecDeque,
-    io::{self},
+    io::{self, Write},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         Arc, Mutex,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 #[cfg(unix)]
 use std::{os::fd::AsRawFd, path::Path};
@@ -377,7 +377,7 @@ fn is_zsh_shell(shell: &str) -> bool {
 
 fn start_reader_thread(
     mut reader: Box<dyn io::Read + Send>,
-    _pane_id: PaneId,
+    pane_id: PaneId,
     parser: Arc<Mutex<AlacrittyTermState>>,
     history_writer: PaneHistoryWriter,
     history_serial: Arc<Mutex<()>>,
@@ -399,9 +399,29 @@ fn start_reader_thread(
             crate::terminal::osc_colors::OscColorTracker::default();
         let mut query_tracker = term_queries::TermQueryTracker::default();
         let render_debounce_seq = Arc::new(AtomicU64::new(0));
+        // Opt-in protocol timing trace. It records no terminal text, only
+        // screen state transitions, so a flicker can be correlated with
+        // alternate-screen, synchronized-output, and scrollback transitions.
+        let mut screen_mode_trace = std::env::var_os("ZMUX_TRACE_SCREEN_MODES")
+            .and_then(|path| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .ok()
+            });
+        let mut last_screen_modes = None;
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => {
+                    if let Some(trace) = screen_mode_trace.as_mut() {
+                        let _ = writeln!(
+                            trace,
+                            "{} pane={} eof",
+                            trace_time_us(),
+                            pane_id
+                        );
+                    }
                     dead_flag.store(true, Ordering::Relaxed);
                     data_version.fetch_add(1, Ordering::Relaxed);
                     render_dirty.store(true, Ordering::Relaxed);
@@ -427,17 +447,52 @@ fn start_reader_thread(
                     let _history_guard = history_serial
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let (should_render, mut history_rows, clear_history) =
-                        parser
-                            .lock()
-                            .map(|mut parser| {
-                                let should_render = parser.process(data);
-                                let rows = parser.take_history_rows();
-                                let clear_history =
-                                    parser.take_history_clear_requested();
-                                (should_render, rows, clear_history)
-                            })
-                            .unwrap_or_else(|_| (true, Vec::new(), false));
+                    let (
+                        should_render,
+                        mut history_rows,
+                        clear_history,
+                        screen_modes,
+                    ) = parser
+                        .lock()
+                        .map(|mut parser| {
+                            let should_render = parser.process(data);
+                            let rows = parser.take_history_rows();
+                            let clear_history =
+                                parser.take_history_clear_requested();
+                            (
+                                should_render,
+                                rows,
+                                clear_history,
+                                screen_mode_trace.as_ref().map(|_| {
+                                    (
+                                        parser.alternate_screen(),
+                                        parser.alternate_exit_held(),
+                                        parser.sync_update_active(),
+                                        parser.display_offset(),
+                                    )
+                                }),
+                            )
+                        })
+                        .unwrap_or_else(|_| (true, Vec::new(), false, None));
+                    if let (Some(trace), Some(modes)) =
+                        (screen_mode_trace.as_mut(), screen_modes)
+                    {
+                        if last_screen_modes != Some(modes) {
+                            let _ = writeln!(
+                                trace,
+                                "{} pane={} bytes={} alt={} held={} sync={} offset={} render_hint={}",
+                                trace_time_us(),
+                                pane_id,
+                                n,
+                                modes.0,
+                                modes.1,
+                                modes.2,
+                                modes.3,
+                                should_render,
+                            );
+                            last_screen_modes = Some(modes);
+                        }
+                    }
                     for &b in data {
                         if b == 0x07 {
                             bell_pending.store(true, Ordering::Relaxed);
@@ -473,6 +528,13 @@ fn start_reader_thread(
             }
         }
     });
+}
+
+fn trace_time_us() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros()
 }
 
 /// Queue terminal rows captured outside the parser's hot scrollback. SQLite

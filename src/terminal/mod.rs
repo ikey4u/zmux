@@ -918,6 +918,10 @@ impl AlacrittyTermState {
         self.term.mode().contains(TermMode::ALT_SCREEN)
     }
 
+    pub(crate) fn alternate_exit_held(&self) -> bool {
+        self.pending_alternate_exit.is_some()
+    }
+
     pub fn mouse_mode(&self) -> u8 {
         let mode = self.term.mode();
         if mode.contains(TermMode::MOUSE_MOTION) {
