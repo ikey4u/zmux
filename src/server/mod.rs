@@ -1702,17 +1702,22 @@ fn flush_deferred_display_updates(state: &mut Server) -> bool {
 fn flush_deferred_display_in_layout(node: &mut LayoutNode, flushed: &mut bool) {
     match node {
         LayoutNode::Leaf(pane) => {
-            let did_flush = pane
+            let (sync_flushed, alternate_exit_flushed) = pane
                 .parser
                 .lock()
                 .map(|mut parser| {
                     let sync = parser.flush_sync_for_display();
                     let alternate_exit =
                         parser.flush_pending_alternate_exit_for_display();
-                    sync || alternate_exit
+                    (sync, alternate_exit)
                 })
-                .unwrap_or(false);
+                .unwrap_or((false, false));
+            let did_flush = sync_flushed || alternate_exit_flushed;
             if did_flush {
+                crate::screen_trace::server(format_args!(
+                    "server pane={} flush_sync={} flush_alt_exit={}",
+                    pane.id, sync_flushed, alternate_exit_flushed
+                ));
                 crate::pty::persist_pending_history(pane);
                 pane.render_dirty
                     .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1785,7 +1790,7 @@ fn render_loop(
             std::process::exit(0);
         }
 
-        let (frame_json, authoritative) = {
+        let (frame_json, authoritative, ansi_bytes, layout_fp) = {
             let mut s = match state.lock() {
                 Ok(s) => s,
                 Err(_) => continue,
@@ -1857,6 +1862,8 @@ fn render_loop(
                     layout_part, status, ansi_b64
                 ),
                 clear_display,
+                ansi.len(),
+                layout_fp,
             )
         };
 
@@ -1867,7 +1874,19 @@ fn render_loop(
                 } else {
                     frame.publish(fd);
                 }
+                let sequence = frame.sequence;
                 last_published_at = Instant::now();
+                drop(frame);
+                crate::screen_trace::server(format_args!(
+                    "server frame={} ansi_bytes={} clear={} layout_fp={} dirty={} flush={} reaped={}",
+                    sequence,
+                    ansi_bytes,
+                    authoritative,
+                    layout_fp,
+                    dirty,
+                    sync_flushed,
+                    reaped
+                ));
             }
         }
     }

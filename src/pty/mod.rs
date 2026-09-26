@@ -1,12 +1,12 @@
 use std::{
     collections::VecDeque,
-    io::{self, Write},
+    io::{self},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         Arc, Mutex,
     },
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 #[cfg(unix)]
 use std::{os::fd::AsRawFd, path::Path};
@@ -399,28 +399,16 @@ fn start_reader_thread(
             crate::terminal::osc_colors::OscColorTracker::default();
         let mut query_tracker = term_queries::TermQueryTracker::default();
         let render_debounce_seq = Arc::new(AtomicU64::new(0));
-        // Opt-in protocol timing trace. It records no terminal text, only
-        // screen state transitions, so a flicker can be correlated with
-        // alternate-screen, synchronized-output, and scrollback transitions.
-        let mut screen_mode_trace = std::env::var_os("ZMUX_TRACE_SCREEN_MODES")
-            .and_then(|path| {
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                    .ok()
-            });
+        let screen_mode_trace = crate::screen_trace::server_enabled();
         let mut last_screen_modes = None;
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => {
-                    if let Some(trace) = screen_mode_trace.as_mut() {
-                        let _ = writeln!(
-                            trace,
-                            "{} pane={} eof",
-                            trace_time_us(),
+                    if screen_mode_trace {
+                        crate::screen_trace::server(format_args!(
+                            "pty pane={} eof",
                             pane_id
-                        );
+                        ));
                     }
                     dead_flag.store(true, Ordering::Relaxed);
                     data_version.fetch_add(1, Ordering::Relaxed);
@@ -463,7 +451,7 @@ fn start_reader_thread(
                                 should_render,
                                 rows,
                                 clear_history,
-                                screen_mode_trace.as_ref().map(|_| {
+                                screen_mode_trace.then(|| {
                                     (
                                         parser.alternate_screen(),
                                         parser.alternate_exit_held(),
@@ -474,14 +462,10 @@ fn start_reader_thread(
                             )
                         })
                         .unwrap_or_else(|_| (true, Vec::new(), false, None));
-                    if let (Some(trace), Some(modes)) =
-                        (screen_mode_trace.as_mut(), screen_modes)
-                    {
+                    if let Some(modes) = screen_modes {
                         if last_screen_modes != Some(modes) {
-                            let _ = writeln!(
-                                trace,
-                                "{} pane={} bytes={} alt={} held={} sync={} offset={} render_hint={}",
-                                trace_time_us(),
+                            crate::screen_trace::server(format_args!(
+                                "pty pane={} bytes={} alt={} held={} sync={} offset={} render_hint={}",
                                 pane_id,
                                 n,
                                 modes.0,
@@ -489,7 +473,7 @@ fn start_reader_thread(
                                 modes.2,
                                 modes.3,
                                 should_render,
-                            );
+                            ));
                             last_screen_modes = Some(modes);
                         }
                     }
@@ -528,13 +512,6 @@ fn start_reader_thread(
             }
         }
     });
-}
-
-fn trace_time_us() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros()
 }
 
 /// Queue terminal rows captured outside the parser's hot scrollback. SQLite

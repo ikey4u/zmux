@@ -9,6 +9,7 @@ pub mod layout;
 pub mod output;
 pub mod platform;
 pub mod pty;
+pub(crate) mod screen_trace;
 pub mod server;
 pub mod style;
 pub mod terminal;

@@ -1627,6 +1627,9 @@ impl ClientApp {
         let mut last_mouse_pos: Option<(u16, u16)> = None;
         let mut last_drawn_mouse_select: Option<MouseSelection> = None;
         let mut last_drawn_counter: u64 = 0;
+        let mut last_trace_draw = None;
+        let mut trace_repeats = 0u32;
+        let mut last_trace_at = Instant::now() - Duration::from_millis(100);
         let mut last_ansi_frame: Option<(String, u64)> = None;
         let mut last_overlay_rect: Option<ratatui::layout::Rect> = None;
         let mut overlay_restore_pending = false;
@@ -2268,6 +2271,42 @@ sidebar_visible,
                     }
                     if server_ansi_update_open {
                         end_server_ansi_update(terminal.backend_mut())?;
+                    }
+                    let trace_draw = (
+                        current_counter,
+                        consumed_server_frame,
+                        frame_layout_ready,
+                        restore_frame_ready,
+                        has_overlay,
+                        sidebar_visible,
+                        cols,
+                        rows,
+                        client_redraw_requested,
+                        frame_changed,
+                    );
+                    if last_trace_draw != Some(trace_draw)
+                        || last_trace_at.elapsed() >= Duration::from_millis(100)
+                    {
+                        crate::screen_trace::client(format_args!(
+                            "client draw={} ansi_b64_bytes={} frame_new={} layout_ready={} restore={} overlay={} sidebar={} size={}x{} client_redraw={} frame_changed={} repeated={}",
+                            current_counter,
+                            frame.as_ref().and_then(|fd| fd.ansi.as_ref()).map_or(0, String::len),
+                            consumed_server_frame,
+                            frame_layout_ready,
+                            restore_frame_ready,
+                            has_overlay,
+                            sidebar_visible,
+                            cols,
+                            rows,
+                            client_redraw_requested,
+                            frame_changed,
+                            trace_repeats
+                        ));
+                        last_trace_draw = Some(trace_draw);
+                        trace_repeats = 0;
+                        last_trace_at = Instant::now();
+                    } else {
+                        trace_repeats = trace_repeats.saturating_add(1);
                     }
                     last_drawn_counter = current_counter;
                     if consumed_server_frame {
