@@ -2,8 +2,8 @@
 
 New zmux processes record a metadata-only trailing trace by default. The trace
 contains timestamps, pane IDs, alternate-screen and synchronized-output state,
-server frame sizes and clear decisions, and client draw decisions. It does not
-contain terminal text or pasted input.
+visible and active-path pane IDs, server frame sizes and clear decisions, and
+client draw decisions. It does not contain terminal text or pasted input.
 
 Files are written under the process's temporary directory:
 

@@ -369,11 +369,8 @@ impl InProcessServer {
                         for (wi, win) in sess.windows.iter().enumerate() {
                             let pane_ids =
                                 crate::layout::collect_pane_ids(&win.root);
-                            let active_pane_id = crate::layout::active_pane(
-                                &win.root,
-                                &win.active_pane_path,
-                            )
-                            .map(|p| p.id);
+                            let active_pane_id =
+                                visible_active_pane(win).map(|p| p.id);
                             let is_active_win =
                                 is_active_sess && wi == active_win_idx;
                             entries.push(SessionTreeEntry::Window {
@@ -1471,9 +1468,7 @@ fn build_session_tree_json(state: &Arc<Mutex<Server>>) -> String {
 
         for (wi, win) in sess.windows.iter().enumerate() {
             let pane_ids = crate::layout::collect_pane_ids(&win.root);
-            let active_pane_id =
-                crate::layout::active_pane(&win.root, &win.active_pane_path)
-                    .map(|p| p.id);
+            let active_pane_id = visible_active_pane(win).map(|p| p.id);
             let is_active_win = is_active_sess && wi == active_win_idx;
             out.push_str(&format!(
                 ",{{\"type\":\"window\",\"session_name\":{},\"index\":{},\"name\":{},\"pane_count\":{},\"is_active\":{}}}",
@@ -1510,7 +1505,7 @@ fn clone_active_pane_writer(
     let s = state.lock().ok()?;
     let session = s.active_session()?;
     let win = session.windows.get(session.active_window_idx)?;
-    let pane = crate::layout::active_pane(&win.root, &win.active_pane_path)?;
+    let pane = visible_active_pane(win)?;
     Some(Arc::clone(&pane.writer))
 }
 
@@ -1556,7 +1551,7 @@ fn paste_bytes_to_pane(
     let pane = if let Some(id) = pane_id {
         crate::layout::find_pane_by_id(&win.root, id)
     } else {
-        crate::layout::active_pane(&win.root, &win.active_pane_path)
+        visible_active_pane(win)
     };
     let pane = pane.ok_or_else(|| "no active pane".to_string())?;
     let bracketed = pane
@@ -1790,7 +1785,15 @@ fn render_loop(
             std::process::exit(0);
         }
 
-        let (frame_json, authoritative, ansi_bytes, layout_fp) = {
+        let (
+            frame_json,
+            authoritative,
+            ansi_bytes,
+            layout_fp,
+            visible_pane_id,
+            active_path_pane_id,
+            zoomed,
+        ) = {
             let mut s = match state.lock() {
                 Ok(s) => s,
                 Err(_) => continue,
@@ -1808,6 +1811,11 @@ fn render_loop(
                 Some(w) => w,
                 None => continue,
             };
+            let visible_pane_id = visible_active_pane(win).map(|pane| pane.id);
+            let active_path_pane_id =
+                crate::layout::active_pane(&win.root, &win.active_pane_path)
+                    .map(|pane| pane.id);
+            let zoomed = win.zoom_state.is_some();
             let area = frame_layout_area(sz);
             let layout_json = serialize_frame(win, area, s.hide_borders);
             let layout_part = layout_json
@@ -1864,6 +1872,9 @@ fn render_loop(
                 clear_display,
                 ansi.len(),
                 layout_fp,
+                visible_pane_id,
+                active_path_pane_id,
+                zoomed,
             )
         };
 
@@ -1878,7 +1889,7 @@ fn render_loop(
                 last_published_at = Instant::now();
                 drop(frame);
                 crate::screen_trace::server(format_args!(
-                    "server frame={} ansi_bytes={} clear={} layout_fp={} dirty={} flush={} reaped={}",
+                    "server frame={} ansi_bytes={} clear={} layout_fp={} visible_pane={visible_pane_id:?} active_path_pane={active_path_pane_id:?} zoom={zoomed} dirty={} flush={} reaped={}",
                     sequence,
                     ansi_bytes,
                     authoritative,
@@ -1905,39 +1916,29 @@ fn reap_dead_panes(state: &mut Server, size: Size) -> bool {
                 continue;
             }
             changed = true;
+            let mut window_removed = false;
             for dead_id in dead_ids {
                 let path = crate::layout::find_pane_path(
                     &session.windows[win_idx].root,
                     dead_id,
                 );
                 if let Some(path) = path {
-                    let placeholder = LayoutNode::Split {
-                        direction: SplitDirection::Horizontal,
-                        sizes: vec![],
-                        children: vec![],
-                    };
-                    let old_root = std::mem::replace(
-                        &mut session.windows[win_idx].root,
-                        placeholder,
-                    );
-                    if let Some(new_root) = kill_pane_at_path(old_root, &path) {
-                        session.windows[win_idx].root = new_root;
-                        session.windows[win_idx].active_pane_path =
-                            crate::layout::first_leaf_path(
-                                &session.windows[win_idx].root,
-                            );
-                    } else {
+                    if !remove_pane_from_window(
+                        &mut session.windows[win_idx],
+                        &path,
+                    ) {
                         session.windows.remove(win_idx);
                         if session.active_window_idx >= session.windows.len()
                             && session.active_window_idx > 0
                         {
                             session.active_window_idx -= 1;
                         }
+                        window_removed = true;
                         break;
                     }
                 }
             }
-            if win_idx < session.windows.len() {
+            if !window_removed {
                 win_idx += 1;
             }
         }
@@ -1949,6 +1950,56 @@ fn reap_dead_panes(state: &mut Server, size: Size) -> bool {
         resize_all_panes(state, size);
     }
     changed
+}
+
+/// Remove a pane while keeping zoom and input focus on the surviving visible
+/// pane. Restore split sizes before changing the tree so saved zoom paths do
+/// not point at the wrong children after a sibling disappears.
+fn remove_pane_from_window(win: &mut Window, path: &[usize]) -> bool {
+    let previously_visible = visible_active_pane(win).map(|pane| pane.id);
+    let zoomed_id = win.zoom_state.take().map(|zoom| {
+        restore_split_sizes(&mut win.root, &[], &zoom.saved_sizes);
+        zoom.zoomed_pane_id
+    });
+    let placeholder = LayoutNode::Split {
+        direction: SplitDirection::Horizontal,
+        sizes: vec![],
+        children: vec![],
+    };
+    let old_root = std::mem::replace(&mut win.root, placeholder);
+    let Some(new_root) = kill_pane_at_path(old_root, path) else {
+        return false;
+    };
+    win.root = new_root;
+
+    let surviving_zoom = zoomed_id
+        .filter(|id| crate::layout::find_pane_by_id(&win.root, *id).is_some());
+    let focus_id = surviving_zoom.or_else(|| {
+        previously_visible.filter(|id| {
+            crate::layout::find_pane_by_id(&win.root, *id).is_some()
+        })
+    });
+    win.active_pane_path = focus_id
+        .and_then(|id| crate::layout::find_pane_path(&win.root, id))
+        .unwrap_or_else(|| first_leaf_path(&win.root));
+
+    if let Some(id) = surviving_zoom {
+        if !matches!(win.root, LayoutNode::Leaf(_)) {
+            let mut saved_sizes = Vec::new();
+            collect_split_sizes(&win.root, &[], &mut saved_sizes);
+            set_all_sizes_to_full(&mut win.root, id);
+            win.zoom_state = Some(crate::types::session::ZoomState {
+                saved_sizes,
+                zoomed_pane_id: id,
+            });
+        }
+    }
+    win.pane_mru
+        .retain(|id| crate::layout::find_pane_by_id(&win.root, *id).is_some());
+    if let Some(id) = visible_active_pane(win).map(|pane| pane.id) {
+        record_pane_focus(win, id);
+    }
+    true
 }
 
 fn mark_exited_panes(node: &mut LayoutNode) {
@@ -2061,6 +2112,7 @@ fn resize_all_panes(state: &mut Server, size: Size) {
     let border_size: u16 = if hide_borders { 0 } else { BORDER_SIZE };
     for session in &mut state.sessions {
         for win in &mut session.windows {
+            normalize_zoom_focus(win);
             let area = frame_layout_area(size);
             if let Some(zoom) = &win.zoom_state {
                 let zoomed_id = zoom.zoomed_pane_id;
@@ -2076,6 +2128,20 @@ fn resize_all_panes(state: &mut Server, size: Size) {
                 resize_node_panes(&mut win.root, &rects, None, hide_borders);
             }
         }
+    }
+}
+
+fn normalize_zoom_focus(win: &mut Window) {
+    let Some(zoomed_id) =
+        win.zoom_state.as_ref().map(|zoom| zoom.zoomed_pane_id)
+    else {
+        return;
+    };
+    if let Some(path) = crate::layout::find_pane_path(&win.root, zoomed_id) {
+        win.active_pane_path = path;
+    } else if let Some(zoom) = win.zoom_state.take() {
+        restore_split_sizes(&mut win.root, &[], &zoom.saved_sizes);
+        win.active_pane_path = first_leaf_path(&win.root);
     }
 }
 
@@ -2333,9 +2399,33 @@ fn with_active_pane_mut<T>(
 ) -> Option<T> {
     let session = state.active_session_mut()?;
     let win = session.windows.get_mut(session.active_window_idx)?;
-    let path = win.active_pane_path.clone();
-    let pane = crate::layout::active_pane_mut(&mut win.root, &path)?;
+    let pane = visible_active_pane_mut(win)?;
     Some(f(pane))
+}
+
+fn visible_active_pane(win: &Window) -> Option<&crate::types::Pane> {
+    if let Some(zoom) = &win.zoom_state {
+        if let Some(pane) =
+            crate::layout::find_pane_by_id(&win.root, zoom.zoomed_pane_id)
+        {
+            return Some(pane);
+        }
+    }
+    crate::layout::active_pane(&win.root, &win.active_pane_path)
+}
+
+fn visible_active_pane_mut(
+    win: &mut Window,
+) -> Option<&mut crate::types::Pane> {
+    if let Some(zoom) = &win.zoom_state {
+        if let Some(path) =
+            crate::layout::find_pane_path(&win.root, zoom.zoomed_pane_id)
+        {
+            return crate::layout::active_pane_mut(&mut win.root, &path);
+        }
+    }
+    let path = win.active_pane_path.clone();
+    crate::layout::active_pane_mut(&mut win.root, &path)
 }
 
 fn with_pane_by_id_mut<T>(
@@ -2350,8 +2440,7 @@ fn with_pane_by_id_mut<T>(
 }
 
 fn active_pane_start_dir(win: &Window) -> Option<String> {
-    crate::layout::active_pane(&win.root, &win.active_pane_path)
-        .and_then(crate::pty::pane_current_dir)
+    visible_active_pane(win).and_then(crate::pty::pane_current_dir)
 }
 
 fn active_window_start_dir(session: &Session) -> Option<String> {
@@ -2683,8 +2772,7 @@ fn cmd_set_pane_start_dir(state: &mut Server) -> String {
         Some(dir) => dir,
         None => return String::new(),
     };
-    let path = win.active_pane_path.clone();
-    if let Some(pane) = crate::layout::active_pane_mut(&mut win.root, &path) {
+    if let Some(pane) = visible_active_pane_mut(win) {
         pane.start_dir = Some(cwd.clone());
     }
     win.default_start_dir = Some(cwd.clone());
@@ -2698,7 +2786,13 @@ fn cmd_kill_pane(state: &mut Server, _cmd: &ParsedCommand, sz: Size) {
             None => return,
         };
         let path = match session.windows.get(session.active_window_idx) {
-            Some(w) => w.active_pane_path.clone(),
+            Some(w) => w
+                .zoom_state
+                .as_ref()
+                .and_then(|zoom| {
+                    crate::layout::find_pane_path(&w.root, zoom.zoomed_pane_id)
+                })
+                .unwrap_or_else(|| w.active_pane_path.clone()),
             None => return,
         };
 
@@ -2716,19 +2810,7 @@ fn cmd_kill_pane(state: &mut Server, _cmd: &ParsedCommand, sz: Size) {
                 Some(w) => w,
                 None => return,
             };
-            let placeholder = LayoutNode::Split {
-                direction: SplitDirection::Horizontal,
-                sizes: vec![],
-                children: vec![],
-            };
-            let old_root = std::mem::replace(&mut win.root, placeholder);
-            if let Some(new_root) = kill_pane_at_path(old_root, &path) {
-                win.root = new_root;
-                win.active_pane_path = first_leaf_path(&win.root);
-                true
-            } else {
-                false
-            }
+            remove_pane_from_window(win, &path)
         }
     };
 
@@ -2768,14 +2850,38 @@ fn cmd_select_pane(state: &mut Server, cmd: &ParsedCommand, sz: Size) {
     };
 
     if let Some(target) = cmd.flag_value("t") {
+        let mut left_zoom = false;
         if let Some(id_str) = target.strip_prefix('%') {
             if let Ok(pane_id) = id_str.parse::<usize>() {
                 if let Some(path) = find_pane_path(&win.root, pane_id) {
+                    if win
+                        .zoom_state
+                        .as_ref()
+                        .is_some_and(|zoom| zoom.zoomed_pane_id != pane_id)
+                    {
+                        let zoom = win.zoom_state.take().unwrap();
+                        restore_split_sizes(
+                            &mut win.root,
+                            &[],
+                            &zoom.saved_sizes,
+                        );
+                        left_zoom = true;
+                    }
                     win.active_pane_path = path;
                     record_pane_focus(win, pane_id);
                 }
             }
         }
+        if left_zoom {
+            resize_all_panes(state, sz);
+        }
+        return;
+    }
+
+    // A maximized window has only one visible pane. Directional focus must
+    // not silently send subsequent input to a sibling hidden behind it.
+    normalize_zoom_focus(win);
+    if win.zoom_state.is_some() {
         return;
     }
 
@@ -2912,8 +3018,7 @@ fn cmd_rename_pane(state: &mut Server, cmd: &ParsedCommand) {
         Some(window) => window,
         None => return,
     };
-    let path = window.active_pane_path.clone();
-    let pane = match crate::layout::active_pane_mut(&mut window.root, &path) {
+    let pane = match visible_active_pane_mut(window) {
         Some(pane) => pane,
         None => return,
     };
@@ -3988,6 +4093,152 @@ mod tests {
         let zoomed_pane =
             crate::layout::find_pane_by_id(&win.root, zoomed_id).unwrap();
         assert!(zoomed_pane.last_cols < full_size.1);
+        Ok(())
+    }
+
+    #[test]
+    fn reaping_hidden_pane_preserves_zoomed_focus_and_input() -> io::Result<()>
+    {
+        let sz = Size::new(24, 80);
+        let mut state = Server::new();
+        make_session(&mut state, "0", sz)?;
+        for _ in 0..2 {
+            let mut split = ParsedCommand::parse("split-window -h");
+            cmd_split_window(&mut state, &split.remove(0), sz);
+        }
+        let ids =
+            crate::layout::collect_pane_ids(&state.sessions[0].windows[0].root);
+        assert_eq!(ids.len(), 3);
+        let hidden_id = ids[0];
+        let zoomed_id = ids[2];
+        cmd_zoom_pane(&mut state, sz);
+        make_session(&mut state, "other", sz)?;
+        let mut away = ParsedCommand::parse("switch-client -t other");
+        cmd_switch_client(&mut state, &away.remove(0), sz);
+        assert_eq!(state.active_session_idx, 1);
+        {
+            let win = &mut state.sessions[0].windows[0];
+            crate::layout::find_pane_by_id_mut(&mut win.root, hidden_id)
+                .unwrap()
+                .dead
+                .store(true, Ordering::Relaxed);
+        }
+
+        assert!(reap_dead_panes(&mut state, sz));
+        let mut back = ParsedCommand::parse("switch-client -t 0");
+        cmd_switch_client(&mut state, &back.remove(0), sz);
+        assert_eq!(state.active_session_idx, 0);
+        let win = &state.sessions[0].windows[0];
+        assert_eq!(win.zoom_state.as_ref().unwrap().zoomed_pane_id, zoomed_id);
+        assert_eq!(visible_active_pane(win).unwrap().id, zoomed_id);
+        assert_eq!(
+            crate::layout::active_pane(&win.root, &win.active_pane_path)
+                .unwrap()
+                .id,
+            zoomed_id
+        );
+        let zoomed_writer =
+            Arc::clone(&visible_active_pane(win).unwrap().writer);
+        let state = Arc::new(Mutex::new(state));
+        assert!(Arc::ptr_eq(
+            &clone_active_pane_writer(&state).unwrap(),
+            &zoomed_writer
+        ));
+        let mut state = state.lock().unwrap();
+        cmd_zoom_pane(&mut state, sz);
+        let win = &state.sessions[0].windows[0];
+        assert!(win.zoom_state.is_none());
+        assert_eq!(visible_active_pane(win).unwrap().id, zoomed_id);
+        Ok(())
+    }
+
+    #[test]
+    fn zoomed_window_never_routes_input_to_hidden_selection() -> io::Result<()>
+    {
+        let sz = Size::new(24, 80);
+        let mut state = Server::new();
+        make_session(&mut state, "0", sz)?;
+        let mut split = ParsedCommand::parse("split-window -h");
+        cmd_split_window(&mut state, &split.remove(0), sz);
+        let ids =
+            crate::layout::collect_pane_ids(&state.sessions[0].windows[0].root);
+        let hidden_id = ids[0];
+        let zoomed_id = ids[1];
+        cmd_zoom_pane(&mut state, sz);
+
+        // Simulate a stale active path left by an older server. Input still
+        // follows the pane the user can see, and attach/resize repairs state.
+        {
+            let win = &mut state.sessions[0].windows[0];
+            win.active_pane_path =
+                crate::layout::find_pane_path(&win.root, hidden_id).unwrap();
+        }
+        let visible_writer = Arc::clone(
+            &crate::layout::find_pane_by_id(
+                &state.sessions[0].windows[0].root,
+                zoomed_id,
+            )
+            .unwrap()
+            .writer,
+        );
+        let state = Arc::new(Mutex::new(state));
+        assert!(Arc::ptr_eq(
+            &clone_active_pane_writer(&state).unwrap(),
+            &visible_writer
+        ));
+        let mut state = state.lock().unwrap();
+        resize_all_panes(&mut state, sz);
+        let win = &state.sessions[0].windows[0];
+        assert_eq!(
+            crate::layout::active_pane(&win.root, &win.active_pane_path)
+                .unwrap()
+                .id,
+            zoomed_id
+        );
+
+        let mut directional = ParsedCommand::parse("select-pane -L");
+        cmd_select_pane(&mut state, &directional.remove(0), sz);
+        assert_eq!(
+            visible_active_pane(&state.sessions[0].windows[0])
+                .unwrap()
+                .id,
+            zoomed_id
+        );
+        let mut targeted =
+            ParsedCommand::parse(&format!("select-pane -t %{hidden_id}"));
+        cmd_select_pane(&mut state, &targeted.remove(0), sz);
+        let win = &state.sessions[0].windows[0];
+        assert!(win.zoom_state.is_none());
+        assert_eq!(visible_active_pane(win).unwrap().id, hidden_id);
+        Ok(())
+    }
+
+    #[test]
+    fn killing_zoomed_pane_cannot_kill_hidden_stale_focus() -> io::Result<()> {
+        let sz = Size::new(24, 80);
+        let mut state = Server::new();
+        make_session(&mut state, "0", sz)?;
+        for _ in 0..2 {
+            let mut split = ParsedCommand::parse("split-window -h");
+            cmd_split_window(&mut state, &split.remove(0), sz);
+        }
+        let ids =
+            crate::layout::collect_pane_ids(&state.sessions[0].windows[0].root);
+        let hidden_id = ids[0];
+        let zoomed_id = ids[2];
+        cmd_zoom_pane(&mut state, sz);
+        {
+            let win = &mut state.sessions[0].windows[0];
+            win.active_pane_path =
+                crate::layout::find_pane_path(&win.root, hidden_id).unwrap();
+        }
+
+        let mut kill = ParsedCommand::parse("kill-pane");
+        cmd_kill_pane(&mut state, &kill.remove(0), sz);
+        let win = &state.sessions[0].windows[0];
+        assert!(win.zoom_state.is_none());
+        assert!(crate::layout::find_pane_by_id(&win.root, zoomed_id).is_none());
+        assert!(crate::layout::find_pane_by_id(&win.root, hidden_id).is_some());
         Ok(())
     }
 
