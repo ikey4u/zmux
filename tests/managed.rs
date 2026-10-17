@@ -4,10 +4,11 @@ mod tests {
 
     use zmux_core::{managed::ManagedRuntime, Environment};
     fn runtime() -> (PathBuf, ManagedRuntime) {
-        static NEXT: std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(0);
+        static NEXT: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
             "managed-{}-{}",
-            NEXT.fetch_add(1,std::sync::atomic::Ordering::Relaxed),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

@@ -8,10 +8,17 @@ pub struct OutputJournal {
 }
 impl OutputJournal {
     pub fn append(&mut self, bytes: &[u8]) {
-        self.chunks.push_back((self.end, bytes.to_vec()));
+        if bytes.is_empty() {
+            return;
+        }
+        let skip = bytes.len().saturating_sub(2 * 1024 * 1024);
+        self.chunks
+            .push_back((self.end + skip as u64, bytes[skip..].to_vec()));
         self.end += bytes.len() as u64;
-        self.bytes += bytes.len();
-        while self.bytes > 2 * 1024 * 1024 && self.chunks.len() > 1 {
+        self.bytes += bytes.len() - skip;
+        while (self.bytes > 2 * 1024 * 1024 || self.chunks.len() > 4096)
+            && self.chunks.len() > 1
+        {
             self.bytes -= self.chunks.pop_front().unwrap().1.len();
         }
     }
@@ -33,5 +40,31 @@ impl OutputJournal {
             }
         }
         Some(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn bounded_stream_detects_gaps_and_chunks_without_losing_bytes() {
+        let mut j = OutputJournal::default();
+        j.append(&vec![b'a'; 3 * 1024 * 1024]);
+        assert!(j.read(0).is_none());
+        assert_eq!(j.read(1024 * 1024).unwrap().len(), 256 * 1024);
+        assert!(j.bytes <= 2 * 1024 * 1024);
+        assert!(j.read(j.end).unwrap().is_empty());
+        assert!(j.read(j.end + 1).is_none());
+        let end = j.end;
+        j.append(b"hello");
+        assert_eq!(j.read(end).unwrap(), b"hello");
+        for _ in 0..10000 {
+            j.append(b"");
+        }
+        assert!(j.chunks.len() <= 2);
+        for _ in 0..10000 {
+            j.append(b"x");
+        }
+        assert!(j.chunks.len() <= 4096);
     }
 }

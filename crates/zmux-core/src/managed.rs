@@ -19,6 +19,7 @@ pub struct PaneInfo {
     pub cols: u16,
     pub rows: u16,
     pub alive: bool,
+    pub preview: String,
 }
 #[derive(Clone, Serialize)]
 pub struct WindowInfo {
@@ -45,6 +46,7 @@ struct Hosted {
     host: Arc<InProcessServer>,
     name: String,
     cwd: String,
+    shell: Option<String>,
 }
 pub struct ManagedRuntime {
     environment: Environment,
@@ -109,7 +111,20 @@ impl ManagedRuntime {
         }
         let mut sessions = self.sessions.lock().map_err(err)?;
         if sessions.len() >= 32 {
-            return Err(err("terminal session limit reached"));
+            let ended = sessions.iter().find_map(|(id, h)| {
+                h.host
+                    .managed_windows()
+                    .ok()
+                    .filter(|ws| {
+                        !ws.iter().flat_map(|w| &w.panes).any(|p| p.alive)
+                    })
+                    .map(|_| id.clone())
+            });
+            if let Some(id) = ended {
+                sessions.remove(&id);
+            } else {
+                return Err(err("terminal session limit reached"));
+            }
         }
         let id = crate::domain::new_instance_id();
         let cwd = cwd.to_string_lossy().into_owned();
@@ -133,6 +148,7 @@ impl ManagedRuntime {
                 host,
                 name: name.clone(),
                 cwd: cwd.clone(),
+                shell: shell.map(str::to_owned),
             },
         );
         Ok(SessionInfo {
@@ -158,7 +174,17 @@ impl ManagedRuntime {
         pane: Option<usize>,
         name: &str,
     ) -> io::Result<(String, String)> {
-        let h = self.host(id)?;
+        if name.trim().is_empty()
+            || name.len() > 128
+            || name.chars().any(char::is_control)
+        {
+            return Err(err("invalid terminal name"));
+        }
+        let (h, shell) = {
+            let sessions = self.sessions.lock().map_err(err)?;
+            let h = sessions.get(id).ok_or_else(missing)?;
+            (h.host.clone(), h.shell.clone())
+        };
         let windows = h.managed_windows()?;
         if windows.iter().map(|w| w.panes.len()).sum::<usize>() >= 32 {
             return Err(err("pane limit reached"));
@@ -172,7 +198,7 @@ impl ManagedRuntime {
             window,
             pane,
             name,
-            None,
+            shell.as_deref(),
             &source.cwd,
             source.cols,
             source.rows,

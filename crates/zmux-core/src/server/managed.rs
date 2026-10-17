@@ -66,6 +66,37 @@ impl InProcessServer {
                                     cols: p.last_cols,
                                     rows: p.last_rows,
                                     alive: !p.dead.load(Ordering::Relaxed),
+                                    preview: p
+                                        .parser
+                                        .lock()
+                                        .ok()
+                                        .map(|term| {
+                                            let rows = term.visible_rows();
+                                            let lines: Vec<String> = rows
+                                                .iter()
+                                                .map(|row| {
+                                                    row.iter()
+                                                        .flatten()
+                                                        .map(|c| {
+                                                            c.text.as_str()
+                                                        })
+                                                        .collect::<String>()
+                                                        .trim_end()
+                                                        .to_owned()
+                                                })
+                                                .collect();
+                                            let end = lines
+                                                .iter()
+                                                .rposition(|l| !l.is_empty())
+                                                .map(|i| i + 1)
+                                                .unwrap_or(0);
+                                            lines[end.saturating_sub(4)..end]
+                                                .join("\n")
+                                                .chars()
+                                                .take(480)
+                                                .collect()
+                                        })
+                                        .unwrap_or_default(),
                                 })
                                 .collect(),
                         })
