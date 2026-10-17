@@ -69,6 +69,7 @@ impl Size {
 }
 
 pub struct Pane {
+    pub stream: Arc<Mutex<crate::journal::OutputJournal>>,
     pub id: PaneId,
     pub master: Box<dyn MasterPty>,
     pub writer: crate::pty::PtyWriter,

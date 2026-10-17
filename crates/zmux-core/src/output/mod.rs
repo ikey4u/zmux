@@ -1442,3 +1442,51 @@ mod tests {
         );
     }
 }
+
+/// Independent, authoritative viewport. Never consumes another renderer's dirty state.
+pub(crate) fn pane_snapshot(pane: &Pane) -> (String, String) {
+    let mut out = String::from("\x1b[0m\x1b[2J\x1b[H");
+    write_pane(
+        pane,
+        true,
+        Rect::new(0, 0, pane.last_cols, pane.last_rows),
+        true,
+        &mut out,
+        &FrameAnsiOptions {
+            clear_display: true,
+            force_repaint: true,
+        },
+        false,
+    );
+    let mut history = String::new();
+    if let Ok(parser) = pane.parser.lock() {
+        let (row, col) = parser.cursor_position();
+        vte_cup(col, row, &mut out);
+        out.push_str(if parser.hide_cursor() {
+            "\x1b[?25l"
+        } else {
+            "\x1b[?25h"
+        });
+        if !parser.alternate_screen() {
+            let (rows, _, _) = parser.snapshot_rows();
+            let end = rows.len().saturating_sub(pane.last_rows as usize);
+            for row in rows[..end]
+                .iter()
+                .rev()
+                .take(1000)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+            {
+                for c in row.iter().flatten() {
+                    history.push_str(&c.text)
+                }
+                history.push_str("\r\n");
+                if history.len() > 256 * 1024 {
+                    break;
+                }
+            }
+        }
+    }
+    (out, history)
+}

@@ -133,7 +133,9 @@ pub fn spawn_pane(opts: SpawnOptions<'_>) -> io::Result<Pane> {
     let render_dirty: Arc<AtomicBool> = Arc::new(AtomicBool::new(true));
     let reported_cwd: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
+    let stream = Arc::new(Mutex::new(crate::journal::OutputJournal::default()));
     start_reader_thread(
+        stream.clone(),
         pair.master
             .try_clone_reader()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?,
@@ -152,6 +154,7 @@ pub fn spawn_pane(opts: SpawnOptions<'_>) -> io::Result<Pane> {
     );
 
     Ok(Pane {
+        stream,
         id: opts.pane_id,
         master: pair.master,
         writer,
@@ -379,6 +382,7 @@ fn is_zsh_shell(shell: &str) -> bool {
 }
 
 fn start_reader_thread(
+    stream: Arc<Mutex<crate::journal::OutputJournal>>,
     mut reader: Box<dyn io::Read + Send>,
     pane_id: PaneId,
     parser: Arc<Mutex<AlacrittyTermState>>,
@@ -479,6 +483,9 @@ fn start_reader_thread(
                             ));
                             last_screen_modes = Some(modes);
                         }
+                    }
+                    if let Ok(mut output) = stream.lock() {
+                        output.append(data);
                     }
                     for &b in data {
                         if b == 0x07 {
