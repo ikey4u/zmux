@@ -963,9 +963,6 @@ impl AlacrittyTermState {
         for (number, flag) in [
             (1, TermMode::APP_CURSOR),
             (7, TermMode::LINE_WRAP),
-            (1000, TermMode::MOUSE_REPORT_CLICK),
-            (1002, TermMode::MOUSE_DRAG),
-            (1003, TermMode::MOUSE_MOTION),
             (1006, TermMode::SGR_MOUSE),
             (2004, TermMode::BRACKETED_PASTE),
         ] {
@@ -973,6 +970,20 @@ impl AlacrittyTermState {
                 "\x1b[?{number}{}",
                 if mode.contains(flag) { 'h' } else { 'l' }
             ));
+        }
+        // Mouse tracking modes are exclusive in clients such as SwiftTerm: reset first.
+        out.push_str("\x1b[?1000l\x1b[?1002l\x1b[?1003l");
+        let mouse = if mode.contains(TermMode::MOUSE_MOTION) {
+            Some(1003)
+        } else if mode.contains(TermMode::MOUSE_DRAG) {
+            Some(1002)
+        } else if mode.contains(TermMode::MOUSE_REPORT_CLICK) {
+            Some(1000)
+        } else {
+            None
+        };
+        if let Some(mouse) = mouse {
+            out.push_str(&format!("\x1b[?{mouse}h"));
         }
         out.push_str(if mode.contains(TermMode::APP_KEYPAD) {
             "\x1b="

@@ -74,7 +74,7 @@ mod tests {
         let (root, rt) = runtime();
         let s = rt.open(&root, "Modes", Some("/bin/sh"), 80, 24).unwrap();
         let p = s.windows[0].panes[0].id.parse().unwrap();
-        rt.input(&s.id,p,b"printf '\\033[?1049h\\033[?1h\\033[?2004h\\033[2;20r\\033[31mMODE_%s' READY; sleep 1\r").unwrap();
+        rt.input(&s.id,p,b"printf '\\033[?1049h\\033[?1h\\033[?2004h\\033[?1000h\\033[2;20r\\033[31mMODE_%s' READY; sleep 1\r").unwrap();
         wait(&rt, &s.id, p, "MODE_READY");
         let snapshot = rt.pull(&s.id, p, None, Duration::ZERO).unwrap();
         assert_eq!((snapshot.cols, snapshot.rows), (80, 24));
@@ -83,6 +83,11 @@ mod tests {
         term.process(&snapshot.data);
         assert!(term.alternate_screen());
         assert!(term.bracketed_paste());
+        let encoded = String::from_utf8_lossy(&snapshot.data);
+        assert!(
+            encoded.rfind("\x1b[?1000h").unwrap()
+                > encoded.rfind("\x1b[?1003l").unwrap()
+        );
         assert!(String::from_utf8_lossy(&snapshot.data).contains("\x1b[?1h"));
         assert!(String::from_utf8_lossy(&snapshot.data).contains("\x1b[2;20r"));
         rt.input(
