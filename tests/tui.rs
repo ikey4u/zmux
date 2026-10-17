@@ -158,7 +158,8 @@ case "$previous" in
         esac ;;
 esac
 TMPDIR="$ZMUX_TEST_ROOT/remote"
-export TMPDIR
+ZMUX_ENVIRONMENT_ROOT="$ZMUX_TEST_ROOT/remote"
+export TMPDIR ZMUX_ENVIRONMENT_ROOT
 PS1='READY> '
 export PS1
 exec /bin/sh -c "$last"
@@ -220,11 +221,14 @@ exec /bin/sh -c "$last"
             })
             .unwrap();
         let mut command = CommandBuilder::new(BIN);
+        command.arg("--environment-root");
+        command.arg(&root);
         command.args(["-L", "ui", "-s", "main"]);
         if all {
             command.arg("a");
         }
         command.env("TMPDIR", &root);
+        command.env("ZMUX_ENVIRONMENT_ROOT", &root);
         command.env("ZMUX_CONFIG", root.join("zmux.conf"));
         command.env("ZMUX_TEST_ROOT", &root);
         command.env("ZMUX_TEST_BIN", BIN);
@@ -267,6 +271,7 @@ exec /bin/sh -c "$last"
         let child = Command::new(BIN)
             .args(["-L", socket, "-s", "main", "server"])
             .env("TMPDIR", &self.root)
+            .env("ZMUX_ENVIRONMENT_ROOT", &self.root)
             .env("ZMUX_CONFIG", self.root.join("zmux.conf"))
             .env("SHELL", "/bin/sh")
             .env("ENV", "/dev/null")
@@ -278,9 +283,10 @@ exec /bin/sh -c "$last"
             .spawn()
             .unwrap();
         self.extra_servers.push((socket.to_string(), child));
-        let path = self
-            .root
-            .join(format!("zmux-{}", unsafe { libc::getuid() }))
+        let path = zmux::Environment::at(&self.root, "default")
+            .unwrap()
+            .runtime_directory()
+            .unwrap()
             .join(socket);
         let until = Instant::now() + Duration::from_secs(8);
         while !path.exists() && Instant::now() < until {
@@ -410,6 +416,7 @@ impl Drop for Tui {
             let _ = Command::new(BIN)
                 .args(["-L", socket, "kill-server"])
                 .env("TMPDIR", &self.root)
+                .env("ZMUX_ENVIRONMENT_ROOT", &self.root)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
@@ -417,14 +424,16 @@ impl Drop for Tui {
             let _ = child.wait();
         }
         let _ = Command::new(BIN)
-            .args(["-L", "ui", "kill-server"])
+            .args(["-L", "ui", "kill-server", "--all"])
             .env("TMPDIR", &self.root)
+            .env("ZMUX_ENVIRONMENT_ROOT", &self.root)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
         let _ = Command::new(BIN)
             .args(["-L", "ui", "kill-server", "--all"])
             .env("TMPDIR", self.root.join("remote"))
+            .env("ZMUX_ENVIRONMENT_ROOT", self.root.join("remote"))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
@@ -706,14 +715,17 @@ fn new_t_on_remote_creates_and_rediscovers_a_remote_workspace() {
         })
         .expect("remote Workspace name was not persisted under its Machine");
     assert!(remote_socket.starts_with("ui.ws."));
-    let runtime = format!("zmux-{}", unsafe { libc::getuid() });
-    assert!(tui
-        .root
-        .join("remote")
-        .join(&runtime)
-        .join(&remote_socket)
-        .exists());
-    assert!(!tui.root.join(&runtime).join(&remote_socket).exists());
+    let remote_runtime =
+        zmux::Environment::at(tui.root.join("remote"), "default")
+            .unwrap()
+            .runtime_directory()
+            .unwrap();
+    let local_runtime = zmux::Environment::at(&tui.root, "default")
+        .unwrap()
+        .runtime_directory()
+        .unwrap();
+    assert!(remote_runtime.join(&remote_socket).exists());
+    assert!(!local_runtime.join(&remote_socket).exists());
 
     // A fresh client must discover the sibling remote socket instead of
     // leaving the newly-created Workspace reachable only by its creator.
@@ -817,10 +829,10 @@ fn ssh_protocol_failures_stop_retries_and_manual_repair_reconnects() {
             "{host}"
         );
     }
-    assert!(!tui
-        .root
-        .join("remote")
-        .join(format!("zmux-{}", unsafe { libc::getuid() }))
+    assert!(!zmux::Environment::at(tui.root.join("remote"), "default")
+        .unwrap()
+        .runtime_directory()
+        .unwrap()
         .join("ui")
         .exists());
     // Making the missing program available must not trigger an implicit retry.

@@ -14,6 +14,12 @@ use zmux::{
     after_help = "Examples:\n  Start or attach to the default zmux server:\n    zmux\n\n  Start an isolated test instance without touching your current session:\n    zmux --clean -L test-scroll\n\n  Show all running servers in the machine tree:\n    zmux a\n\n  Attach only to the selected socket:\n    zmux -L test-scroll a --single\n\n  List sessions for that isolated test instance:\n    zmux -L test-scroll ls\n\n  Start in a specific working directory:\n    zmux -c /path/to/project\n\n  Open the runtime options panel inside zmux:\n    Prefix + O"
 )]
 struct Cli {
+    /// Runtime namespace. Defaults to 'default', or the enclosing zmux shell's environment.
+    #[arg(long, global = true)]
+    environment_id: Option<String>,
+    /// Dedicated data root. Normally ~/.zmux.
+    #[arg(long, global = true)]
+    environment_root: Option<std::path::PathBuf>,
     #[command(subcommand)]
     command: Option<Cmd>,
 
@@ -81,6 +87,23 @@ fn main() -> io::Result<()> {
     setup_signals();
 
     let cli = Cli::parse();
+    let id = cli
+        .environment_id
+        .clone()
+        .or_else(|| std::env::var("ZMUX_ENVIRONMENT_ID").ok())
+        .unwrap_or_else(|| zmux::environment::DEFAULT_ENVIRONMENT_ID.into());
+    let root = cli
+        .environment_root
+        .clone()
+        .or_else(|| std::env::var_os("ZMUX_ENVIRONMENT_ROOT").map(Into::into));
+    let environment = match root {
+        Some(root) => zmux::Environment::at(root, &id)?,
+        None => zmux::Environment::new(&id)?,
+    };
+    environment.enter(|| run(cli))
+}
+
+fn run(cli: Cli) -> io::Result<()> {
     let socket = cli.socket.clone();
 
     match cli.command {
@@ -148,8 +171,10 @@ fn main() -> io::Result<()> {
             run_kill_server(&socket, sockets, all)?;
         }
         Some(Cmd::External(args)) => {
-            eprintln!("unknown subcommand: {:?}", args);
-            std::process::exit(1);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unknown subcommand: {args:?}"),
+            ));
         }
         None => {
             ClientApp::new(&socket, cli.session, cli.clean, cli.directory)
@@ -442,7 +467,8 @@ fn all_socket_names(socket_name: &str) -> io::Result<Vec<String>> {
 fn all_socket_names(_socket_name: &str) -> io::Result<Vec<String>> {
     use std::collections::BTreeSet;
 
-    let pipe_prefix = "zmux-";
+    let prefix = zmux::ipc::pipe_prefix();
+    let pipe_prefix = prefix.as_str();
     let mut names = BTreeSet::new();
     if let Ok(entries) = std::fs::read_dir(r"\\.\pipe\") {
         for entry in entries.flatten() {
@@ -489,7 +515,8 @@ fn matching_socket_names(socket_name: &str) -> io::Result<Vec<String>> {
 fn matching_socket_names(socket_name: &str) -> io::Result<Vec<String>> {
     use std::collections::BTreeSet;
 
-    let pipe_prefix = "zmux-";
+    let prefix = zmux::ipc::pipe_prefix();
+    let pipe_prefix = prefix.as_str();
     let base_pipe = format!("{}{}", pipe_prefix, socket_name);
     let tab_pipe_prefix = format!("{}{}.tab.", pipe_prefix, socket_name);
     let workspace_pipe_prefix = format!("{}{}.ws.", pipe_prefix, socket_name);

@@ -41,9 +41,10 @@ impl Fixture {
         ));
         fs::create_dir(&root).unwrap();
         fs::write(root.join("config"), "").unwrap();
-        let runtime = root.join(format!("zmux-{}", unsafe { libc::getuid() }));
-        fs::create_dir(&runtime).unwrap();
-        let socket = runtime.join("wire");
+        let environment = zmux::Environment::at(&root, "default").unwrap();
+        let socket = environment
+            .enter(|| zmux::ipc::socket_path("wire"))
+            .unwrap();
         let mut fixture = Self {
             root,
             socket,
@@ -70,7 +71,9 @@ impl Fixture {
     }
     fn command(&self) -> Command {
         let mut cmd = Command::new(BIN);
-        cmd.args(["-L", "wire", "-s", "keep"])
+        cmd.arg("--environment-root")
+            .arg(&self.root)
+            .args(["-L", "wire", "-s", "keep"])
             .env("TMPDIR", &self.root)
             .env("ZMUX_CONFIG", self.root.join("config"))
             .env("SHELL", "/bin/sh")
@@ -219,7 +222,8 @@ fn remote_clipboard_paste_runs_zsync_in_the_server_drop_directory() {
 
     assert_eq!(fixture.request("PASTE_CLOUD"), "OK pasted 1 path(s)");
     assert_eq!(
-        fs::read(fixture.root.join(".zmux/drop/synced-image.png")).unwrap(),
+        fs::read(fixture.root.join("env/default/drop/synced-image.png"))
+            .unwrap(),
         b"png"
     );
 }
@@ -336,4 +340,15 @@ fn stdio_bridge_checks_the_running_server_not_just_executable_metadata() {
     drop(input);
     let _ = bridge.wait().unwrap();
     assert!(fixture.request("LIST").contains("keep:"));
+}
+
+#[test]
+fn overlapping_server_cannot_unlink_or_replace_the_live_environment_socket() {
+    let fixture = Fixture::new(true);
+    let before = fixture.request("LIST");
+    let second = fixture.command().arg("server").output().unwrap();
+    assert!(!second.status.success());
+    thread::sleep(Duration::from_millis(100));
+    assert!(fixture.socket.exists());
+    assert_eq!(fixture.request("LIST"), before);
 }

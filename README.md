@@ -531,3 +531,52 @@ Remote tests replace SSH with a local shim while exercising the real stdio
 bridge and a second isolated server. They do not validate real SSH networking,
 authentication, Linux execution, font rendering, or every terminal emulator's
 synchronized-update support.
+
+
+## Isolated environments and the Rust library
+
+The `zmux` executable is a client of the standalone `zmux-core` crate. The core
+builds without a terminal UI or OS clipboard backend by default; the executable
+enables its `tui` feature. Existing library imports through `zmux` remain a
+compatibility facade.
+
+```sh
+zmux                                    # environment ID: default
+zmux --environment-id dev                # independent environment
+zmux --environment-id dev -L build       # workspace build, inside dev only
+zmux --environment-id dev ls
+zmux --environment-id dev kill-server --all  # only dev, never default
+```
+
+An environment is identified by its canonical data root plus a validated ID.
+Each has its own configuration, machine names/SSH routes, workspaces, sessions,
+history database, drop files, logs, IPC namespace and host locks. `-L` selects a
+workspace **inside** that environment; it is not a substitute for environment
+isolation. IDs are 1–64 lowercase ASCII letters, digits, `_` or `-`, start with a
+letter/digit, and exclude Windows reserved device names.
+
+The default data root is `~/.zmux`; use `--environment-root /absolute/path` for an
+application-owned root. Data is under `ROOT/env/ID/`, including
+`config/zmux.conf`, `config/machines.json`, `history/`, `drop/`, `logs/`, and
+`locks/`. Short, hashed Unix socket directories and Windows named pipe prefixes
+include the canonical root and ID. CLI discovery and `kill-server --all` cannot
+see other environments. The protocol also checks the environment ID before any
+command. Local namespaces are not an OS sandbox or authentication boundary:
+shells still run with the caller's account and filesystem permissions.
+
+Spawned shells and background servers inherit the selected identity. Outside
+zmux, omitting the ID selects `default`; inside its shell, the enclosing
+`ZMUX_ENVIRONMENT_ID` and `ZMUX_ENVIRONMENT_ROOT` retain that environment.
+`--environment-id` / `--environment-root` override those inherited values. SSH
+connections explicitly select the same environment ID on the remote machine,
+using that machine's data root.
+
+Named environments do not load global/legacy zmux or tmux configuration,
+`ZMUX_CONFIG`, shared machine names, trace destinations or the shared zsync
+clipboard. For compatibility, an explicit `ZMUX_CONFIG` is still honored by the
+default environment. Old configuration/history locations and pre-environment
+sockets are not imported, removed, or automatically attached; copy wanted
+configuration into the new environment after saving work in old servers.
+
+For embedding, see [zmux-core](crates/zmux-core/README.md). Select the environment
+explicitly rather than changing `HOME`, `TMPDIR`, or process environment variables.

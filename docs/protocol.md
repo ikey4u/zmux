@@ -5,7 +5,7 @@
 Application releases and wire versions are independent. `zmux --version` is for
 diagnostics; it is never used as a compatibility gate. `zmux protocol-info`
 prints one bounded JSON declaration without opening a socket or starting a
-server. `src/ipc/protocol.rs` is the single source of truth for both discovery
+server. `crates/zmux-core/src/ipc/protocol.rs` is the single source of truth for both discovery
 and live negotiation.
 
 The enforced protocol begins at **2.0**. Historical `ZMUX 1` constants were not
@@ -122,3 +122,17 @@ Regression coverage must include major/minor/capability matrices, malformed and
 fragmented handshakes, read-ahead preservation, old/new peers in both directions,
 unnegotiated mutation rejection, management channels, stale running servers,
 SSH failure classification, and preservation of existing sockets/sessions.
+
+
+## Environment namespaces
+
+`ProtocolInfo.environment_id` identifies the selected environment; peers with
+different IDs are rejected with `environment_mismatch` before ATTACH or commands.
+An omitted field on an older peer means `default`, so a named environment cannot
+silently attach to an old unscoped server. Matching IDs still require compatible
+versions/capabilities and do not authenticate either peer.
+
+IPC endpoints and host locks include both the canonical environment data root
+and ID. SSH selects the ID explicitly on the remote host; its data root is local
+to that host. Workspace discovery and kill-all enumerate only that IPC namespace.
+The executable and optional TUI use the same core as embedding applications.
