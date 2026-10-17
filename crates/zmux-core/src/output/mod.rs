@@ -1445,7 +1445,11 @@ mod tests {
 
 /// Independent, authoritative viewport. Never consumes another renderer's dirty state.
 pub(crate) fn pane_snapshot(pane: &Pane) -> (String, String) {
-    let mut out = String::from("\x1b[0m\x1b[2J\x1b[H");
+    let mut out = String::new();
+    if pane.parser.lock().is_ok_and(|p| p.alternate_screen()) {
+        out.push_str("\x1b[?1049h");
+    }
+    out.push_str("\x1b[0m\x1b[2J\x1b[H");
     write_pane(
         pane,
         true,
@@ -1460,8 +1464,7 @@ pub(crate) fn pane_snapshot(pane: &Pane) -> (String, String) {
     );
     let mut history = String::new();
     if let Ok(parser) = pane.parser.lock() {
-        let (row, col) = parser.cursor_position();
-        vte_cup(col, row, &mut out);
+        out.push_str(&parser.snapshot_suffix());
         out.push_str(if parser.hide_cursor() {
             "\x1b[?25l"
         } else {

@@ -121,6 +121,7 @@ struct HistoryControlTracker {
     alternate_exit_requested: bool,
     sync_update: bool,
     clear_requested: bool,
+    scroll_region: Option<(u16, u16)>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -151,6 +152,7 @@ impl HistoryControlTracker {
                 }
                 b'c' => {
                     self.alternate_screen = false;
+                    self.scroll_region = None;
                     self.clear_requested = true;
                     self.state = HistoryControlState::Ground;
                 }
@@ -183,6 +185,17 @@ impl HistoryControlTracker {
     }
 
     fn finish_csi(&mut self, final_byte: u8) {
+        if final_byte == b'r' && self.csi_params.first() != Some(&b'?') {
+            let mut parts = self.csi_params.split(|b| *b == b';');
+            let top = decimal_parameter(parts.next().unwrap_or_default())
+                .unwrap_or(1)
+                .max(1);
+            let bottom = decimal_parameter(parts.next().unwrap_or_default())
+                .unwrap_or(0);
+            if bottom == 0 || bottom > top {
+                self.scroll_region = Some((top, bottom));
+            }
+        }
         if final_byte == b'J'
             && first_csi_param(&self.csi_params) == Some(3)
             && !self.alternate_screen
@@ -851,6 +864,7 @@ impl AlacrittyTermState {
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
+        self.history_control.scroll_region = None;
         self.pending_alternate_exit = None;
         let size = TermSize::new(rows, cols);
         let alternate_screen = self.alternate_screen();
@@ -935,6 +949,63 @@ impl AlacrittyTermState {
         } else {
             0
         }
+    }
+
+    /// Restore the modes needed for a newly attached incremental terminal renderer.
+    pub(crate) fn snapshot_suffix(&self) -> String {
+        let mode = self.term.mode();
+        let mut out = String::new();
+        for (number, flag) in [
+            (1, TermMode::APP_CURSOR),
+            (7, TermMode::LINE_WRAP),
+            (1000, TermMode::MOUSE_REPORT_CLICK),
+            (1002, TermMode::MOUSE_DRAG),
+            (1003, TermMode::MOUSE_MOTION),
+            (1006, TermMode::SGR_MOUSE),
+            (2004, TermMode::BRACKETED_PASTE),
+        ] {
+            out.push_str(&format!(
+                "\x1b[?{number}{}",
+                if mode.contains(flag) { 'h' } else { 'l' }
+            ));
+        }
+        out.push_str(if mode.contains(TermMode::APP_KEYPAD) {
+            "\x1b="
+        } else {
+            "\x1b>"
+        });
+        out.push_str(if mode.contains(TermMode::INSERT) {
+            "\x1b[4h"
+        } else {
+            "\x1b[4l"
+        });
+        let (top, bottom) =
+            self.history_control.scroll_region.unwrap_or((1, self.rows));
+        let bottom = if bottom == 0 {
+            self.rows
+        } else {
+            bottom.min(self.rows)
+        };
+        let top = top.min(bottom.saturating_sub(1).max(1));
+        out.push_str(&format!("\x1b[{top};{bottom}r"));
+        let origin = mode.contains(TermMode::ORIGIN);
+        out.push_str(if origin { "\x1b[?6h" } else { "\x1b[?6l" });
+        let (row, col) = self.cursor_position();
+        let row = if origin {
+            row.saturating_sub(top - 1)
+        } else {
+            row
+        };
+        out.push_str(&format!("\x1b[{};{}H", row + 1, col + 1));
+        if let Some(cell) = cell_to_view(&self.term.grid().cursor.template) {
+            out.push_str("\x1b[0m");
+            crate::output::write_style_diff(
+                &mut crate::output::RESET_STYLES.clone(),
+                crate::output::CharacterStyles::from_cell(&cell),
+                &mut out,
+            );
+        }
+        out
     }
 
     pub fn bracketed_paste(&self) -> bool {

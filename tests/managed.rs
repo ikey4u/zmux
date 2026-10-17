@@ -70,6 +70,26 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
+    fn snapshot_restores_dimensions_and_application_modes() {
+        let (root, rt) = runtime();
+        let s = rt.open(&root, "Modes", Some("/bin/sh"), 80, 24).unwrap();
+        let p = s.windows[0].panes[0].id.parse().unwrap();
+        rt.input(&s.id,p,b"printf '\\033[?1049h\\033[?1h\\033[?2004h\\033[2;20r\\033[31mMODE_%s' READY; sleep 1\r").unwrap();
+        wait(&rt, &s.id, p, "MODE_READY");
+        let snapshot = rt.pull(&s.id, p, None, Duration::ZERO).unwrap();
+        assert_eq!((snapshot.cols, snapshot.rows), (80, 24));
+        let mut term =
+            zmux_core::terminal::AlacrittyTermState::new(24, 80, 100);
+        term.process(&snapshot.data);
+        assert!(term.alternate_screen());
+        assert!(term.bracketed_paste());
+        assert!(String::from_utf8_lossy(&snapshot.data).contains("\x1b[?1h"));
+        assert!(String::from_utf8_lossy(&snapshot.data).contains("\x1b[2;20r"));
+        rt.close(&s.id, None, None).unwrap();
+        drop(rt);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn viewer_detach_and_other_sessions_do_not_end_shells() {
         let (root, rt) = runtime();
         let a = rt.open(&root, "A", None, 80, 24).unwrap();

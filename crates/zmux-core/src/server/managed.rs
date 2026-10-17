@@ -317,6 +317,8 @@ impl InProcessServer {
             if let Some(after) = after {
                 if let Some(data) = journal.read(after) {
                     return Ok(PaneOutput {
+                        cols: p.last_cols,
+                        rows: p.last_rows,
                         offset: after + data.len() as u64,
                         data,
                         snapshot: false,
@@ -327,6 +329,8 @@ impl InProcessServer {
             }
             let (data, history) = pane_snapshot(p);
             Ok(PaneOutput {
+                cols: p.last_cols,
+                rows: p.last_rows,
                 offset: journal.end,
                 data: data.into_bytes(),
                 snapshot: true,

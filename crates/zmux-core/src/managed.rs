@@ -36,6 +36,8 @@ pub struct SessionInfo {
     pub alive: bool,
 }
 pub struct PaneOutput {
+    pub cols: u16,
+    pub rows: u16,
     pub data: Vec<u8>,
     pub offset: u64,
     pub snapshot: bool,
