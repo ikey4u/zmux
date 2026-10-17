@@ -1446,7 +1446,10 @@ mod tests {
 /// Independent, authoritative viewport. Never consumes another renderer's dirty state.
 pub(crate) fn pane_snapshot(pane: &Pane) -> (String, String) {
     let mut out = String::new();
-    if pane.parser.lock().is_ok_and(|p| p.alternate_screen()) {
+    if pane.parser.lock().is_ok_and(|mut p| {
+        p.prepare_client_snapshot();
+        p.alternate_screen()
+    }) {
         out.push_str("\x1b[?1049h");
     }
     out.push_str("\x1b[0m\x1b[2J\x1b[H");

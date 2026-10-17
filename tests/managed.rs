@@ -85,6 +85,28 @@ mod tests {
         assert!(term.bracketed_paste());
         assert!(String::from_utf8_lossy(&snapshot.data).contains("\x1b[?1h"));
         assert!(String::from_utf8_lossy(&snapshot.data).contains("\x1b[2;20r"));
+        rt.input(
+            &s.id,
+            p,
+            b"printf '\\033[?1049l\\033[?2026hSYNC_%s' READY; sleep 1\r",
+        )
+        .unwrap();
+        wait(&rt, &s.id, p, "SYNC_READY");
+        let normal = rt.pull(&s.id, p, None, Duration::ZERO).unwrap();
+        let mut restored =
+            zmux_core::terminal::AlacrittyTermState::new(24, 80, 100);
+        restored.process(&normal.data);
+        assert!(!restored.alternate_screen());
+        let visible = restored
+            .visible_rows()
+            .iter()
+            .flat_map(|row| row.iter().flatten())
+            .map(|c| c.text.as_str())
+            .collect::<String>();
+        assert!(
+            visible.contains("SYNC_READY"),
+            "snapshot lost output: {visible:?}"
+        );
         rt.close(&s.id, None, None).unwrap();
         drop(rt);
         std::fs::remove_dir_all(root).unwrap();

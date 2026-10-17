@@ -951,6 +951,11 @@ impl AlacrittyTermState {
         }
     }
 
+    /// A byte-offset snapshot must commit buffered display state before skipping raw bytes.
+    pub(crate) fn prepare_client_snapshot(&mut self) {
+        self.apply_pending_sync();
+        self.pending_alternate_exit = None;
+    }
     /// Restore the modes needed for a newly attached incremental terminal renderer.
     pub(crate) fn snapshot_suffix(&self) -> String {
         let mode = self.term.mode();
