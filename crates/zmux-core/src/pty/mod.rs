@@ -718,6 +718,7 @@ fn configure_pty_nonblocking(master: &dyn portable_pty::MasterPty) {
 
 #[cfg(unix)]
 fn apply_host_termios_to_slave(master: &dyn portable_pty::MasterPty) {
+    use std::os::unix::fs::OpenOptionsExt;
     let path = match master.tty_name() {
         Some(path) => path,
         None => return,
@@ -726,6 +727,10 @@ fn apply_host_termios_to_slave(master: &dyn portable_pty::MasterPty) {
     let file = match std::fs::OpenOptions::new()
         .read(true)
         .write(true)
+        // An embedding daemon can be a session leader with no controlling TTY.
+        // Never let this parent-side open claim the slave: closing the PTY would
+        // otherwise deliver SIGHUP to the daemon instead of only its shell.
+        .custom_flags(libc::O_NOCTTY)
         .open(path)
     {
         Ok(file) => file,
