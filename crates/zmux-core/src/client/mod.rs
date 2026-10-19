@@ -5856,31 +5856,51 @@ fn key_matches_char(key: KeyEvent, expected: char) -> bool {
             && shifted_ascii_base(expected) == Some(actual))
 }
 
+const SHIFTED_ASCII_PAIRS: [(char, char); 21] = [
+    ('~', '`'),
+    ('!', '1'),
+    ('@', '2'),
+    ('#', '3'),
+    ('$', '4'),
+    ('%', '5'),
+    ('^', '6'),
+    ('&', '7'),
+    ('*', '8'),
+    ('(', '9'),
+    (')', '0'),
+    ('_', '-'),
+    ('+', '='),
+    ('{', '['),
+    ('}', ']'),
+    ('|', '\\'),
+    (':', ';'),
+    ('"', '\''),
+    ('<', ','),
+    ('>', '.'),
+    ('?', '/'),
+];
+
 fn shifted_ascii_base(shifted: char) -> Option<char> {
-    Some(match shifted {
-        '~' => '`',
-        '!' => '1',
-        '@' => '2',
-        '#' => '3',
-        '$' => '4',
-        '%' => '5',
-        '^' => '6',
-        '&' => '7',
-        '*' => '8',
-        '(' => '9',
-        ')' => '0',
-        '_' => '-',
-        '+' => '=',
-        '{' => '[',
-        '}' => ']',
-        '|' => '\\',
-        ':' => ';',
-        '"' => '\'',
-        '<' => ',',
-        '>' => '.',
-        '?' => '/',
-        _ => return None,
-    })
+    SHIFTED_ASCII_PAIRS
+        .iter()
+        .find(|(s, _)| *s == shifted)
+        .map(|(_, base)| *base)
+}
+
+/// Resolve the character a key produces.  Terminals speaking the kitty
+/// keyboard protocol without alternate-key reporting (e.g. Alacritty) send
+/// the unshifted key plus `SHIFT`, so apply the US-layout shift ourselves.
+fn key_char(c: char, modifiers: KeyModifiers) -> char {
+    if !modifiers.contains(KeyModifiers::SHIFT) {
+        return c;
+    }
+    if c.is_ascii_lowercase() {
+        return c.to_ascii_uppercase();
+    }
+    SHIFTED_ASCII_PAIRS
+        .iter()
+        .find(|(_, base)| *base == c)
+        .map_or(c, |(shifted, _)| *shifted)
 }
 
 fn prefix_nav_dir(key: KeyEvent) -> Option<crate::layout::NavDir> {
@@ -5948,7 +5968,7 @@ fn edit_prompt(buf: &mut String, cursor: &mut usize, key: KeyEvent) {
             ) && !ch.is_control() =>
         {
             let at = char_byte_pos(buf, *cursor);
-            buf.insert(at, ch);
+            buf.insert(at, key_char(ch, key.modifiers));
             *cursor += 1;
         }
         _ => {}
@@ -6541,6 +6561,7 @@ fn key_to_bytes(key: KeyEvent) -> Vec<u8> {
         KeyCode::Enter => b"\r".to_vec(),
         KeyCode::Char(c) if c == '\r' || c == '\n' => b"\r".to_vec(),
         KeyCode::Char(c) => {
+            let c = key_char(c, mods);
             if mods.contains(KeyModifiers::CONTROL) {
                 let lower = c.to_ascii_lowercase();
                 if lower >= 'a' && lower <= 'z' {
@@ -7231,6 +7252,38 @@ mod tests {
                 shifted,
             ));
         }
+    }
+
+    #[test]
+    fn shifted_csi_u_keys_forward_shifted_characters() {
+        for (base, shifted) in [('`', "~"), ('1', "!"), ('/', "?"), ('a', "A")]
+        {
+            assert_eq!(
+                key_to_bytes(KeyEvent::new(
+                    KeyCode::Char(base),
+                    KeyModifiers::SHIFT,
+                )),
+                shifted.as_bytes(),
+            );
+        }
+        assert_eq!(
+            key_to_bytes(KeyEvent::new(KeyCode::Char('~'), KeyModifiers::NONE)),
+            b"~",
+        );
+        assert_eq!(
+            key_to_bytes(KeyEvent::new(
+                KeyCode::Char('`'),
+                KeyModifiers::SHIFT | KeyModifiers::ALT,
+            )),
+            b"\x1b~",
+        );
+        assert_eq!(
+            key_to_bytes(KeyEvent::new(
+                KeyCode::Char('2'),
+                KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+            )),
+            [0x00],
+        );
     }
 
     #[test]
