@@ -41,3 +41,7 @@ panic = "abort"
 
 [profile.dev]
 panic = "abort"
+
+# Track our maintained crossterm patch branch; Cargo.lock pins the resolved commit.
+[patch.crates-io]
+crossterm = { git = "https://github.com/ikey4u/fork-crossterm.git", branch = "patch" }

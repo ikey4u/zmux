@@ -591,6 +591,26 @@ fn sigterm_restores_keyboard_mouse_and_terminal_modes() {
 }
 
 #[test]
+fn sighup_detaches_client_and_preserves_session() {
+    let mut tui = Tui::start_hidden();
+    tui.wait("client ready", |rows| {
+        rows.iter().any(|line| line.contains("READY>"))
+    });
+    let pid = tui.child.process_id().expect("child process id");
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGHUP) }, 0);
+    tui.wait_for_exit("SIGHUP");
+    tui.assert_terminal_modes_restored();
+    let mut attached = Tui::attach_raw(tui.root.clone(), false);
+    attached.wait("session survived SIGHUP", |rows| {
+        rows.iter().any(|line| line.contains("READY>"))
+    });
+    attached.send(b"printf 'AFTER_HUP_%s\\n' 'ALIVE'\r");
+    attached.wait("shell remains responsive", |rows| {
+        rows.iter().any(|line| line.contains("AFTER_HUP_ALIVE"))
+    });
+}
+
+#[test]
 fn long_shell_output_leaves_cursor_at_the_latest_prompt() {
     fn assert_prompt_cursor(tui: &Tui) {
         let lines = tui.lines();

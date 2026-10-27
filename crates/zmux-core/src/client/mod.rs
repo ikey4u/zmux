@@ -124,7 +124,12 @@ impl ClientTerminationGuard {
         let mut guard = Self {
             previous: Vec::new(),
         };
-        for signal in [Signal::SIGTERM, Signal::SIGINT, Signal::SIGQUIT] {
+        for signal in [
+            Signal::SIGHUP,
+            Signal::SIGTERM,
+            Signal::SIGINT,
+            Signal::SIGQUIT,
+        ] {
             let previous = unsafe { sigaction(signal, &action) }
                 .map_err(io::Error::other)?;
             guard.previous.push((signal, previous));
@@ -2341,7 +2346,18 @@ sidebar_visible,
                     log_client(&format!("failed to set mouse pointer: {err}"));
                 }
 
-                if event::poll(Duration::from_millis(8))? {
+                // A disconnected PTY is a normal detach, not an input error.
+                // The reader must return on EOF instead of spinning internally.
+                let input_ready = match event::poll(Duration::from_millis(8)) {
+                    Ok(ready) => ready,
+                    Err(error)
+                        if error.kind() == io::ErrorKind::UnexpectedEof =>
+                    {
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                };
+                if input_ready {
                     match event::read()? {
                         Event::Key(key)
                             if key.kind == KeyEventKind::Press
