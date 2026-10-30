@@ -1701,7 +1701,8 @@ const NAVIGATION_HELP: &[&str] = &[
     "Click name      Open selected node",
     "",
     "Delete cascades through empty parent nodes.",
-    "Machine/Workspace delete stops their servers.",
+    "Machine delete disconnects; remote sessions survive.",
+    "Workspace delete stops its server and sessions.",
     "Machine/workspace rename is saved in machines.json.",
 ];
 

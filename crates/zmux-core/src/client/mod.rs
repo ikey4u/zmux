@@ -688,7 +688,7 @@ fn navigation_delete_effect(
     entry: &navigation::NavigationEntry,
 ) -> &'static str {
     match navigation_delete_target(entries, entry) {
-        NavigationDeleteTarget::Machine(_) => "stop all Workspace servers",
+        NavigationDeleteTarget::Machine(_) => "disconnect and forget Machine",
         NavigationDeleteTarget::Workspace { .. } => {
             "stop its Workspace server and processes"
         }
@@ -710,29 +710,13 @@ fn close_navigation_entry(
             if machine_id == "local" {
                 return Err("the local machine cannot be closed".to_string());
             }
-            while let Some(workspace) = workspaces
-                .workspaces
-                .iter()
-                .find(|workspace| workspace.machine_id == machine_id)
-                .map(|workspace| workspace.socket_name.clone())
-            {
-                if workspaces.kill_workspace(&machine_id, &workspace)? {
-                    machine_names
-                        .forget_remote(machine_config, &machine_id)
-                        .map_err(|error| {
-                            format!("could not forget remote Machine: {error}")
-                        })?;
-                    remotes.machines.retain(|machine| machine.id != machine_id);
-                    return Ok(true);
-                }
-            }
             machine_names
                 .forget_remote(machine_config, &machine_id)
                 .map_err(|error| {
                     format!("could not forget remote Machine: {error}")
                 })?;
             remotes.machines.retain(|machine| machine.id != machine_id);
-            Ok(false)
+            Ok(workspaces.disconnect_machine(&machine_id))
         }
         NavigationDeleteTarget::Workspace { machine, workspace } => {
             let empty = workspaces.kill_workspace(&machine, &workspace)?;
@@ -1106,6 +1090,25 @@ impl WorkspaceManager {
         } else {
             false
         }
+    }
+
+    fn disconnect_machine(&mut self, machine_id: &str) -> bool {
+        // Machine removal only releases this client's connections. Its servers
+        // may also be in use by clients on the remote desktop or other hosts.
+        let mut index = 0;
+        while index < self.workspaces.len() {
+            if self.workspaces[index].machine_id == machine_id {
+                self.workspaces[index].client.shutdown();
+                self.workspaces.remove(index);
+                if index < self.active {
+                    self.active -= 1;
+                }
+            } else {
+                index += 1;
+            }
+        }
+        self.active = self.active.min(self.workspaces.len().saturating_sub(1));
+        self.workspaces.is_empty()
     }
 
     fn kill_workspace(

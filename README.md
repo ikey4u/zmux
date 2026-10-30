@@ -55,9 +55,10 @@ MACHINE-02 (SSH)
 Names may repeat across machines or Workspaces without identifying the same
 session or pane. Opening a node targets its owning Workspace;
 renaming a machine or Workspace changes its display label, not its SSH address
-or server socket. Closing a Workspace detaches this client from it, while its
-server and sessions remain available for reattachment. Closing a session,
-window, or pane is a different operation and can end the processes inside it.
+or server socket. Removing an SSH Machine disconnects this client and forgets
+its saved route; remote servers and sessions remain available for reattachment.
+Deleting a Workspace stops its server and sessions. Deleting a session,
+window, or pane can end the processes inside it.
 
 The sidebar is a navigation surface, not another terminal pane, and is **hidden
 by default** on client startup. `Prefix+m` opens the same tree in a centered
@@ -265,13 +266,18 @@ legacy tab server sockets. All levels use the same tree controls below.
 | Click `▸`/`▾` | Expand or collapse that branch |
 | Click a node name | Connect or open that machine, workspace, session, window, or pane |
 
-Deletion applies to every node level. Removing an SSH Machine stops every
-currently connected Workspace server under that Machine and removes the tree
-node. Removing a Workspace stops its server and all sessions. Deleting a
-Session, Window, or Pane ends its processes; when it is the last child, deletion
+Deletion applies to every node level. Removing an SSH Machine disconnects this
+client from its Workspaces, forgets its saved route, and removes the tree node.
+Its remote servers, sessions, and other attached clients keep running; use
+`new -m` to reconnect. Removing a Workspace stops its server and all sessions.
+Deleting a Session, Window, or Pane ends its processes; when it is the last child, deletion
 cascades through the now-empty parents and stops the Workspace. The local
 Machine root remains protected. Every destructive action requires explicit
 `y/Y` confirmation.
+
+To intentionally stop remote zmux, select its Workspace and press `K`, or run
+`zmux kill-server <socket>` on the remote host. Run `zmux kill-server --all` on
+that host to stop all discoverable servers in the selected zmux environment.
 
 The tab bar remains removed; Workspace nodes replace its organization role.
 The former `new -t` spelling now creates a Workspace instead of a visual tab.

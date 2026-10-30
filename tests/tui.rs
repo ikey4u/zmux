@@ -754,7 +754,60 @@ fn new_t_on_remote_creates_and_rediscovers_a_remote_workspace() {
     observer.wait("remote Workspace is rediscovered after reconnect", |rows| {
         rows.iter().any(|line| line.contains("▣ Remote-build"))
             && rows.iter().any(|line| line.contains("● loopback"))
+            && rows.last().unwrap().contains(" [0] ")
+            && rows.iter().any(|line| line.contains("READY>"))
     });
+    // Allow the asynchronous activation to finish before typing shell input.
+    observer.pump_for(Duration::from_secs(1));
+    observer.send(b"export MACHINE_REMOVE_SENTINEL=still-alive; printf 'BEFORE=%s\\n' \"$MACHINE_REMOVE_SENTINEL\"\r");
+    observer.wait("original shell state is set before removal", |rows| {
+        rows.iter().any(|line| line.contains("BEFORE=still-alive"))
+    });
+
+    // Removing a Machine releases every connection owned by this client,
+    // including sibling Workspaces, without disrupting another attached client.
+    tui.send(b"\x01h");
+    tui.wait(
+        "tree focused before removing multi-Workspace Machine",
+        |rows| rows.iter().any(|line| line.contains('▌')),
+    );
+    tui.send(b"gjjjjjK");
+    tui.wait("Machine removal asks to disconnect", |rows| {
+        rows.last().unwrap().starts_with("Close machine")
+            && rows.last().unwrap().contains("disconnect and forget")
+    });
+    tui.send(b"y");
+    tui.wait("all remote Workspaces removed from this client", |rows| {
+        !rows.iter().any(|line| line.contains("loopback"))
+            && !rows.iter().any(|line| line.contains("Remote-build"))
+            && rows.last().unwrap().contains("[main]")
+    });
+    for socket in ["ui", remote_socket.as_str()] {
+        let running = Command::new(BIN)
+            .args(["-L", socket, "ls"])
+            .env("TMPDIR", tui.root.join("remote"))
+            .env("ZMUX_ENVIRONMENT_ROOT", tui.root.join("remote"))
+            .output()
+            .unwrap();
+        assert!(running.status.success());
+        assert!(
+            String::from_utf8_lossy(&running.stdout).contains("0:"),
+            "Machine removal must leave remote Workspace {socket} alive"
+        );
+    }
+    observer.send(b"printf 'SURVIVED=%s\\n' \"$MACHINE_REMOVE_SENTINEL\"\r");
+    observer.wait("other client retains the original remote shell", |rows| {
+        rows.iter()
+            .any(|line| line.contains("SURVIVED=still-alive"))
+    });
+    tui.command("new -m loopback");
+    tui.wait(
+        "removed Machine reconnects to existing Workspaces",
+        |rows| {
+            rows.iter().any(|line| line.contains("● loopback"))
+                && rows.iter().any(|line| line.contains("▣ Remote-build"))
+        },
+    );
 }
 
 #[test]
@@ -1030,6 +1083,7 @@ fn remote_tree_focus_rename_split_close_and_offline_rename() {
     tui.send(format!("g{}K", "j".repeat(index)).as_bytes());
     tui.wait("online machine delete requires confirmation", |rows| {
         rows.last().unwrap().starts_with("Close machine")
+            && rows.last().unwrap().contains("disconnect and forget")
     });
     tui.send(b"y");
     tui.wait("online machine and its workspaces removed", |rows| {
@@ -1038,17 +1092,22 @@ fn remote_tree_focus_rename_split_close_and_offline_rename() {
         }) && rows.iter().any(|l| l.contains("▣ ui"))
             && rows.last().unwrap().contains("[main]")
     });
-    let stopped = Command::new(BIN)
+    let running = Command::new(BIN)
         .args(["-L", "ui", "ls"])
         .env("TMPDIR", tui.root.join("remote"))
+        .env("ZMUX_ENVIRONMENT_ROOT", tui.root.join("remote"))
         .output()
         .unwrap();
     assert!(
-        stopped.status.success()
-            && String::from_utf8_lossy(&stopped.stdout)
-                .contains("no server running"),
-        "removing a machine must stop all of its remote Workspace servers"
+        running.status.success()
+            && String::from_utf8_lossy(&running.stdout).contains("0:"),
+        "removing a Machine must preserve its remote Workspace server and session"
     );
+    let saved = zmux::config::machines::MachineNames::load(
+        &tui.root.join("machines.json"),
+    )
+    .unwrap();
+    assert!(!saved.routes.contains_key("ssh:8#loopback"));
 }
 
 #[test]
@@ -1114,11 +1173,13 @@ fn floating_remote_tree_k_removes_child_and_machine_nodes() {
     let remote = Command::new(BIN)
         .args(["-L", "ui", "ls"])
         .env("TMPDIR", tui.root.join("remote"))
+        .env("ZMUX_ENVIRONMENT_ROOT", tui.root.join("remote"))
         .output()
         .unwrap();
     assert!(remote.status.success());
     assert!(
-        String::from_utf8_lossy(&remote.stdout).contains("no server running")
+        String::from_utf8_lossy(&remote.stdout).contains("0:"),
+        "floating-tree Machine removal must preserve remote sessions"
     );
 }
 
