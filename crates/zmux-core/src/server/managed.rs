@@ -3,6 +3,7 @@ use super::*;
 use crate::{
     managed::{PaneInfo, PaneOutput, WindowInfo},
     output::pane_snapshot,
+    types::Pane,
 };
 fn missing() -> io::Error {
     io::Error::new(io::ErrorKind::NotFound, "terminal target no longer exists")
@@ -301,6 +302,25 @@ impl InProcessServer {
         pane: usize,
         after: Option<u64>,
     ) -> io::Result<PaneOutput> {
+        self.managed_read_with(pane, after, |pane| {
+            let (data, history) = pane_snapshot(pane);
+            (data, history, false)
+        })
+    }
+    #[cfg(feature = "mobile")]
+    pub(crate) fn managed_read_mobile(
+        &self,
+        pane: usize,
+        after: Option<u64>,
+    ) -> io::Result<PaneOutput> {
+        self.managed_read_with(pane, after, crate::mobile::pane_snapshot)
+    }
+    fn managed_read_with(
+        &self,
+        pane: usize,
+        after: Option<u64>,
+        snapshot: fn(&Pane) -> (String, String, bool),
+    ) -> io::Result<PaneOutput> {
         self.environment.enter(|| {
             let s = self.state.lock().map_err(poisoned)?;
             let p = s
@@ -324,10 +344,11 @@ impl InProcessServer {
                         snapshot: false,
                         closed: p.dead.load(Ordering::Relaxed),
                         history: String::new(),
+                        history_truncated: false,
                     });
                 }
             }
-            let (data, history) = pane_snapshot(p);
+            let (data, history, history_truncated) = snapshot(p);
             Ok(PaneOutput {
                 cols: p.last_cols,
                 rows: p.last_rows,
@@ -336,6 +357,7 @@ impl InProcessServer {
                 snapshot: true,
                 closed: p.dead.load(Ordering::Relaxed),
                 history,
+                history_truncated,
             })
         })
     }

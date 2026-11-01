@@ -24,3 +24,5 @@ pub use runtime::TerminalRuntime;
 
 mod journal;
 pub mod managed;
+#[cfg(feature = "mobile")]
+pub mod mobile;

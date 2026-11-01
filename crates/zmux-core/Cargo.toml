@@ -12,6 +12,8 @@ path = "src/lib.rs"
 
 [features]
 default = []
+# Adds opt-in ANSI scrollback snapshots for mobile terminal clients.
+mobile = []
 tui = ["dep:arboard", "ratatui/crossterm_0_29", "ratatui/underline-color", "dep:objc2", "dep:objc2-foundation", "dep:objc2-app-kit"]
 
 [dependencies]

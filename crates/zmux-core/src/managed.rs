@@ -43,6 +43,7 @@ pub struct PaneOutput {
     pub snapshot: bool,
     pub closed: bool,
     pub history: String,
+    pub history_truncated: bool,
 }
 struct Hosted {
     host: Arc<InProcessServer>,
@@ -276,11 +277,42 @@ impl ManagedRuntime {
         after: Option<u64>,
         wait: Duration,
     ) -> io::Result<PaneOutput> {
+        self.pull_with(id, pane, after, wait, InProcessServer::managed_read)
+    }
+    /// ANSI scrollback preserving soft wraps and colours for mobile viewers.
+    #[cfg(feature = "mobile")]
+    pub fn pull_mobile(
+        &self,
+        id: &str,
+        pane: usize,
+        after: Option<u64>,
+        wait: Duration,
+    ) -> io::Result<PaneOutput> {
+        self.pull_with(
+            id,
+            pane,
+            after,
+            wait,
+            InProcessServer::managed_read_mobile,
+        )
+    }
+    fn pull_with(
+        &self,
+        id: &str,
+        pane: usize,
+        after: Option<u64>,
+        wait: Duration,
+        read: fn(
+            &InProcessServer,
+            usize,
+            Option<u64>,
+        ) -> io::Result<PaneOutput>,
+    ) -> io::Result<PaneOutput> {
         let host = self.host(id)?;
         let deadline = Instant::now() + wait.min(Duration::from_secs(20));
         loop {
             let version = self.environment.wait(0, Duration::ZERO);
-            let output = host.managed_read(pane, after)?;
+            let output = read(&host, pane, after)?;
             if !output.data.is_empty()
                 || output.snapshot
                 || output.closed

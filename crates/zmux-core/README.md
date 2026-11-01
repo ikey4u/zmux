@@ -40,6 +40,14 @@ adapters; retained output is bounded. It is a blocking API: asynchronous hosts
 should call it on a blocking executor. Clipboard or terminal replies must not be
 automatically echoed as shell input by display adapters.
 
+The optional `mobile` feature adds `ManagedRuntime::pull_mobile`. Its snapshot
+`history` is ANSI text that preserves colours, wide characters and soft wraps;
+replay it at the returned column count before painting `data`. Incremental
+pulls keep the existing `data` and offset behavior. History is limited to the
+newest 4,000 physical rows and 256 KiB of encoded text. Check
+`history_truncated` to tell the viewer when older scrollback was omitted.
+The regular `pull` retains its original plain history format.
+
 `Environment::enter` adapts existing synchronous APIs and restores the previous
 scope on return or unwind. `environment::spawn` / `spawn_named` propagate that
 scope to library threads. Do not hold an `enter` scope across an async `.await`;

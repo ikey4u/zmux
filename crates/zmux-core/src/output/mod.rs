@@ -1445,6 +1445,14 @@ mod tests {
 
 /// Independent, authoritative viewport. Never consumes another renderer's dirty state.
 pub(crate) fn pane_snapshot(pane: &Pane) -> (String, String) {
+    pane_snapshot_with_history(pane, true)
+}
+
+/// Render the authoritative screen; mobile snapshots encode history separately.
+pub(crate) fn pane_snapshot_with_history(
+    pane: &Pane,
+    include_history: bool,
+) -> (String, String) {
     let mut out = String::new();
     if pane.parser.lock().is_ok_and(|mut p| {
         p.prepare_client_snapshot();
@@ -1473,7 +1481,7 @@ pub(crate) fn pane_snapshot(pane: &Pane) -> (String, String) {
         } else {
             "\x1b[?25h"
         });
-        if !parser.alternate_screen() {
+        if include_history && !parser.alternate_screen() {
             let (rows, _, _) = parser.snapshot_rows();
             let end = rows.len().saturating_sub(pane.last_rows as usize);
             for row in rows[..end]
