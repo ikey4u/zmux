@@ -1,7 +1,10 @@
 //! Typed pane operations never depend on another viewer's active selection.
 use super::*;
 use crate::{
-    managed::{PaneInfo, PaneOutput, WindowInfo},
+    commands::ParsedCommand,
+    managed::{
+        ManagedCommandOutput, ManagedLayout, PaneInfo, PaneOutput, WindowInfo,
+    },
     output::pane_snapshot,
     types::Pane,
 };
@@ -14,7 +17,72 @@ where
 {
     io::Error::other(e.to_string())
 }
+fn managed_layout(node: &LayoutNode) -> ManagedLayout {
+    match node {
+        LayoutNode::Leaf(pane) => ManagedLayout::Pane {
+            id: pane.id.to_string(),
+        },
+        LayoutNode::Split {
+            direction,
+            sizes,
+            children,
+        } => ManagedLayout::Split {
+            direction: match direction {
+                SplitDirection::Horizontal => "horizontal",
+                SplitDirection::Vertical => "vertical",
+            },
+            sizes: sizes.clone(),
+            children: children.iter().map(managed_layout).collect(),
+        },
+    }
+}
 impl InProcessServer {
+    pub(crate) fn managed_command(
+        &self,
+        window: usize,
+        pane: usize,
+        command: &ParsedCommand,
+    ) -> io::Result<ManagedCommandOutput> {
+        self.environment.enter(|| {
+            let size = *self.size.lock().map_err(poisoned)?;
+            let mut state = self.state.lock().map_err(poisoned)?;
+            let session = state.sessions.first_mut().ok_or_else(missing)?;
+            let window_index = session
+                .windows
+                .iter()
+                .position(|item| item.id == window)
+                .ok_or_else(missing)?;
+            let path = crate::layout::find_pane_path(
+                &session.windows[window_index].root,
+                pane,
+            )
+            .ok_or_else(missing)?;
+            session.active_window_idx = window_index;
+            session.windows[window_index].active_pane_path = path;
+            let output =
+                super::dispatch_command_output(&mut state, command, size);
+            let (window_id, pane_id) = state
+                .sessions
+                .first()
+                .and_then(|session| {
+                    session.windows.get(session.active_window_idx)
+                })
+                .map(|window| {
+                    (
+                        Some(window.id.to_string()),
+                        super::visible_active_pane(window)
+                            .map(|pane| pane.id.to_string()),
+                    )
+                })
+                .unwrap_or((None, None));
+            mark_data_ready();
+            Ok(ManagedCommandOutput {
+                window_id,
+                pane_id,
+                output,
+            })
+        })
+    }
     pub(crate) fn managed_start(
         environment: &crate::Environment,
         id: &str,
@@ -34,7 +102,7 @@ impl InProcessServer {
             latest_frame: Arc::new(Mutex::new(FrameStore::default())),
             size: Arc::new(Mutex::new(Size::terminal(rows, cols))),
         };
-        host.managed_create(None, None, "Shell", shell, cwd, cols, rows)?;
+        host.managed_create(None, None, "Shell", shell, cwd, cols, rows, None)?;
         Ok(host)
     }
 
@@ -50,6 +118,13 @@ impl InProcessServer {
                         .map(|w| WindowInfo {
                             id: w.id.to_string(),
                             name: w.name.clone(),
+                            layout: w
+                                .zoom_state
+                                .as_ref()
+                                .map(|zoom| ManagedLayout::Pane {
+                                    id: zoom.zoomed_pane_id.to_string(),
+                                })
+                                .unwrap_or_else(|| managed_layout(&w.root)),
                             panes: crate::layout::collect_pane_ids(&w.root)
                                 .into_iter()
                                 .filter_map(|id| {
@@ -115,6 +190,7 @@ impl InProcessServer {
         cwd: &str,
         cols: u16,
         rows: u16,
+        direction: Option<SplitDirection>,
     ) -> io::Result<(String, String)> {
         self.environment.enter(|| {
             let mut s = self.state.lock().map_err(poisoned)?;
@@ -163,7 +239,8 @@ impl InProcessServer {
                 let old = std::mem::replace(
                     &mut w.root,
                     LayoutNode::Split {
-                        direction: SplitDirection::Horizontal,
+                        direction: direction
+                            .unwrap_or(SplitDirection::Horizontal),
                         sizes: vec![],
                         children: vec![],
                     },
@@ -171,7 +248,7 @@ impl InProcessServer {
                 w.root = split_node(
                     old,
                     &path,
-                    SplitDirection::Horizontal,
+                    direction.unwrap_or(SplitDirection::Horizontal),
                     p,
                     false,
                 );

@@ -4,13 +4,31 @@ use std::{
     fs::File,
     io,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
 use serde::Serialize;
 
-use crate::{server::InProcessServer, Environment};
+use crate::{
+    commands::ParsedCommand, server::InProcessServer, types::SplitDirection,
+    Environment,
+};
+#[derive(Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum ManagedLayout {
+    Pane {
+        id: String,
+    },
+    Split {
+        direction: &'static str,
+        sizes: Vec<u16>,
+        children: Vec<ManagedLayout>,
+    },
+}
 #[derive(Clone, Serialize)]
 pub struct PaneInfo {
     pub id: String,
@@ -26,10 +44,12 @@ pub struct WindowInfo {
     pub id: String,
     pub name: String,
     pub panes: Vec<PaneInfo>,
+    pub layout: ManagedLayout,
 }
 #[derive(Clone, Serialize)]
 pub struct SessionInfo {
     pub id: String,
+    pub display_id: u64,
     pub name: String,
     pub cwd: String,
     pub windows: Vec<WindowInfo>,
@@ -45,8 +65,14 @@ pub struct PaneOutput {
     pub history: String,
     pub history_truncated: bool,
 }
+pub struct ManagedCommandOutput {
+    pub window_id: Option<String>,
+    pub pane_id: Option<String>,
+    pub output: String,
+}
 struct Hosted {
     host: Arc<InProcessServer>,
+    display_id: u64,
     name: String,
     cwd: String,
     shell: Option<String>,
@@ -55,6 +81,7 @@ pub struct ManagedRuntime {
     environment: Environment,
     _lock: File,
     sessions: Mutex<BTreeMap<String, Hosted>>,
+    next_display_id: AtomicU64,
 }
 fn err(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
@@ -72,6 +99,7 @@ impl ManagedRuntime {
             environment,
             _lock: lock,
             sessions: Mutex::new(BTreeMap::new()),
+            next_display_id: AtomicU64::new(1),
         })
     }
     pub fn list(&self) -> io::Result<Vec<SessionInfo>> {
@@ -84,6 +112,7 @@ impl ManagedRuntime {
                     windows.iter().flat_map(|w| &w.panes).any(|p| p.alive);
                 Ok(SessionInfo {
                     id: id.clone(),
+                    display_id: h.display_id,
                     name: h.name.clone(),
                     cwd: h.cwd.clone(),
                     windows,
@@ -145,10 +174,12 @@ impl ManagedRuntime {
             name.trim().into()
         };
         let windows = host.managed_windows()?;
+        let display_id = self.next_display_id.fetch_add(1, Ordering::Relaxed);
         sessions.insert(
             id.clone(),
             Hosted {
                 host,
+                display_id,
                 name: name.clone(),
                 cwd: cwd.clone(),
                 shell: shell.map(str::to_owned),
@@ -156,6 +187,7 @@ impl ManagedRuntime {
         );
         Ok(SessionInfo {
             id,
+            display_id,
             name,
             cwd,
             windows,
@@ -176,6 +208,16 @@ impl ManagedRuntime {
         window: Option<usize>,
         pane: Option<usize>,
         name: &str,
+    ) -> io::Result<(String, String)> {
+        self.create_with_direction(id, window, pane, name, None)
+    }
+    pub fn create_with_direction(
+        &self,
+        id: &str,
+        window: Option<usize>,
+        pane: Option<usize>,
+        name: &str,
+        direction: Option<SplitDirection>,
     ) -> io::Result<(String, String)> {
         if name.trim().is_empty()
             || name.len() > 128
@@ -205,6 +247,7 @@ impl ManagedRuntime {
             &source.cwd,
             source.cols,
             source.rows,
+            direction,
         )
     }
     pub fn input(&self, id: &str, pane: usize, data: &[u8]) -> io::Result<()> {
@@ -212,6 +255,15 @@ impl ManagedRuntime {
             return Err(err("terminal input exceeds 64 KiB"));
         }
         self.host(id)?.managed_input(pane, data)
+    }
+    pub fn command(
+        &self,
+        id: &str,
+        window: usize,
+        pane: usize,
+        command: &ParsedCommand,
+    ) -> io::Result<ManagedCommandOutput> {
+        self.host(id)?.managed_command(window, pane, command)
     }
     pub fn resize(
         &self,

@@ -2,7 +2,10 @@
 mod tests {
     use std::{path::PathBuf, time::Duration};
 
-    use zmux_core::{managed::ManagedRuntime, Environment};
+    use zmux_core::{
+        commands::ParsedCommand, managed::ManagedRuntime,
+        types::SplitDirection, Environment,
+    };
     fn runtime() -> (PathBuf, ManagedRuntime) {
         static NEXT: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(0);
@@ -66,6 +69,51 @@ mod tests {
         assert_eq!(rt.list().unwrap()[0].windows.len(), 1);
         rt.close(&s.id, None, None).unwrap();
         assert!(rt.list().unwrap().is_empty());
+        drop(rt);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn managed_commands_keep_layout_and_display_ids_stable() {
+        let (root, rt) = runtime();
+        let first = rt.open(&root, "First", Some("/bin/sh"), 80, 24).unwrap();
+        let window: usize = first.windows[0].id.parse().unwrap();
+        let pane: usize = first.windows[0].panes[0].id.parse().unwrap();
+        let split = ParsedCommand::parse("split-window -h").remove(0);
+        let result = rt.command(&first.id, window, pane, &split).unwrap();
+        assert_ne!(
+            result.pane_id.as_deref(),
+            Some(first.windows[0].panes[0].id.as_str())
+        );
+        let listing = rt.list().unwrap();
+        let layout =
+            serde_json::to_value(&listing[0].windows[0].layout).unwrap();
+        assert_eq!(layout["direction"], "horizontal");
+        assert_eq!(listing[0].display_id, first.display_id);
+        let (_, vertical_pane) = rt
+            .create_with_direction(
+                &first.id,
+                Some(window),
+                Some(pane),
+                "Stack",
+                Some(SplitDirection::Vertical),
+            )
+            .unwrap();
+        let layout =
+            serde_json::to_value(&rt.list().unwrap()[0].windows[0].layout)
+                .unwrap();
+        assert!(layout.to_string().contains("vertical"));
+        assert!(rt.list().unwrap()[0].windows[0]
+            .panes
+            .iter()
+            .any(|item| item.id == vertical_pane));
+
+        let second = rt.open(&root, "Second", Some("/bin/sh"), 80, 24).unwrap();
+        assert!(second.display_id > first.display_id);
+        rt.close(&first.id, None, None).unwrap();
+        let third = rt.open(&root, "Third", Some("/bin/sh"), 80, 24).unwrap();
+        assert!(third.display_id > second.display_id);
+        rt.close(&second.id, None, None).unwrap();
+        rt.close(&third.id, None, None).unwrap();
         drop(rt);
         std::fs::remove_dir_all(root).unwrap();
     }

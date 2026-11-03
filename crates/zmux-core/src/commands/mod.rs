@@ -91,7 +91,7 @@ fn parse_single(s: &str) -> Option<ParsedCommand> {
             let flag_chars: Vec<char> = tok[1..].chars().collect();
             for (fi, &fc) in flag_chars.iter().enumerate() {
                 let flag_key = fc.to_string();
-                if FLAG_HAS_VALUE.contains(&fc) {
+                if flag_has_value(&name, fc) {
                     if fi + 1 < flag_chars.len() {
                         let val: String = flag_chars[fi + 1..].iter().collect();
                         flags.insert(flag_key, Some(val));
@@ -117,10 +117,14 @@ fn parse_single(s: &str) -> Option<ParsedCommand> {
     Some(ParsedCommand { name, args, flags })
 }
 
-const FLAG_HAS_VALUE: &[char] = &[
-    't', 's', 'm', 'n', 'c', 'F', 'f', 'l', 'w', 'h', 'e', 'p', 'T', 'C', 'L',
-    'I',
-];
+fn flag_has_value(command: &str, flag: char) -> bool {
+    match flag {
+        'n' => matches!(command, "new-window" | "neww"),
+        't' | 's' | 'm' | 'c' | 'F' | 'f' | 'l' | 'w' | 'e' | 'T' | 'C'
+        | 'I' => true,
+        _ => false,
+    }
+}
 
 fn tokenize(s: &str) -> Vec<String> {
     let mut tokens = Vec::new();
@@ -174,5 +178,16 @@ mod tests {
         assert_eq!(command.name, "new");
         assert_eq!(command.flag_value("m"), Some("user@prod"));
         assert!(command.args.is_empty());
+    }
+
+    #[test]
+    fn split_and_navigation_flags_do_not_consume_following_arguments() {
+        let split =
+            ParsedCommand::parse("split-window -h 'echo ready'").remove(0);
+        assert!(split.flag("h"));
+        assert_eq!(split.args, vec!["echo ready"]);
+        let select = ParsedCommand::parse("select-window -n").remove(0);
+        assert!(select.flag("n"));
+        assert!(select.args.is_empty());
     }
 }
